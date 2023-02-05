@@ -1,0 +1,1232 @@
+#!/usr/bin/perl -w
+# Originally written 15 February 1999 by Jim Lippard as short hack script.
+# Rewritten 25 February 1999 by Jim Lippard to use config file and be
+#    a bit fancier.  Early a.m. 26 February: changed some error messages,
+#    fixed uninitialized variable problem in read_size_file.
+# Modified 11 August 1999 by Jim Lippard to support cyclog-format logs.
+#    A cyclog is a directory containing files named with timestamps.
+#    For cyclogs, we store the time logs were last examined as well as
+#    the size of the last log file examined.  We can only detect a
+#    reduction in size (editing) on the last log file examined.
+#    cyclog is part of Daniel Bernstein's daemontools package, and may
+#    be found at ftp://koobera.math.uic.edu/www/daemontools.html
+#    This script now requires Time::HiRes from CPAN.
+# Modified 26 August 1999 by Jim Lippard to support multilog-format
+#    logs.  This is Bernstein's new replacement for cyclog, the format
+#    is very similar.  The only real change is when converting the
+#    timestamps.  Also modified to sort files within cyclogs/multilogs.
+# Modified 23 December 1999 by Jim Lippard to change name on email to
+#    "Reporter" and use hostname minus domain name in subject line.
+# Modified 23 April 2002 by Jim Lippard to correctly parse regexps which
+#    contain colons.
+# Modified 12 February 2003 by Jim Lippard to allow the use of a single
+#    reportnew.conf file for multiple hosts in a backwards-compatible
+#    way by adding optional begin-host: hostname and end-host: hostname
+#    fields.  If master_notify appears outside of any begin-host/end-host
+#    blocks, it is the master_notify for all hosts.
+# Modified 28 June 2003 by Jim Lippard--there appears to be a bug where
+#    sometimes notifications are sent when the value in the notify hash
+#    is undefined.  A workaround has been put in place to use the master_notify
+#    address when an undefined value is sent to the send_notify sub.
+# Modified 12 January 2009 by Jim Lippard to convert djbdns log IP addresses.
+# Modified 11 February 2011 by Jim Lippard to change size for warning about
+#    logfile turning over.
+# Modified 3 December 2011 by Jim Lippard to catch an error condition
+#    that leads to an unitialized value for $notify_list in the "To"
+#    field generation of send_notify, probably caused by a bug in
+#    parse_config that leaves everything undefined (perhaps when a
+#    new log is added to the config file, perhaps when it's the first
+#    log after a begin-host directive?).
+# Modified 25 December 2011 by Jim Lippard to use /etc/reportnew.conf as
+#    default config file and put default size file in same dir
+#    or get it from the config file. Fixed bug mentioned in previous
+#    (used "return" instead of "last" to prematurely exit from
+#    parse_config subroutine).
+# Modified 30 March 2013, 7-8 June 2013 by Jim Lippard to:
+#    - Support multiple match/exclude/action triplets per log.
+#    - Replace notify: with action: notify
+#    - Add action: alert
+# Modified 8 June 2013 by Jim Lippard to
+#    - Add action: text
+# Modified 4 July 2013 by Jim Lippard to add special casing for process
+#    accounting logs.
+# Modified 18 September 2013 by Jim Lippard to
+#    - Add action: execute (with dropped privileges) [incomplete]
+# Modified 25 October 2013 by Jim Lippard to change if (defined (@array))
+#    to if (exists (@array)), since perl has deprecated the former and now warns.
+# Modified 27 November 2019 by Jim Lippard to split hostname and domain name
+#    differently (domain name is no longer hardcoded and hostname is just
+#    first component of domain name rather than hostname with hardcoded domain
+#    name removed).
+# Modified 17 February 2020 by Jim Lippard to make notification email sender
+#    configurable.
+# Modified 22 February 2020 by Jim Lippard to look at rotated logs if a
+#    log rotation has occurred since our last check of a standard logfile.
+# Modified 23 February 2020 by Jim Lippard to give &match_line the option
+#    to return the first capture group instead of 1 for a match.
+# Modified 24 February 2020 by Jim Lippard to fix bug in checking for first
+#    line date stamps which was causing repeat log reports.
+# Modified 25 February 2020 by Jim Lippard to add session matching functionality.
+# Modified 26-27 February 2020 by Jim Lippard to fix bugs in checking
+#    date/time in first line of log (timezone, web log format).
+# Modified 27 February 2020 by Jim Lippard to use SHA256 digest of first line
+#    of log instead of parsing dates.
+# Modified 28 February 2020 by Jim Lippard to assume a single digit number
+#    of rotated logs in &identify_rotated_logs.
+# To Do:
+#    - Find way to not miss additional process execution within the same
+#      minute of the last check?
+#    - Add time range checking option for match and exclude (new directive?)
+
+# Suggested enhancements:
+# * Create temp dir on first need and delete after last need, instead of
+#   creating it for each rotated log file.
+# * Process all rotated logs and original log, as well as all components
+#   of cyclogs or multilogs, together and process all notifications for them
+#   together at once instead of once per match per file.
+# * Have a way to capture context which can be reported for certain matches,
+#   including context prior to and after the matching log line (e.g., for
+#   logging of session-related information which may have relevant information
+#   from the start or end of the session that you only want to see if
+#   certain events occur during the session.
+# * Allow customization of subject line so that multiple reportnew
+#   configs can be used on the same machine/same logs and be distinguishable.
+# * Allow a "replace" rule that has regexps for string replacement in what
+#   gets reported (e.g., to replace known IPs or MAC addresses with human
+#   readable strings).
+# * Allow to run continuously (like swatch) monitoring logs with
+#   select.  That will perhaps be more efficient than starting up
+#   a perl process every N minutes, and will catch log changes more
+#   rapidly.  It should wait a little bit for additional matching
+#   messages, though, so that it doesn't send a separate message for
+#   each log line.  (Easiest way might be to make it go into an
+#   infinite loop, sleeping every N minutes at the end.  Though
+#   it would be more efficient to use select.)
+
+### Required packages.
+
+use strict;
+use Digest::SHA qw( sha256_hex );
+use File::Basename;
+#use Privileges::Drop;
+use Time::HiRes qw( gettimeofday );
+use Time::ParseDate;
+
+### Constants.
+
+my $HOSTNAME = `hostname`;
+chop ($HOSTNAME);
+my ($SHORT_HOSTNAME, $DOMAINNAME) = split (/\./, $HOSTNAME, 2);
+
+### Set to your security admin.
+my $SECURITY_ADMIN = 'lippard@discord.org';
+
+my $EMAIL_SENDER = 'nobody@' . $DOMAINNAME;
+
+### Set to your log time zone (used only in one subroutine below).
+my $TIME_ZONE = 'MST';
+
+my $COPY = '/bin/cp';
+my $ECHO = '/bin/echo';
+my $GUNZIP = '/usr/bin/gunzip';
+my $LASTCOMM = '/usr/bin/lastcomm';
+my $MKTEMP = '/usr/bin/mktemp';
+my $SENDMAIL = '/usr/sbin/sendmail';
+my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
+
+my $VERSION = 'reportnew 1.13d of 10 March 2020';
+
+my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
+my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
+my $DEFAULT_SIZE_FILE_DIR = '/etc/reportnew';
+my $DEFAULT_SIZE_FILE_NAME = 'reportnew.size';
+my $CONFIG_SUFFIX = ".conf";
+my $SIZE_SUFFIX = ".size";
+
+my $PROCESS_ACCOUNTING_LOG = '/var/account/acct';
+my $MAX_PROCESS_ACCOUNTING_FILE = 3;
+
+my $NL = '
+';
+
+my $LOG_TYPE_STANDARD_LOG = 0;
+my $LOG_TYPE_CYCLOG_OR_MULTILOG = 1;
+my $LOG_TYPE_PROCESS_ACCOUNTING = 2;
+
+### Variables.
+
+# Filenames.
+use vars qw($config_file $size_file);
+
+# Global variables from config file.
+use vars qw(
+	    $master_notify
+            $email_sender
+	    @logfiles
+	    %match_hash
+	    %exclude_hash
+	    %action_hash
+	    %match_hash_ref
+	    %exclude_hash_ref
+	    %action_hash_ref
+	    );
+
+# Global variables from size file.
+use vars qw(
+	    %log_size
+	    %log_mtime
+	    %log_checktime
+            %log_sha256_digest
+	    );
+
+# Other global variables.
+use vars qw(
+	    $debug_mode
+	    );
+
+# Local variables in main program.
+my ($logfile, $size, $mtime, $sha256_digest,  @cyclog_files, $cyclog_file,
+    $old_log_checktime, $got_first_cyclog_file, $temp_logfile);
+my ($rotated_logs_flag, $processed_rotated_log_flag, @rotated_logs, $rotated_logfile);
+
+### Main program.
+
+$debug_mode = 0;
+
+if ($#ARGV == 0) {
+    $config_file = $ARGV[0];
+}
+elsif ($#ARGV < 0) {
+    $config_file = "$DEFAULT_CONFIG_DIR/$DEFAULT_CONFIG_NAME";
+}
+else {
+    die "Usage: reportnew [config-file]\n";
+}
+
+if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
+    $config_file .= $CONFIG_SUFFIX;
+}
+
+&parse_config ($config_file);
+
+&read_size_file ($size_file);
+
+foreach $logfile (@logfiles) {
+    if ($logfile eq $PROCESS_ACCOUNTING_LOG) {
+	# Read process accounting logs out to the last time seen, or
+	# for all of it, and write it out to a tmp file, $temp_logfile,
+	# putting it into chronological order instead of reverse.
+	$temp_logfile = &read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile});
+	# Then use check_logfile on the temp file, disregarding the size,
+	# which is set to 0, just as for files in cyclogs.
+	($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
+	    &check_logfile ($temp_logfile, 0, $log_mtime{$logfile},
+			    $log_checktime{$logfile}, $log_sha256_digest{$logfile},
+			    $match_hash_ref{$logfile},
+			    $exclude_hash_ref{$logfile}, $action_hash_ref{$logfile}, $LOG_TYPE_PROCESS_ACCOUNTING);
+
+	# Unlink $temp_logfile.
+	unlink ($temp_logfile);
+    }
+    elsif (!-d $logfile) { # Standard syslog file.
+	# If there are archived rotated logs which have been modified since
+	# log_checktime{$logfile}, we should check any contents that postdate
+	# that time. The oldest rotated logfile changed after our last
+	# checktime will be the last one we looked at OR a more recent one
+	# that we have to look at in its entirety (depending on frequency
+	# of checks vs log rotation/retention, it might have already been
+	# deleted).
+	# We check the oldest one modified after our last check, and
+	# if its first line is newer than our last check we check the entire
+	# thing, otherwise we presume it's the same logfile we last checked
+	# and we start where we left off.
+	($rotated_logs_flag, @rotated_logs) = &identify_rotated_logs ($logfile, $log_checktime{$logfile});
+	# We have rotated logs we need to examine.
+	if ($rotated_logs_flag) {
+	    $processed_rotated_log_flag = 0;
+	    foreach $rotated_logfile (@rotated_logs) {
+		# If the oldest logfile is one we've seen part of before,
+		# we'll seek to the right position. We verify by checking
+		# the SHA256 digest of the first line to see if it matches
+		# what was there before. This check also occurs in check_logfile.
+		if (!$processed_rotated_log_flag) {
+		    # If first line is different from what we last saw,
+		    # then start from the beginning.
+		    if ($log_sha256_digest{$logfile} eq '' ||
+			&first_log_line_sha256_digest ($rotated_logfile) ne
+			$log_sha256_digest{$logfile}) {
+			$log_size{$logfile} = 0;
+		    }
+		    # We don't look at return values here.
+			&check_logfile ($rotated_logfile, $log_size{$logfile}, $log_mtime{$logfile},
+					$log_checktime{$logfile},
+					$log_sha256_digest{$logfile},
+					$match_hash_ref{$logfile},
+					$exclude_hash_ref{$logfile},
+					$action_hash_ref{$logfile},
+					$LOG_TYPE_STANDARD_LOG);
+		    
+			$processed_rotated_log_flag = 1;
+		}
+		else {
+		    # Again, not looking at return values.
+		    &check_logfile ($rotated_logfile, 0, 0, 0,
+				    $log_sha256_digest{$logfile},
+				    $match_hash_ref{$logfile},
+				    $exclude_hash_ref{$logfile},
+				    $action_hash_ref{$logfile},
+				    $LOG_TYPE_STANDARD_LOG);
+		}
+
+		# Set log_size to 0 for the regular logfile since we need to
+		# look at the whole thing, and update first line SHA256.
+		$log_size{$logfile} = 0;
+		$log_sha256_digest{$logfile} = &first_log_line_sha256_digest ($logfile);
+	    } # End processing of rotated logs.
+	} # Standard logfile check.
+	
+	($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
+	    &check_logfile ($logfile, $log_size{$logfile}, $log_mtime{$logfile},
+			    $log_checktime{$logfile},
+			    $log_sha256_digest{$logfile},
+			    $match_hash_ref{$logfile},
+			    $exclude_hash_ref{$logfile}, $action_hash_ref{$logfile}, $LOG_TYPE_STANDARD_LOG);
+    }
+    else { # cyclog or multilog
+	if (opendir (CYCLOG, $logfile)) {
+	    @cyclog_files = grep (!/^\./, readdir (CYCLOG));
+	    closedir (CYCLOG);
+	    $got_first_cyclog_file = 0;
+	    $old_log_checktime = $log_checktime{$logfile};
+	    foreach $cyclog_file (sort (@cyclog_files)) {
+		next if ($cyclog_file eq 'lock'); # multilog format
+		next if ($cyclog_file eq 'state'); # multilog format
+		$cyclog_file = $logfile . '/' . $cyclog_file;
+		($size, $mtime) = &read_size ($cyclog_file);
+		next if ($mtime < $old_log_checktime);
+		# If we get here, then we've found the oldest changed file
+		# (since we last checked).
+		$got_first_cyclog_file++;
+		if ($got_first_cyclog_file == 1) {
+		    ($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
+			&check_logfile ($cyclog_file, $log_size{$logfile}, $log_mtime{$logfile},
+					$old_log_checktime,
+					$log_sha256_digest{$logfile},
+					$match_hash_ref{$logfile},
+					$exclude_hash_ref{$logfile},
+					$action_hash_ref{$logfile},
+					$LOG_TYPE_CYCLOG_OR_MULTILOG);
+		}
+		# For all the new files, we don't care about size or mtime.
+		else {
+		    ($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}) =
+			&check_logfile ($cyclog_file, 0, 0, 0,
+					$log_sha256_digest{$logfile},
+					$match_hash_ref{$logfile},
+					$exclude_hash_ref{$logfile},
+					$action_hash_ref{$logfile},
+					$LOG_TYPE_CYCLOG_OR_MULTILOG);
+		    # If we're on the last one, set the first line SHA256 digest.
+		    # (Count is number of last element, not number of elements.)
+		    # This is never reached if there is only one, but we've
+		    # already set SHA256 above for the first one (zeroth) as well.
+		    if ($got_first_cyclog_file > $#cyclog_files) {
+			$log_sha256_digest{$logfile} = &first_log_line_sha256_digest ($cyclog_file);
+		    }
+		}
+	    } # foreach
+	} # if opendir successful
+	else {
+	    &send_error ($logfile, "Could not open cyclog/multilog $logfile. $!");
+	}
+    }
+}
+
+&write_size_file ($size_file);
+
+### Subroutines.
+
+# Subroutine to parse configuration file.
+sub parse_config {
+    my ($config_file) = @_;
+    my ($directive, $value, $line_num, $current_logfile,
+	$specified_host, $current_host, $all_host_master_notify,
+	$action, $action_value, $current_match_session_match_flag);
+
+    $line_num = 0;
+    $specified_host = 0;
+    $current_match_session_match_flag = 0;
+    if (open (CONFIG, $config_file)) {
+	while (<CONFIG>) {
+	    $line_num++;
+	    if (!/^#|^$/) {
+		chop;
+		($directive, $value) = split (/:\s*/, $_, 2);
+		if ($directive eq 'begin-host') {
+		    if (defined ($master_notify) && !defined ($current_host)) {
+			$all_host_master_notify = $master_notify;
+		    }
+		    $current_host = $value;
+		}
+		elsif ($directive eq 'end-host') {
+		    if ($current_host ne $value) {
+			&send_error ($config_file, "end-host directive does not match begin-host directive (which uses \"$current_host\") on line $line_num. $value\n");
+			exit;
+		    }
+		    if ($current_host eq $HOSTNAME) {
+			last;
+		    }
+		    $current_host = "";
+		    undef $master_notify;
+		    undef @logfiles;
+		    undef %match_hash;
+		    undef %exclude_hash;
+		    undef %action_hash;
+		}
+		elsif ($directive eq 'master_notify') {
+		    if (defined ($master_notify)) {
+			&send_error ($config_file, "Second master_notify directive on line $line_num. $value");
+			exit;
+		    }
+		    $master_notify = $value;
+		}
+		elsif ($directive eq 'size_file') {
+		    if (defined ($size_file)) {
+			&send_error ($config_file, "Second size_file directive on line $line_num. $value");
+			exit;
+		    }
+		    $size_file = $value;
+		}
+		elsif ($directive eq 'email_sender') {
+		    if (defined ($email_sender)) {
+			&send_error ($config_file, "Second email_sender directive on line $line_num. $value");
+			exit;
+		    }
+		    $email_sender = $value;
+		}
+		elsif ($directive eq 'log') {
+		    if ((!defined ($current_host) || $current_host eq $HOSTNAME) && !-e $value) {
+			&send_error ($config_file, "Logfile does not exist in log directive on line $line_num.  $value");
+			exit;
+		    }
+		    if (grep ($_ eq $value, @logfiles)) {
+			&send_error ($config_file, "Previously defined logfile on line $line_num. $value");
+			exit;
+		    }
+		    push (@logfiles, $value);
+		    $current_logfile = $value;
+		}
+		elsif ($directive eq 'match') {
+		    if (!defined ($current_logfile)) {
+			&send_error ($config_file, "No log directive corresponding to match directive on line $line_num. $_");
+			exit;
+		    }
+		    if (($value eq 'all') || &valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && &valid_regexp ($1))) {
+			push (@{$match_hash{$current_logfile}}, $value);
+			if ($value =~ /^session-with/) {
+			    $current_match_session_match_flag = 1;
+			}
+			else {
+			    $current_match_session_match_flag = 0;
+			}
+		    }
+		    else {
+			&send_error ($config_file, "Invalid match directive on line $line_num. $_");
+			exit;
+		    }
+		}
+		elsif ($directive eq 'exclude') {
+		    if (!defined ($current_logfile)) {
+			&send_error ($config_file, "No log directive corresponding to exclude directive on line $line_num. $_");
+			exit;
+		    }
+		    if (($value eq 'none') || &valid_regexp ($value) || ($value =~ /^session-without (.*$)/ && &valid_regexp ($1))) {
+			if ($value =~ /^session-without/ && !$current_match_session_match_flag) {
+			    &send_error ($config_file, "Exclude directive is a session match but corresponding match directive is not on line $line_num. $_");
+			    exit;
+			}
+			elsif ($value !~ /^session-without/ && $current_match_session_match_flag) {
+			    &send_error ($config_file, "Exclude directive is not a session match but corresponding match directive is on line $line_num. $_");
+			    exit;
+			}
+			push (@{$exclude_hash{$current_logfile}}, $value);
+		    }
+		    else {
+			&send_error ($config_file, "Invalid exclude directive on line $line_num. $_");
+		    }
+		}
+		elsif ($directive eq 'action') {
+		    if (!defined ($current_logfile)) {
+			&send_error ($config_file, "No log directive corresponding to action directive on line $line_num. $_");
+			exit;
+		    }
+		    # Parse action (action, whitespace, value).
+		    if ($value !~ /\s/) {
+			$action = $value;
+			undef $action_value;
+		    }
+		    else {
+			($action, $action_value) = split (/\s+/, $value, 2);
+		    }
+		    # action: notify
+		    if ($action eq 'notify') {
+			if (defined ($action_value)) {
+			    # Should probably validate email format?
+			    push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+			}
+			else {
+			    &send_error ($config_file, "Missing email address(es) following \"notify\" action in action directive on line $line_num. $_");
+			    exit;
+			}
+		    }
+		    # action: text
+		    elsif ($action eq 'text') {
+			if (defined ($action_value)) {
+			    # Should probably validate email format?
+			    push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+			}
+			else {
+			    &send_error ($config_file, "Missing email address(es) following \"text\" action in action directive on line $line_num. $_");
+			    exit;
+			}
+		    }
+		    # action: alert
+		    elsif ($action eq 'alert') {
+			if (defined ($action_value)) {
+			    &send_error ($config_file, "Extraneous data following \"alert\" action in action directive on line $line_num. $_");
+			    exit;
+			}
+			push (@{$action_hash{$current_logfile}}, $action);
+		    }
+		    # action: execute
+		    elsif ($action eq 'execute') {
+			if (defined ($action_value)) {
+			    push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+			}
+			else {
+			    &send_error ($config_file, "Missing script name following \"execute\" action in action directive on line $line_num. $_");
+			    exit;
+			}
+		    }
+		    # Other actions?
+		    else {
+			&send_error ($config_file, "Unknown action specified in action directive on line $line_num. $_");
+			exit;
+		    }
+		}
+		# For backwards compatibility.
+		elsif ($directive eq 'notify') {
+		    if (!defined ($current_logfile)) {
+			&send_error ($config_file, "No log directive corresponding to notify directive on line $line_num. $_");
+			exit;
+		    }
+		    push (@{$action_hash{$current_logfile}}, "$directive,$value");
+		    # need to specify that action=notify, and add
+		    # separate code to parse new action: directive.
+		}
+		else {
+		    &send_error ($config_file, "Unknown directive on line $line_num. $_");
+		    exit;
+		}
+	    }
+	}
+	close (CONFIG);
+    }
+    else {
+	die "Cannot open config file $config_file. $!\n";
+	&send_error ($config_file, "Cannot open config file. $!");
+	exit;
+    }
+
+    if (!defined ($size_file)) {
+	$size_file = "$DEFAULT_SIZE_FILE_DIR/$DEFAULT_SIZE_FILE_NAME";
+    }
+    elsif (substr ($size_file, length ($size_file) - 5, 5) ne $SIZE_SUFFIX) {
+	$size_file .= $SIZE_SUFFIX;
+    }
+
+    if (!defined ($master_notify)) {
+	if (defined ($all_host_master_notify)) {
+	    $master_notify = $all_host_master_notify;
+	}
+	else {
+	    $master_notify = $SECURITY_ADMIN;
+	}
+    }
+
+    if (!defined ($email_sender)) {
+	$email_sender = $EMAIL_SENDER;
+    }
+
+    foreach $current_logfile (@logfiles) {
+	# These checks need to be changed.
+	if (!defined ($match_hash{$current_logfile})) {
+	    push (@{$match_hash{$current_logfile}}, 'all');
+	}
+	$match_hash_ref{$current_logfile} = \@{$match_hash{$current_logfile}};
+	if (!defined ($exclude_hash{$current_logfile})) {
+	    push (@{$exclude_hash{$current_logfile}}, 'none');
+	}
+	$exclude_hash_ref{$current_logfile} = \@{$exclude_hash{$current_logfile}};
+	if (!defined ($action_hash{$current_logfile})) {
+	    push (@{$action_hash{$current_logfile}}, $master_notify);
+	    # need indicator for action=notify.
+	}
+	$action_hash_ref{$current_logfile} = \@{$action_hash{$current_logfile}};
+    }
+}
+
+# Look through a log file for any changed lines; add them to
+# the global variable @notify_lines and execute the corresponding action.
+#
+# If $log_type == $LOG_TYPE_PROCESS_ACCOUNTING, then the display and
+# size file reference is different from the name of the file actually
+# being checked. (Should this be the same for cyclog/multilog?)
+sub check_logfile {
+    my ($logfile, $old_size, $old_mtime, $old_checktime, $old_sha256_digest, $match_ref, $exclude_ref, $action_ref, $log_type) = @_;
+    my ($ref_logfile, $size, $mtime, $checktime, $date, $line, $idx,
+	@match_hashes, @exclude_hashes, @action_hashes,
+	$match, $exclude, $action, $action_value,
+	@notify_arrays, @notify_lines);
+    my (@session_match_flag, @session_match_array, @session_exclude_array, $session_append_string);
+    my $have_matches_flag;
+    my $sha256_digest = '';
+    my $gzip_temp_log_flag = 0;
+
+    if ($log_type == $LOG_TYPE_PROCESS_ACCOUNTING) {
+	$ref_logfile = $PROCESS_ACCOUNTING_LOG;
+    }
+    elsif (&is_gzip ($logfile)) {
+	$gzip_temp_log_flag = 1;
+	$ref_logfile = $logfile;
+	$logfile = &gunzip_logfile ($ref_logfile);
+    }
+    else {
+	$ref_logfile = $logfile;
+    }
+
+    # Note: this is sometimes operating on a temp file in the case of gzipped
+    # rotated logfiles. So mtime will always be > old_mtime for those
+    # files -- but we've already verified that that's the case before
+    # we got here so it shouldn't break anything.
+    # If an old rotated log is larger than the last log file we looked
+    # at, we're still checking the first log line to see if we need
+    # to look at the whole log file, but we only compute that when needed.
+    ($size, $mtime) = &read_size ($logfile);
+
+    # Determine if we are processing a file we have already seen before,
+    # or if it's a new one.
+    # Not relevant to process accounting logs.
+    if ($log_type == $LOG_TYPE_STANDARD_LOG ||
+	$log_type == $LOG_TYPE_CYCLOG_OR_MULTILOG) {
+	# If we don't have a first line SHA256 digest for the logfile,
+	# get one. (Since it always gets passed in for log rotation and
+	# cyclog/multilog processing, it should be non-null unless it's
+	# a brand new log.)
+	if ($old_sha256_digest eq '') {
+	    $sha256_digest = &first_log_line_sha256_digest ($logfile);
+	}
+	# If it's an existing logfile -- we've received as input a
+	# size (old_size > 0), an mtime (old_mtime > 0) and a first
+	# line SHA256 digest (old_sha256_digest ne ''), then test to
+	# see if we need to reset old_size to 0 and start at the
+	# beginning.
+	# If file has changed (mtime > old_mtime) and the size is
+	# smaller than it was OR the first line SHA256 digest doesn't
+	# match, then we start over (set old_size = 0).
+	if ((($old_size > 0) &&
+	     ($old_mtime > 0) &&
+	     ($old_sha256_digest ne '') &&
+	     ($mtime > $old_mtime)) &&
+	    (($size < $old_size) ||
+	     (($sha256_digest = &first_log_line_sha256_digest ($logfile)) ne $old_sha256_digest))) {
+	    $old_size = 0;
+	}
+    }
+    else { # process accounting logs
+	# We're always going to check for process accounting logs and
+	# cyclogs/multilogs.  Used to say $size = $old_size + 1, but
+	# since a change above, $size is size of /var/account/acct,
+	# and $old_size = 0. [I don't understand this comment anymore.
+	# I've just changed it so cyclogs get the test above.]
+	$size = $old_size + 1;
+    }
+
+    # Turn match/exclude/action refs into arrays.
+    @match_hashes = @{$match_ref};
+    @exclude_hashes = @{$exclude_ref};
+    @action_hashes = @{$action_ref};
+
+    # Identify session rules.
+    # Session rules collect matches as normal with the normal processing but most will be discarded.
+    # The session_exclude_array is used to find the subset of matches that are kept (so it's somewhat misnamed), and by finding
+    # strings which are appended to the session_match_array used for that final filtering.
+    for ($idx = 0; $idx <= $#match_hashes; $idx++ ) {
+	$session_match_flag[$idx] = 0;
+	if ($match_hashes[$idx] =~ /^session-with (.*$)/) {
+	    $match_hashes[$idx] = $1;
+	    $session_match_array[$idx] = ''; # start empty
+	    $session_match_flag[$idx] = 1;
+	    if ($exclude_hashes[$idx] =~ /^session-without (.*$)/) {
+		$session_exclude_array[$idx] = $1;
+		$exclude_hashes[$idx] = 'none';
+	    }
+	    else {
+		# This shouldn't happen.
+		&send_error ($ref_logfile, "Internal error - found session match hash without corresponding session exclude hash for logfile $ref_logfile. $match_hashes[$idx] / $exclude_hashes[$idx]");
+	    }
+	}
+	elsif ($exclude_hashes[$idx] =~ /^session-without/) {
+	    # This also shouldn't happen.
+	    &send_error ($ref_logfile, "Internal error - found session exclude hash without corresponding session match hash for logfile $ref_logfile. $match_hashes[$idx] / $exclude_hashes[$idx]");
+	}
+    }
+
+    # Logfile has grown.
+    if ($size > $old_size) {
+	if (open (LOG, $logfile)) {
+	    seek (LOG, $old_size, 0) if ($old_size > 0);
+	    while (<LOG>) {
+		chop;
+		# Cycle through match/exclude hashes for each line.
+		# Action is performed at end if notify--could be
+		#   performed within this loop for other actions
+		#   that might be performed on a line at a time.
+		for ($idx = 0; $idx <= $#match_hashes; $idx++) {
+		    $match = $match_hashes[$idx];
+		    $exclude = $exclude_hashes[$idx];
+		    $action = $action_hashes[$idx]; # May not be necessary.
+
+		    # Process session matches. If we find a match to the exclude array, the relevant match group is returned so that
+		    # it can be added to the $session_match_array which will be used to identify the matches to keep.
+		    if ($session_match_flag[$idx]) {
+			if ($session_append_string = &match_line ($session_exclude_array[$idx], $_, 1)) {
+			    if ($session_match_array[$idx] eq '') {
+				$session_match_array[$idx] = $session_append_string;
+			    }
+			    else {
+				$session_match_array[$idx] .= '|' . $session_append_string;
+			    }
+			}
+		    }
+
+		    if ((($match eq 'all') || (&match_line ($match, $_))) &&
+			(($exclude eq 'none') || (!&match_line ($exclude, $_)))) {
+			if ($log_type == $LOG_TYPE_CYCLOG_OR_MULTILOG) { # cyclog or multilog
+			    ($date, $line) = split (/\s+/, $_, 2);
+			    if ((substr ($date, 0, 1) eq '@') && (length ($date) == 15)) { # cyclog
+				$date = localtime ($date);
+				push (@{$notify_arrays[$idx]}, $date . ' ' . $line);
+			    }
+			    elsif ((substr ($date, 0, 1) eq '@') && (length ($date) == 25) && (-e$TAI64NLOCAL)) { # multilog
+				open (TAICONVERT, "$ECHO \"$date\" | $TAI64NLOCAL|");
+				$date = <TAICONVERT>;
+				close (TAICONVERT);
+				chop ($date);
+				$line =~ s/\b([a-f0-9]{8})\b/join(".", unpack("C*", pack("H8", $1)))/eg;
+				push (@{$notify_arrays[$idx]}, $date . ' ' . $line);
+			    }
+			    else { # unknown, leave it alone
+				push (@{$notify_arrays[$idx]}, $_);
+			    }
+			}
+			else { # syslog
+			    push (@{$notify_arrays[$idx]}, $_);
+			}
+		    }
+		}
+	    }
+	    close (LOG);
+
+	    # If we were processing a gunzipped temp file, delete it.
+	    &cleanup_gunzip_temp ($logfile) if $gzip_temp_log_flag;
+
+	    # Perform action on corresponding matches, and reset
+	    # @notify_lines for the next match/exclude/action.
+	    for ($idx = 0; $idx <= $#action_hashes; $idx++) {
+		$have_matches_flag = 0;
+		$action = $action_hashes[$idx];
+		($action, $action_value) = split (/,/, $action, 2);
+		if (exists ($notify_arrays[$idx])) {
+		    # Process session matches. Just return the notify_array lines which match the collected session match strings.
+		    if ($session_match_flag[$idx]) {
+			# Don't grep for a null string and match everything.
+			if ($session_match_array[$idx] ne '') {
+			    $have_matches_flag = 1;
+			    @notify_lines = grep (/$session_match_array[$idx]/, @{$notify_arrays[$idx]});
+			}
+		    }
+		    else { # regular matches
+			$have_matches_flag = 1;
+			@notify_lines = @{$notify_arrays[$idx]};
+		    }
+		}
+		if ($have_matches_flag) {
+		    if ($action eq 'notify') {
+			&send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
+		    }
+		    elsif ($action eq 'alert') {
+			# Might want to format this differently or better.
+			print "***$SHORT_HOSTNAME $ref_logfile\n@notify_lines\n***";
+		    }
+		    elsif ($action eq 'text') {
+			# Might want to do separate text per line?
+			&send_text ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
+		    }
+		    elsif ($action eq 'execute') {
+			&execute_script ($action_value, $HOSTNAME, $ref_logfile, @notify_lines);
+		    }
+		}
+	    }
+
+	    $checktime = gettimeofday();
+	    $sha256_digest = $old_sha256_digest if ($sha256_digest eq '');
+	    return ($size, $mtime, $checktime, $sha256_digest);
+	}
+	else {
+	    &send_error ($ref_logfile, "Cannot open logfile $logfile. $!");
+	}
+    }
+
+    $checktime = gettimeofday();
+    $sha256_digest = $old_sha256_digest if ($sha256_digest eq '');
+    return ($size, $mtime, $checktime, $sha256_digest);
+}
+
+# Is logfile a gzip file?
+sub is_gzip {
+    my ($logfile) = @_;
+
+
+    return 1 if (substr ($logfile, length ($logfile) - 3, 3) eq '.gz');
+
+    return (0);
+}
+
+# Subroutine to unzip zipped logfile into a temp dir.
+sub gunzip_logfile {
+    my ($logfile) = @_;
+    my ($temp_dir, $temp_in_file, $temp_out_file, $temp_logfile);
+
+    $temp_dir = `$MKTEMP -d -q /tmp/reportnew.XXXXXXX`;
+    chop ($temp_dir);
+    $temp_in_file = basename ($logfile);
+    $temp_out_file = substr ($temp_in_file, 0, length ($temp_in_file) - 3);
+    $temp_logfile = $temp_dir . '/' . $temp_out_file;
+    
+    system "$COPY $logfile $temp_dir/";
+    system "$GUNZIP $temp_dir/$temp_in_file -o $temp_logfile";
+
+    return ($temp_logfile);
+}
+
+# Subroutine to delete gunzipped temp file and temp dir.
+sub cleanup_gunzip_temp {
+    my ($logfile) = @_;
+    my ($temp_dir);
+
+    # Don't delete anything not in /tmp.
+    return if (substr ($logfile, 0, 4) ne '/tmp');
+    $temp_dir = dirname ($logfile);
+
+    unlink ($logfile);
+    unlink ($temp_dir);
+}
+
+# Subroutine to return a SHA256 hash of the first log line (or 0).
+sub first_log_line_sha256_digest {
+    my ($logfile) = @_;
+    my ($first_line, $sha256_digest);
+
+    if (open (LOG, $logfile)) {
+	$first_line = <LOG>;
+	close (LOG);
+	if (defined ($first_line)) {
+	    chop ($first_line);
+	    $sha256_digest = sha256_hex ($first_line);
+	    return ($sha256_digest);
+	}
+    }
+    return 0;
+}
+
+# THIS IS NO LONGER USED, WILL KEEP AROUND FOR A WHILE IN CASE I
+# DECIDE I NEED IT AGAIN. THE WEB_DATE_STRING PARSING IS INCOMPLETE.
+# Replaced with SHA256 digest on first line to avoid dealing with
+# parsing or timezone issues.
+# Subroutine to return the parsed time of the first log line (or 0).
+# DATE_STRING = standard syslog format
+# DATE_STRING2 = process accounting log format
+# RFC3339_date_string = RFC3339, newsyslog log rotation format
+sub first_log_line_time {
+    my ($logfile) = @_;
+    my ($first_line, $log_time, $date);
+    my $DATE_STRING = '\w{3}\s{1,2}\d{1,2}\s\d{2}:\d{2}:\d{2}';
+    my $DATE_STRING2 = '\w{3}\s\w{3}\s{1,2}\d{1,2}\s\d{2}:\d{2}:\d{2}';
+    my $WEB_DATE_STRING = '\[\w{3}\s\w{3}\s\d{1,2}\s\d{2}:\d{2}:\d{2}\.\d{6}\s\d{4}\]';
+    my $RFC3339_date_string = '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z';
+    my $timezone = $TIME_ZONE;
+    my $rfc3339_timezone = 'UTC';
+
+    if (open (LOG, $logfile)) {
+	$first_line = <LOG>;
+	close (LOG);
+	if (defined ($first_line)) {
+	    chop ($first_line);
+	    if ($first_line =~ /^($DATE_STRING|$DATE_STRING2|$RFC3339_date_string)/) {
+		$date = $1;
+		$timezone = $rfc3339_timezone if ($date =~ /^$RFC3339_date_string/);
+		$log_time = parsedate ($date, PREFER_PAST => 1, ZONE => $timezone);
+		return ($log_time);
+	    }
+	}
+    }
+    return 0;
+}
+
+# Identify any rotated logs which have modification times more recent than
+# our last check. Was going to check here if the first one found had a line
+# newer than our last check, but I don't want to unzip files twice.
+sub identify_rotated_logs {
+    my ($logfile, $old_checktime) = @_;
+    my ($logdir, $logbase, @files, $file, $size, $mtime);
+    my ($rotated_logs_flag, @rotated_logs);
+    my $first_log_time;
+
+    $rotated_logs_flag = 0;
+
+    # Get directory and filename of logfile from full path.
+    $logdir = dirname ($logfile);
+    $logbase = basename ($logfile);
+
+    # Read directory, searching for matching files.
+    # Assumes a single-digit number of rotated logs.
+    if (opendir (DIR, $logdir)) {
+	@files = grep (/^$logbase\.\d$/, readdir (DIR));
+
+	# Find files that have been modified since our last check.
+	foreach $file (reverse (sort (@files))) {
+	    ($size, $mtime) = &read_size ("$logdir/$file");
+	    if ($mtime > $old_checktime) { # a rotated log that needs checking
+		if (!$rotated_logs_flag) { # first one we find
+		    $rotated_logs_flag = 1;
+		}
+		push (@rotated_logs, "$logdir/$file");
+	    }
+	}
+	
+	closedir (DIR); 
+    }
+
+    return ($rotated_logs_flag, @rotated_logs);
+}
+
+# Subroutine to read process accounting log files using lastcomm.
+sub read_process_acct_log {
+    my ($acct_log, $checktime) = @_;
+    my ($idx, $acct_file, @lastcomm_logs, $log_line, $temp_logfile);
+    my ($command, $flags, $user, $tty, $time_info,
+	$cpu, $secs, $day_name, $month, $day, $time, $duration,
+	$time_dec);
+
+# Read process accounting logs, out to end or to $checktime, whichever
+# comes first.  Write out to temp file, in reverse order, with more
+# standardized date/time stamps.  Return $temp_logfile name.
+
+    # Do lastcomm, starting with the most recent and working backward,
+    # reading lines into @lastcomm_logs with parsed date/time, until
+    # we reach $checktime or run out of logs.
+    for ($idx = -1; $idx <= $MAX_PROCESS_ACCOUNTING_FILE; $idx++) {
+	if ($idx >= 0) {
+	    $acct_file = $acct_log . '.' . $idx;
+	}
+	else {
+	    $acct_file = $acct_log;
+	}
+
+	if (!open (LASTCOMM, "$LASTCOMM -f $acct_file|")) {
+	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
+	    exit; # or just return?
+	}
+	while (<LASTCOMM>) {
+	    # Parse line, check time.  If lastcomm time <= $check_time,
+	    # then set $idx to $MAX_PROCESS_ACCOUNTING_FILE+1 and exit with next.
+	    if (substr ($_, length ($_) - 1, 1) eq $NL) {
+		chop;
+	    }
+
+	    ($command, $flags, $user, $tty, $time_info) = split (/\s+/, $_, 5);
+	    ($cpu, $secs, $day_name, $month, $day, $time, $duration) = split (/\s+/, $time_info, 7);
+	    $time = $day_name . ' ' . $month . ' ' . $day . ' ' . $time;
+	    $time_dec = parsedate ($time);
+	    $duration =~ s/^\((.*)\)$/$1/;
+
+	    # Stop this once we reach an entry earlier than last check.
+	    if ($time_dec < $checktime) {
+		$idx = $MAX_PROCESS_ACCOUNTING_FILE + 1;
+		last;
+	    }
+
+	    $log_line = "$time $tty $user $command $flags $cpu $secs $duration";
+
+	    push (@lastcomm_logs, $log_line);
+	}
+	close (LASTCOMM);
+    }
+
+    # Now write out @lastcomm_logs to a temp file in reverse order.
+
+    # Create temp file.
+    $temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
+    chop ($temp_logfile);
+
+    # Open temp file for writing.
+    if (!open (TEMPFILE, ">$temp_logfile")) {
+	    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+	    exit; # or just return?
+	}
+
+    # Print out each log line to the temp file.
+    foreach $log_line (reverse (@lastcomm_logs)) {
+	print TEMPFILE "$log_line\n";
+    }
+
+    # Close temp file.
+    close (TEMPFILE);
+
+    # Return the filename.
+    return ($temp_logfile);
+}
+
+# Return 1 if a regexp is valid, 0 if not.
+sub valid_regexp {
+    my ($regexp) = @_;
+
+    if (($regexp =~ /\/.*\//) ||
+	($regexp =~ /!\/.*\//)) {
+	return 1;
+    }
+    else {
+	return 0;
+    }
+}
+
+# Read the contents of the size file.
+sub read_size_file {
+    my ($size_file) = @_;
+    my ($logfile, $size, $mtime, $checktime, $sha256_digest);
+
+    if (!-e $size_file) {
+	foreach $logfile (@logfiles) {
+	    $log_size{$logfile} = 0;
+	    $log_mtime{$logfile} = 0;
+	    $log_checktime{$logfile} = 0;
+	    $log_sha256_digest{$logfile} = '';
+	}
+    }
+    else {
+	if (open (SIZEFILE, $size_file)) {
+	    while (<SIZEFILE>) {
+		chop;
+		($logfile, $size, $mtime, $checktime, $sha256_digest) = split (/,/);
+		if (!grep ($_ eq $logfile, @logfiles)) {
+		    &send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Logfile $logfile in size file is not in config file.");
+		}
+		$log_size{$logfile} = $size;
+		$log_mtime{$logfile} = $mtime;
+		$log_checktime{$logfile} = $checktime;
+		if (!defined ($sha256_digest)) { # old size file
+		    $sha256_digest = '';
+		}
+		elsif ($sha256_digest eq 'null') { # how we store null ones
+		    $sha256_digest = '';
+		}
+		$log_sha256_digest{$logfile} = $sha256_digest;
+	    }
+	    close (SIZEFILE);
+	}
+	else {
+	    &send_error ($size_file, "Cannot open size file. $!");
+	    exit;
+	}
+
+	foreach $logfile (@logfiles) {
+	    if (!defined ($log_size{$logfile})) {
+		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Logfile $logfile in config file is not in size file.");
+		$log_size{$logfile} = 0;
+		$log_mtime{$logfile} = 0;
+		$log_checktime{$logfile} = 0;
+		$log_sha256_digest{$logfile} = '';
+	    }
+	}
+    }
+}
+
+# Read current log file size and mtime.
+sub read_size {
+    my ($logfile) = @_;
+    my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size, $atime,
+	$mtime, $ctime, $blksize, $blocks);
+
+    ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size, $atime,
+     $mtime, $ctime, $blksize, $blocks) = stat $logfile;
+
+    $size = 0 if (!defined ($size));
+    $mtime = 0 if (!defined ($mtime));
+
+    return ($size, $mtime);
+}
+
+# Return 1 if line matches regexp, 0 if not.
+# If $return_group is specified, on match the first capture group is returned.
+sub match_line {
+    my ($regexp, $line, $return_group) = @_;
+    my ($negative);
+
+    if (!defined ($return_group)) {
+	$return_group = 0;
+    }
+
+    if (substr ($regexp, 0, 1) eq '!') {
+	$negative = 1;
+	$regexp =~ s/^!//;
+    }
+    else {
+	$negative = 0;
+    }
+
+    $regexp =~ s/^\///;
+    $regexp =~ s/\/$//;
+
+    if (($negative && ($line =~ !/$regexp/)) ||
+	(!$negative && ($line =~ /$regexp/))) {
+	return $1 if $return_group;
+	return 1;
+    }
+    else {
+	return 0;
+    }
+}
+
+# Execute a script as nonprivileged user.
+sub execute_script {
+
+# Should verify the existence of script, permissions, and what else?
+
+    if (fork) {
+	wait;
+	return $? >> 8;
+    }
+
+    # -- child
+    # Drop privileges.
+# Not yet ready...
+#    drop_privileges('nobody'); # better, use _reportnew.
+#    exec @_;
+}
+
+# Send a mail notification.
+sub send_notify {
+    my ($hostname, $logfile, $notify_list, @lines) = @_;
+    my ($line);
+
+    if (!defined ($notify_list)) {
+	if (!defined ($master_notify)) {
+	    # This seems to happen periodically, indicating a bug
+	    # in the config parsing.
+	    $notify_list = $SECURITY_ADMIN;
+	}
+	else {
+	    $notify_list = $master_notify;
+	}
+    }
+
+    if ($debug_mode) {
+	print "$hostname: $logfile ($notify_list)\n";
+	foreach $line (@lines) {
+	    print "$line\n";
+	}
+    }
+
+    else {
+	open (MAIL, "|$SENDMAIL -t");
+	print MAIL "From: Reporter <$email_sender>\n";
+	print MAIL "To: $notify_list\n";
+	print MAIL "Subject: $hostname $logfile\n\n";
+	foreach $line (@lines) {
+	    print MAIL "$line\n";
+	}
+	close (MAIL);
+    }
+}
+
+# Send a text message. This code could easily be merged with
+# send_notify, it is identical except for the mail format.
+sub send_text {
+    my ($hostname, $logfile, $notify_list, @lines) = @_;
+    my ($line);
+
+    if (!defined ($notify_list)) {
+	if (!defined ($master_notify)) {
+	    # This seems to happen periodically, indicating a bug
+	    # in the config parsing.
+	    $notify_list = $SECURITY_ADMIN;
+	}
+	else {
+	    $notify_list = $master_notify;
+	}
+    }
+
+    if ($debug_mode) {
+	print "$hostname: $logfile ($notify_list)\n";
+	foreach $line (@lines) {
+	    print "$line\n";
+	}
+    }
+
+    else {
+	open (MAIL, "|$SENDMAIL -t $notify_list");
+	foreach $line (@lines) {
+	    print MAIL "$line\n";
+	}
+	close (MAIL);
+    }
+}
+
+# Send error notification.
+sub send_error {
+    my ($filename, $error) = @_;
+
+    if (defined ($master_notify)) {
+	&send_notify ($SHORT_HOSTNAME, $filename, $master_notify, $error);
+    }
+    else {
+	&send_notify ($SHORT_HOSTNAME, $filename, $SECURITY_ADMIN, $error);
+    }
+}
+
+# Write out size file.
+sub write_size_file {
+    my ($size_file) = @_;
+    my ($logfile, $sha256_digest);
+
+    if (open (SIZEFILE, ">$size_file")) {
+	foreach $logfile (@logfiles) {
+	    # Write out 'null' if blank. Should only be for process accounting logs.
+	    if (!defined ($log_sha256_digest{$logfile})) {
+		$sha256_digest = 'null';
+	    }
+	    else {
+		$sha256_digest = $log_sha256_digest{$logfile};
+		$sha256_digest = 'null' if ($sha256_digest eq '');
+	    }
+
+	    # Write it all out.
+	    print SIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},$sha256_digest\n";
+	}
+	close (SIZEFILE);
+    }
+    else {
+	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
+    }
+}

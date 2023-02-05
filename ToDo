@@ -1,0 +1,141 @@
+BUGS:
+
+* Write out size file again for each log completed?  Have an issue where
+reportnew crashes, and then crashes each successive time.
+
+FEATURES:
+
+* The cyclog/multilog logic for looking at prior log files should
+  also be implemented for standard logfiles that have been rotated. DONE
+* Add action to re-log specific indicators from a log entry into
+  an indicator log in something like Fortinet's log format, which
+  identifies source host, source log, date/time from the original log
+  entry, the specific indicators (e.g., source IP/port, dest IP/port,
+  client IP, protocol, permitted or blocked, mail from/rcpt to/subject,
+  etc. Such a log would be useful for auto-generation of block and monitor
+  lists for pf. This might be a replacement for the below script idea?
+* Add enrich: [{x,y},{x,y}] which will substitute y for x or append "[y]" after x in matching line output. (Or could be done via execute...)
+* Finish action: execute <script>
+* Create a separate parsing script for both pf and DNS query logs,
+    which keeps a database of observed IP addresses/ports and IP
+    addresses/domain queries, along with first seen time, last seen
+    time, number of times seen.  Generate alerts for novelty,
+    i.e., newly appearing, newly appearing after an absence, and
+    appearing in multiple places/contexts for the first time (pf).
+* Set up a _reportnew user?  Drop privs more generally?
+
+* Process accounting time granularity is only to the nearest minute(?),
+and so any new commands which immediately followed the last seen, within
+the same minute, will not be shown in the next run--it will stop just before
+them.
+
+To support process accounting files:
+
+1. Use date/time stamp instead of size. (mtime is already captured in
+    size file)
+2. On each run, parse files from present to past until matching
+   time stamp is hit.  Start with first file, then only go to the
+   next if the time stamp isn't hit.  (This isn't really parsing,
+   need to pipe through lastcomm, would be nice to reverse the
+   sequence.)
+
+Perhaps it would be easier if it was specialcased by generating a
+normal logfile out of the process accounting logs?  Each time? Or via
+a separate process like pflogs? (Started specialcasing it at top,
+also need to special case in the subroutine, similar to cyclog?)
+
+Will normal match/exclude work? Not for the time component, or for
+multiple users.  The multiple users part would work if I could have
+multiple distinct match/exclude pairs, which would be useful in general.
+
+It would be nice to add a time component after the regexp. Maybe
+   days:<day-of-week-list-or-range> hours:<hour-of-week-list-or-range>
+
+I.e.:
+
+log: /var/account/acct
+match: /root/
+exclude: /acceptable commands/
+match: /lippard/ hours:0-5,22-24
+exclude: none
+notify: user@host
+
+Better:  allow triples per log:
+match: /xxx/ <time option>
+exclude: /yyy/ <time option>
+action: [notify emailaddr|alert]
+(or notify: emailaddr for backwards compatibility)
+match:
+exclude:
+action:
+etc. Support at least ten per log.
+DONE.
+
+Maybe it would be better to just use action: execute and pass to a
+script.
+
+Time options:
+  [days: <day-list>] [hours: <hour-list>]
+  <day-list>: [<day>|<day-range>][,<day>|<day-range>]
+  <day>: [<dow>|<dom>]
+  <day-range>: [<day>-<day>|weekends|weekday]
+  <hour-list>: [<hour>|<hour-range>][,<hour>|<hour-range>]
+  <hour>: 0-24
+  <hour-range>: <hour>-<hour>
+
+Data structure: Array of days, array of hours, where each element is
+an individual day/hour or range, in numeric form.
+
+Algorithm:  Match requires that the time stamp of log entry matches the
+conjunction of one or more day and hour (or day and hour ranges).  It's
+the conjunction of day/hour, disjunction within day/hour.  (What if I want
+a day/hour conjunction?  Hmm. Should allow multiple days/hours pairs.)
+
+Set up some examples...
+
+match: /lippard use of sudo/ days:Sun-Thu hours:0-5,22-24 days:Fri-Sat hours:05
+exclude: none
+action: text jim.lippard@gmail.com
+
+Actually, don't like weekdays/weekends, as the above example illustrates,
+unless "weekend" means Fri-Sat, not Sat-Sun.
+
+Would also like to be able to do field matching, which requires parsing
+out fields...
+
+Note that lastcomm will take a username or commandname as an argument
+and do that level of filtering for you.
+
+
+Would also like to add ability to customize subject on notification:
+
+default notify-subject: %hostname% %logfile%
+notify-subject:
+
+Make session matching work across log rotation boundaries.
+
+Create all temp files in one temp dir, perhaps use to save data for matching across log rotation boundaries.
+   All hash arrays are per-log, so could create a separate file for each match/exclude/action rule per log.
+   Need to carry the session_match_array across, as well as the notify_arrays.
+
+three conditions for needing temp dir:
+(1) process accounting logs (known from config) [currently single file -- should put it in the temp dir though]
+(2) session matches (known from config) -- now no longer thinking this needs temp dir
+(3) rotated logs (known before check_logfile invocation)  &gunzip_logfile, &cleanup_gunzip_temp
+
+Session matching as implemented:
+
+match: session-with /[a-f0-9]{16} smtp/
+exclude: session-without /([a-f0-9]+) smtp failed-command/
+action: notify ...
+
+will collect the match: session-with lines, and will collect the matching group from the exclude line, and only notify on what matches both.
+
+Add another kind of session matching:
+
+match: session-start /start-string-match/
+exclude: session-end /end-string-match/
+action: notify
+
+Start collecting at /start-string-match/ and end collecting at /end-string-match/
+(like doing a temporary match all/exclude none.)
