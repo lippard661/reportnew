@@ -16,7 +16,7 @@ log: /var/log/maillog
 match: session-with /[a-f0-9]{16} smtp/
 exclude: session-without /([a-f0-9]{16}) smtp (?:failed-command|client-cert-check result="failure")/
 action: notify <emailaddress>
-  </PRE>
+</PRE>
 
 This will start capturing logs when it matches a 16-character hex string followed by smtp, and then will
 discard that collected set of logs unless it matches an smtp failed-command or smtp client-cert-check with
