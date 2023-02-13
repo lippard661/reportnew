@@ -29,5 +29,54 @@ by smtp.
 The "match" field tells reportnew to collect matches of that string for later comparison, the "exclude"
 field tells it to report on any of those collected log lines that have an envelope ID that matches the
 regular expression capture group from a line with a failure.
+  
+---
+  
+To monitor process accounting logs to identify unusual activity from service accounts, normal users, or root, use something like the following:
+
+<PRE>
+  log: /var/account/acct
+  match: all
+  exclude: /(__|tty..) (_dovecot | _file | _identd | _ntp | _ping | _smtpd | _syspatch | _tcpdump | _traceroute | user1 | user2 | root | sshd | www)/
+  action: notify myemailaddr
+  
+  match: /_dovecot/
+  exclude: /anvil|auth|stats/
+  action: notify myemailaddr
+  
+  match: /_file/
+  exclude: /file/
+  action: notify myemailaddr
+  
+  match: /_ntp/
+  exclude: / ntpd/
+  action: notify myemailaddr
+  
+  match: /_ping/
+  exclude: / ping/
+  action: notify myemailaddr
+  
+  match: /_smtpd/
+  exclude: / mail.mboxf| sh | smtpctl | smtpd/
+  action: notify myemailaddr
+  
+  match: /_syspatch/
+  exclude: /ftp| sh | signify/
+  action: notify myemailaddr
+  
+  match: /_tcpdump/
+  exclude: / tcpdump/
+  action: notify myemailddr
+  
+  match: /_traceroute/
+  exclude: / traceroute/
+  action: notify myemailaddr
+  
+  match: / user1/
+  exclude: / list of commands | used by user1/
+  action: notify myemailaddr
+ </PRE>
+  
+and so on. The first set of directives will cause alerts for unknown users and the rest for unexpected activity by known users.
 
 
