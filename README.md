@@ -5,9 +5,9 @@ Supports syslog, cyclog, multilog, and BSD process accounting logs. Runs periodi
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.13d.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org.pub
+reportnew-1.14.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org.pub
 
-Current version is reportnew-1.13d of 10 March 2020.
+Current version is reportnew-1.14 of 2 September 2023.
 
 "frequency" in config file comments is not implemented; config file doesn't include an example of
 the within-log correlation, here is an example used for alerting on an SMTP session of concern with
