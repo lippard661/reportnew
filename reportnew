@@ -73,6 +73,11 @@
 #    of log instead of parsing dates.
 # Modified 28 February 2020 by Jim Lippard to assume a single digit number
 #    of rotated logs in &identify_rotated_logs.
+# Modified 2 September 2023 by Jim Lippard to read and write size file
+#    before and after each log processed, to set email_sender properly
+#    for errors that occur before it is defined, and to track current
+#    processing on a log in the size file so that another process doesn't
+#    start processing on the same log. Use File::Copy instead of system cp.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -108,6 +113,7 @@
 use strict;
 use Digest::SHA qw( sha256_hex );
 use File::Basename;
+use File::Copy;
 #use Privileges::Drop;
 use Time::HiRes qw( gettimeofday );
 use Time::ParseDate;
@@ -126,15 +132,15 @@ my $EMAIL_SENDER = 'nobody@' . $DOMAINNAME;
 ### Set to your log time zone (used only in one subroutine below).
 my $TIME_ZONE = 'MST';
 
-my $COPY = '/bin/cp';
 my $ECHO = '/bin/echo';
 my $GUNZIP = '/usr/bin/gunzip';
 my $LASTCOMM = '/usr/bin/lastcomm';
 my $MKTEMP = '/usr/bin/mktemp';
+my $PS = '/bin/ps';
 my $SENDMAIL = '/usr/sbin/sendmail';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.13d of 10 March 2020';
+my $VERSION = 'reportnew 1.14 of 2 September 2023';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -153,6 +159,9 @@ my $LOG_TYPE_STANDARD_LOG = 0;
 my $LOG_TYPE_CYCLOG_OR_MULTILOG = 1;
 my $LOG_TYPE_PROCESS_ACCOUNTING = 2;
 
+my $LOG_PROCESSING_START = 1;
+my $LOG_PROCESSING_END = 2;
+
 ### Variables.
 
 # Filenames.
@@ -160,29 +169,30 @@ use vars qw($config_file $size_file);
 
 # Global variables from config file.
 use vars qw(
-	    $master_notify
-            $email_sender
-	    @logfiles
-	    %match_hash
-	    %exclude_hash
-	    %action_hash
-	    %match_hash_ref
-	    %exclude_hash_ref
-	    %action_hash_ref
-	    );
+    $master_notify
+    $email_sender
+    @logfiles
+    %match_hash
+    %exclude_hash
+    %action_hash
+    %match_hash_ref
+    %exclude_hash_ref
+    %action_hash_ref
+    );
 
 # Global variables from size file.
 use vars qw(
-	    %log_size
-	    %log_mtime
-	    %log_checktime
-            %log_sha256_digest
-	    );
+    %log_size
+    %log_mtime
+    %log_checktime
+    %log_sha256_digest
+    %log_processing_pid
+    );
 
 # Other global variables.
 use vars qw(
-	    $debug_mode
-	    );
+    $debug_mode
+    );
 
 # Local variables in main program.
 my ($logfile, $size, $mtime, $sha256_digest,  @cyclog_files, $cyclog_file,
@@ -209,9 +219,17 @@ if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
 
 &parse_config ($config_file);
 
-&read_size_file ($size_file);
+# Modified to read and write size file after each log processed, so that
+# if something fails on processing, work already done isn't repeated.
 
 foreach $logfile (@logfiles) {
+
+    # Read all logs from size file, skip this one if it's already
+    # being processed, otherwise mark this one as being processed.
+    &read_size_file ($size_file);
+    next if ($log_processing_pid{$logfile} != 0 && &pid_exists ($log_processing_pid{$logfile}));
+    &write_size_file ($size_file, $logfile, $LOG_PROCESSING_START); # save PID
+    
     if ($logfile eq $PROCESS_ACCOUNTING_LOG) {
 	# Read process accounting logs out to the last time seen, or
 	# for all of it, and write it out to a tmp file, $temp_logfile,
@@ -340,9 +358,12 @@ foreach $logfile (@logfiles) {
 	    &send_error ($logfile, "Could not open cyclog/multilog $logfile. $!");
 	}
     }
-}
 
-&write_size_file ($size_file);
+    # Read all other logs from size file, then update this one.
+    &read_size_file ($size_file, $logfile);
+    &write_size_file ($size_file, $logfile, $LOG_PROCESSING_END);
+    
+}
 
 ### Subroutines.
 
@@ -813,8 +834,8 @@ sub gunzip_logfile {
     $temp_in_file = basename ($logfile);
     $temp_out_file = substr ($temp_in_file, 0, length ($temp_in_file) - 3);
     $temp_logfile = $temp_dir . '/' . $temp_out_file;
-    
-    system "$COPY $logfile $temp_dir/";
+
+    copy ($logfile, "$temp_dir/$temp_in_file");
     system "$GUNZIP $temp_dir/$temp_in_file -o $temp_logfile";
 
     return ($temp_logfile);
@@ -1012,9 +1033,10 @@ sub valid_regexp {
 }
 
 # Read the contents of the size file.
+# If a current_logfile is specified, do not update hashes for that logfile.
 sub read_size_file {
-    my ($size_file) = @_;
-    my ($logfile, $size, $mtime, $checktime, $sha256_digest);
+    my ($size_file, $current_logfile) = @_;
+    my ($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid);
 
     if (!-e $size_file) {
 	foreach $logfile (@logfiles) {
@@ -1022,26 +1044,33 @@ sub read_size_file {
 	    $log_mtime{$logfile} = 0;
 	    $log_checktime{$logfile} = 0;
 	    $log_sha256_digest{$logfile} = '';
+	    $processing_pid = 0;
 	}
     }
     else {
 	if (open (SIZEFILE, $size_file)) {
 	    while (<SIZEFILE>) {
 		chop;
-		($logfile, $size, $mtime, $checktime, $sha256_digest) = split (/,/);
+		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = split (/,/);
 		if (!grep ($_ eq $logfile, @logfiles)) {
 		    &send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Logfile $logfile in size file is not in config file.");
 		}
-		$log_size{$logfile} = $size;
-		$log_mtime{$logfile} = $mtime;
-		$log_checktime{$logfile} = $checktime;
-		if (!defined ($sha256_digest)) { # old size file
-		    $sha256_digest = '';
+		if (!defined ($current_logfile) || $current_logfile ne $logfile) {
+		    $log_size{$logfile} = $size;
+		    $log_mtime{$logfile} = $mtime;
+		    $log_checktime{$logfile} = $checktime;
+		    if (!defined ($sha256_digest)) { # old size file
+			$sha256_digest = '';
+		    }
+		    elsif ($sha256_digest eq 'null') { # how we store null ones
+			$sha256_digest = '';
+		    }
+		    $log_sha256_digest{$logfile} = $sha256_digest;
+		    if (!defined ($processing_pid)) { # old size file
+			$processing_pid = 0;
+		    }
+		    $log_processing_pid{$logfile} = $processing_pid;
 		}
-		elsif ($sha256_digest eq 'null') { # how we store null ones
-		    $sha256_digest = '';
-		}
-		$log_sha256_digest{$logfile} = $sha256_digest;
 	    }
 	    close (SIZEFILE);
 	}
@@ -1050,13 +1079,16 @@ sub read_size_file {
 	    exit;
 	}
 
-	foreach $logfile (@logfiles) {
-	    if (!defined ($log_size{$logfile})) {
-		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Logfile $logfile in config file is not in size file.");
-		$log_size{$logfile} = 0;
-		$log_mtime{$logfile} = 0;
-		$log_checktime{$logfile} = 0;
-		$log_sha256_digest{$logfile} = '';
+	if (!defined ($current_logfile)) {
+	    foreach $logfile (@logfiles) {
+		if (!defined ($log_size{$logfile})) {
+		    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Logfile $logfile in config file is not in size file.");
+		    $log_size{$logfile} = 0;
+		    $log_mtime{$logfile} = 0;
+		    $log_checktime{$logfile} = 0;
+		    $log_sha256_digest{$logfile} = '';
+		    $log_processing_pid{$logfile} = 0;
+		}
 	    }
 	}
     }
@@ -1141,6 +1173,10 @@ sub send_notify {
 	}
     }
 
+    # It is possible to get here before $email_sender is defined if
+    # an error occurs while still parsing the config.
+    $email_sender = $EMAIL_SENDER if (!defined ($email_sender));
+
     if ($debug_mode) {
 	print "$hostname: $logfile ($notify_list)\n";
 	foreach $line (@lines) {
@@ -1206,27 +1242,102 @@ sub send_error {
 }
 
 # Write out size file.
+# Since other processes could be operating (though this is not normally
+# expected behavior), we write output to a new size file in the temp
+# dir from the current size file except for what we're updating, then
+# copy it back over the old one.
+# If no current logfile is specified or the current sizefile cannot
+# be opened, then we write out everything.
 sub write_size_file {
-    my ($size_file) = @_;
-    my ($logfile, $sha256_digest);
+    my ($size_file, $current_logfile, $start_or_end) = @_;
+    my ($logfile, $sha256_digest, $my_pid);
+    my ($temp_dir, $temp_in_file, $write_all_logfiles);
 
-    if (open (SIZEFILE, ">$size_file")) {
-	foreach $logfile (@logfiles) {
-	    # Write out 'null' if blank. Should only be for process accounting logs.
-	    if (!defined ($log_sha256_digest{$logfile})) {
-		$sha256_digest = 'null';
-	    }
-	    else {
-		$sha256_digest = $log_sha256_digest{$logfile};
-		$sha256_digest = 'null' if ($sha256_digest eq '');
-	    }
+    if (!defined ($current_logfile)) {
+	$write_all_logfiles = 1;
+    }
+    else {
+	$write_all_logfiles = 0;
+    }
 
-	    # Write it all out.
-	    print SIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},$sha256_digest\n";
+    # Create temp directory to write data to.
+    $temp_dir = `$MKTEMP -d -q /tmp/reportnew.XXXXXXX`;
+    chop ($temp_dir);
+    $temp_in_file = basename ($size_file);
+
+    $write_all_logfiles = 1 if (!open (SIZEFILE, $size_file));
+
+    if (open (TEMPSIZEFILE, ">$temp_dir/$temp_in_file")) {
+	if ($write_all_logfiles) {
+	    foreach $logfile (@logfiles) {
+		# Write out 'null' if blank. Should only be for process accounting logs.
+		if (!defined ($log_sha256_digest{$logfile})) {
+		    $sha256_digest = 'null';
+		}
+		else {
+		    $sha256_digest = $log_sha256_digest{$logfile};
+		    $sha256_digest = 'null' if ($sha256_digest eq '');
+		}
+
+		# Write it all out.
+		if ($logfile eq $current_logfile && $start_or_end == $LOG_PROCESSING_START) {
+		    $my_pid = $$;
+		}
+		else {
+		    $my_pid = 0;
+		}
+		print TEMPSIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},$sha256_digest,$my_pid\n";
+	    }
 	}
-	close (SIZEFILE);
+	else { # just changing current log info
+	    while (<SIZEFILE>) {
+		chop;
+		($logfile) = split (/,/, $_);
+		if ($logfile eq $current_logfile) {
+		    # Write out 'null' if blank. Should only be for process accounting logs.
+		    if (!defined ($log_sha256_digest{$logfile})) {
+			$sha256_digest = 'null';
+		    }
+		    else {
+			$sha256_digest = $log_sha256_digest{$logfile};
+			$sha256_digest = 'null' if ($sha256_digest eq '');
+		    }
+			
+		    # Write it all out.
+		    if ($logfile eq $current_logfile && $start_or_end == $LOG_PROCESSING_START) {
+			$my_pid = $$;
+		    }
+		    else {
+			$my_pid = 0;
+		    }
+		    print TEMPSIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},$sha256_digest,$my_pid\n";
+		}
+		else {
+		    print TEMPSIZEFILE "$_\n";
+		}
+	    }
+	    close (SIZEFILE);
+	}
+	close (TEMPSIZEFILE);
+
+	# Copy it back and remove temp dir.
+	copy ("$temp_dir/$temp_in_file", $size_file);
+	unlink ("$temp_dir/$temp_in_file");
+	unlink ($temp_dir);
     }
     else {
 	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
     }
 }
+
+# Subroutine to return 1 if process exists, 0 otherwise.
+sub pid_exists {
+    my ($pid) = @_;
+    my $ps_output;
+    
+    $ps_output = `$PS -p $pid`;
+    $ps_output =~ s/^.*\n//; # remove header
+    return 1 if length ($ps_output > 1);
+    return 0;
+}
+    
