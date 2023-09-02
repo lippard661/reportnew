@@ -1,12 +1,15 @@
-BUGS:
+BUGS
 
-* Write out size file again for each log completed?  Have an issue where
-reportnew crashes, and then crashes each successive time.
+Should really lock size file, only read and write necessary logfile
+entries.
 
 FEATURES:
 
+* Add macros? Or a way to set baseline log settings for multiple hosts
+  that can be enhanced for a specific host? (Macros might be the easiest
+  way to implement.)
 * The cyclog/multilog logic for looking at prior log files should
-  also be implemented for standard logfiles that have been rotated. DONE
+  also be implemented for standard logfiles that have been rotated.
 * Add action to re-log specific indicators from a log entry into
   an indicator log in something like Fortinet's log format, which
   identifies source host, source log, date/time from the original log
@@ -131,11 +134,16 @@ action: notify ...
 
 will collect the match: session-with lines, and will collect the matching group from the exclude line, and only notify on what matches both.
 
-Add another kind of session matching:
+Other things I might want to be able to do:
+Match all lines from one match to another?  match: start-with / exclude: end-after?
 
-match: session-start /start-string-match/
-exclude: session-end /end-string-match/
-action: notify
+Definitely want to be able to do this matching across log rotations.
+Two options:
+(1) Rebuild implementation of log rotation and cyclog/multilog handling to not require multiple calls to check_logfile (i.e., do it internally).
+(2) Save the relevant arrays (notify_arrays, session_match_arrays) to a file, hold off on actions to the next check_logfile invocation (i.e., add an option to check_logfile
+    to save the data and restore the data, and not do actions until the last call).
+(3) for the current kind of session match, it would be sufficient to grep or zgrep one prior log file [keeping in mind that the current logfile might be a rotated one] for
+    the collected matches, without bothering to save any information across invocations of check_logfile. This is probably simplest -- pass a flag that indicates to do this.
 
-Start collecting at /start-string-match/ and end collecting at /end-string-match/
-(like doing a temporary match all/exclude none.)
+It might be best to build log objects that track multiple names, rotation format and type, etc.
+
