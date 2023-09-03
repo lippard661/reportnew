@@ -1337,7 +1337,7 @@ sub pid_exists {
     
     $ps_output = `$PS -p $pid`;
     $ps_output =~ s/^.*\n//; # remove header
-    return 1 if length ($ps_output > 1);
+    return 1 if length ($ps_output) > 1;
     return 0;
 }
     
