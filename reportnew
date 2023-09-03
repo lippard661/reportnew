@@ -1323,7 +1323,7 @@ sub write_size_file {
 	# Copy it back and remove temp dir.
 	copy ("$temp_dir/$temp_in_file", $size_file);
 	unlink ("$temp_dir/$temp_in_file");
-	unlink ($temp_dir);
+	rmdir ($temp_dir);
     }
     else {
 	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
