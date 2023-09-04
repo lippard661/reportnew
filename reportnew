@@ -1267,7 +1267,7 @@ sub write_size_file {
 	if ($start_or_end == $LOG_APPEND) {
 	    # just write new logfile to end and exit
 	    open (SIZEFILE, ">>$size_file"); # ignore errors?
-	    print SIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},null,0\n";
+	    print SIZEFILE "$current_logfile,$log_size{$current_logfile},$log_mtime{$current_logfile},$log_checktime{$current_logfile},null,0\n";
 	    close (SIZEFILE);
 	    return;
 	}
