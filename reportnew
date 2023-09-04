@@ -78,6 +78,10 @@
 #    for errors that occur before it is defined, and to track current
 #    processing on a log in the size file so that another process doesn't
 #    start processing on the same log. Use File::Copy instead of system cp.
+# Modified 3 September 2023 by Jim Lippard to fix minor bugs and properly
+#    identify gzipped rotated log files.
+# Modified 4 September 2023 by Jim Lippard to add new logfiles to size file
+#    again, since I broke that.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -140,7 +144,7 @@ my $PS = '/bin/ps';
 my $SENDMAIL = '/usr/sbin/sendmail';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.14 of 2 September 2023';
+my $VERSION = 'reportnew 1.14a of 4 September 2023';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -161,6 +165,7 @@ my $LOG_TYPE_PROCESS_ACCOUNTING = 2;
 
 my $LOG_PROCESSING_START = 1;
 my $LOG_PROCESSING_END = 2;
+my $LOG_APPEND = 3;
 
 ### Variables.
 
@@ -1088,6 +1093,7 @@ sub read_size_file {
 		    $log_checktime{$logfile} = 0;
 		    $log_sha256_digest{$logfile} = '';
 		    $log_processing_pid{$logfile} = 0;
+		    &write_size_file ($size_file, $logfile, $LOG_APPEND);
 		}
 	    }
 	}
@@ -1258,6 +1264,13 @@ sub write_size_file {
     }
     else {
 	$write_all_logfiles = 0;
+	if ($start_or_end == $LOG_APPEND) {
+	    # just write new logfile to end and exit
+	    open (SIZEFILE, ">>$size_file"); # ignore errors?
+	    print SIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},null,0\n";
+	    close (SIZEFILE);
+	    return;
+	}
     }
 
     # Create temp directory to write data to.
