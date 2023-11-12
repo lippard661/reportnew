@@ -82,6 +82,13 @@
 #    identify gzipped rotated log files.
 # Modified 4 September 2023 by Jim Lippard to add new logfiles to size file
 #    again, since I broke that.
+# Modified 11 November 2023 by Jim Lippard to add macro substitution, both
+#    pre-processing (to simplify match/exclude rules) and post-processing
+#    (to enrich output by appending macro name or substituting macro name
+#    in results). Added global and per-host macros in a single namespace.
+# Modified 12 November 2023 by Jim Lippard to add special handling of
+#    post-processing macro substitution for IP addresses to avoid appending
+#    or substitution in the middle of a larger matching IP address.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -93,16 +100,8 @@
 # * Process all rotated logs and original log, as well as all components
 #   of cyclogs or multilogs, together and process all notifications for them
 #   together at once instead of once per match per file.
-# * Have a way to capture context which can be reported for certain matches,
-#   including context prior to and after the matching log line (e.g., for
-#   logging of session-related information which may have relevant information
-#   from the start or end of the session that you only want to see if
-#   certain events occur during the session.
 # * Allow customization of subject line so that multiple reportnew
 #   configs can be used on the same machine/same logs and be distinguishable.
-# * Allow a "replace" rule that has regexps for string replacement in what
-#   gets reported (e.g., to replace known IPs or MAC addresses with human
-#   readable strings).
 # * Allow to run continuously (like swatch) monitoring logs with
 #   select.  That will perhaps be more efficient than starting up
 #   a perl process every N minutes, and will catch log changes more
@@ -144,7 +143,7 @@ my $PS = '/bin/ps';
 my $SENDMAIL = '/usr/sbin/sendmail';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.14a of 4 September 2023';
+my $VERSION = 'reportnew 1.15 of 12 November 2023';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -167,6 +166,10 @@ my $LOG_PROCESSING_START = 1;
 my $LOG_PROCESSING_END = 2;
 my $LOG_APPEND = 3;
 
+my $GLOBAL_CONTEXT = 1;
+my $HOST_CONTEXT = 2;
+my $LOG_CONTEXT = 3; # not used, uses !defined($current_logfile)
+
 ### Variables.
 
 # Filenames.
@@ -183,6 +186,14 @@ use vars qw(
     %match_hash_ref
     %exclude_hash_ref
     %action_hash_ref
+    %global_preproc_macro
+    $have_global_postproc_macros
+    %global_append_macro
+    %global_substitute_macro   
+    %preproc_macro
+    $have_postproc_macros
+    %append_macro
+    %substitute_macro
     );
 
 # Global variables from size file.
@@ -373,26 +384,100 @@ foreach $logfile (@logfiles) {
 ### Subroutines.
 
 # Subroutine to parse configuration file.
+# As written you the global directives at the top in the sample config file
+# can be anywhere, it would probably be better to have a global section
+# and individual host sections.
 sub parse_config {
     my ($config_file) = @_;
-    my ($directive, $value, $line_num, $current_logfile,
+    my ($current_context, $directive, $value, $line_num, $current_logfile,
 	$specified_host, $current_host, $all_host_master_notify,
 	$action, $action_value, $current_match_session_match_flag);
+    my ($macro_name, $macro_value, $macro_options);
 
     $line_num = 0;
     $specified_host = 0;
     $current_match_session_match_flag = 0;
+    $current_context = $GLOBAL_CONTEXT;
+    $have_global_postproc_macros = 0;
+    $have_postproc_macros = 0;
     if (open (CONFIG, $config_file)) {
 	while (<CONFIG>) {
 	    $line_num++;
-	    if (!/^#|^$/) {
+	    if (!/^\s*#|^\s*$/) {
 		chop;
+		# Macro definitions.
+		if (/^([\w0-9-_]+)\s*=\s*\"(\S+)\"(.*$)/) {
+		    $macro_name = $1;
+		    $macro_value = $2;
+		    $macro_options = $3;
+		    # if !defined ($current_host) then we're in global
+		    # context, otherwise we're in a specific host context.
+		    # need to convert all this stuff to subroutines.
+		    if (defined ($global_preproc_macro{$macro_name})) {
+			&send_error ($config_file, "Previously defined global preproc macro \"$macro_name\" on line $line_num. $_\n");
+			exit;
+		    }
+		    if (defined ($preproc_macro{$macro_name})) {
+			&send_error ($config_file, "Previously defined host preproc macro \"$macro_name\" on line $line_num. $_\n");
+			exit;
+		    }
+		    if ($current_context == $GLOBAL_CONTEXT) {
+			$global_preproc_macro{$macro_name} = $macro_value;
+		    }
+		    else {
+			$preproc_macro{$macro_name} = $macro_value;
+		    }
+		    if ($macro_options =~ /:(append|substitute)/) {
+			if ($1 eq 'append') {
+			    if (defined ($global_append_macro{$macro_value})) {
+				&send_error ($config_file, "Previously defined append global macro value \"$macro_value\" on line $line_num. $_\n");
+				exit;				
+			    }
+			    if (defined ($append_macro{$macro_value})) {
+				&send_error ($config_file, "Previously defined append host macro value \"$macro_value\" on line $line_num. $_\n");
+				exit;
+			    }
+			    if ($current_context == $GLOBAL_CONTEXT) {
+				$global_append_macro{$macro_value} = $macro_name;
+				$have_global_postproc_macros = 1;
+			    }
+			    else {
+				$append_macro{$macro_value} = $macro_name;
+				$have_postproc_macros = 1;
+			    }
+			}
+			else {
+			    if (defined ($global_substitute_macro{$macro_value})) {
+				&send_error ($config_file, "Previously defined substitute global macro value \"$macro_value\" on line $line_num. $_\n");
+				exit;
+			    }
+			    if (defined ($substitute_macro{$macro_value})) {
+				&send_error ($config_file, "Previously defined substitute host macro value \"$macro_value\" on line $line_num. $_\n");
+				exit;
+			    }
+			    if ($current_context == $GLOBAL_CONTEXT) {
+				$global_substitute_macro{$macro_value} = $macro_name;
+				$have_global_postproc_macros = 1;
+			    }
+			    else {
+				$substitute_macro{$macro_value} = $macro_name;
+				$have_postproc_macros = 1;
+			    }
+			}
+		    }
+		    elsif ($macro_options ne '') {
+			&send_error ($config_file, "Invalid macro options for macro \"$macro_name\" on line $line_num. $_\n");
+			exit;
+		    }
+		}
+		elsif (/^.*:.*$/) {
 		($directive, $value) = split (/:\s*/, $_, 2);
 		if ($directive eq 'begin-host') {
 		    if (defined ($master_notify) && !defined ($current_host)) {
 			$all_host_master_notify = $master_notify;
 		    }
 		    $current_host = $value;
+		    $current_context = $HOST_CONTEXT;
 		}
 		elsif ($directive eq 'end-host') {
 		    if ($current_host ne $value) {
@@ -408,6 +493,10 @@ sub parse_config {
 		    undef %match_hash;
 		    undef %exclude_hash;
 		    undef %action_hash;
+		    undef %preproc_macro;
+		    undef %append_macro;
+		    undef %substitute_macro;
+		    $have_postproc_macros = 0;
 		}
 		elsif ($directive eq 'master_notify') {
 		    if (defined ($master_notify)) {
@@ -448,6 +537,8 @@ sub parse_config {
 			exit;
 		    }
 		    if (($value eq 'all') || &valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && &valid_regexp ($1))) {
+			# Do preproc macro substitution.
+			$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%\w+%%/);
 			push (@{$match_hash{$current_logfile}}, $value);
 			if ($value =~ /^session-with/) {
 			    $current_match_session_match_flag = 1;
@@ -475,6 +566,8 @@ sub parse_config {
 			    &send_error ($config_file, "Exclude directive is not a session match but corresponding match directive is on line $line_num. $_");
 			    exit;
 			}
+			# Do preproc macro substitution.
+			$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%\w+%%/);
 			push (@{$exclude_hash{$current_logfile}}, $value);
 		    }
 		    else {
@@ -554,6 +647,7 @@ sub parse_config {
 		    &send_error ($config_file, "Unknown directive on line $line_num. $_");
 		    exit;
 		}
+	    }
 	    }
 	}
 	close (CONFIG);
@@ -788,6 +882,11 @@ sub check_logfile {
 		    }
 		}
 		if ($have_matches_flag) {
+		    # Here is where to do post-processing on @notify_lines to
+		    # do substitution/appending of macro names on values.
+		    if ($have_postproc_macros || $have_global_postproc_macros) {
+			@notify_lines = &postproc_macro_substitution (@notify_lines);
+		    }
 		    if ($action eq 'notify') {
 			&send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
 		    }
@@ -1354,3 +1453,132 @@ sub pid_exists {
     return 0;
 }
     
+# Subroutine to replace macro names with values on preprocessing.
+# Process host macros then global macros.
+sub preproc_macro_substitution {
+    my ($orig_regexp_line, $line_num) = @_;
+    my ($more_to_process, $regexp_line, $macro_name, $global_macro);
+
+    $regexp_line = $orig_regexp_line;
+
+    $more_to_process = 1;
+
+    while ($more_to_process) {
+	if ($regexp_line =~ /%%(\w+)%%/) {
+	    $macro_name = $1;
+	    $global_macro = 0;
+	    if (!defined ($preproc_macro{$macro_name})) {
+		if (defined ($global_preproc_macro{$macro_name})) {
+		    $global_macro = 1;
+		}
+		else {
+		    &send_error ($config_file, "Undefined preproc macro %%$macro_name%% on line $line_num. $orig_regexp_line\n");
+		    exit;
+		}
+	    }
+	    # Replace all occurrences.
+	    if ($global_macro) {
+		$regexp_line =~ s/%%$macro_name%%/$global_preproc_macro{$macro_name}/g;	
+	    }
+	    else {
+		$regexp_line =~ s/%%$macro_name%%/$preproc_macro{$macro_name}/g;
+	    }
+	}
+	else {
+	    $more_to_process = 0;
+	}
+    }
+    return ($regexp_line);
+}
+
+# Subroutine to rewrite output containing macro values by
+# appending or substituting macro names. This would work
+# better if only executed where we know the macro names were
+# present in preprocessing.
+# We have to go through all the macros on each line.
+# Bad stuff could happen if there are macro values that match
+# macro names.
+# Process host macros first, then global macros.
+sub postproc_macro_substitution {
+    my (@output_lines) = @_;
+    my ($output_line, $macro_value, $macro_name);
+
+    my $APPEND = 1;
+    my $SUBSTITUTE = 0;
+
+    if ($have_postproc_macros) {
+	foreach $output_line (@output_lines) {
+	    foreach $macro_value (keys (%append_macro)) {
+		if ($output_line =~ /$macro_value/) {
+		    $output_line = &postproc_match_and_replace ($output_line, $macro_value, $append_macro{$macro_value}, $APPEND);
+		}
+	    }
+	    foreach $macro_value (keys (%substitute_macro)) {
+		if ($output_line =~ /$macro_value/) {
+		    $output_line = &postproc_match_and_replace ($output_line, $macro_value, $substitute_macro{$macro_value}, $SUBSTITUTE);	    
+		}
+	    }
+	}
+    }
+
+    if ($have_global_postproc_macros) {
+	foreach $output_line (@output_lines) {
+	    foreach $macro_value (keys (%global_append_macro)) {
+		if ($output_line =~ /$macro_value/) {
+		    $output_line = &postproc_match_and_replace ($output_line, $macro_value, $global_append_macro{$macro_value}, $APPEND);
+		}
+	    }
+	    foreach $macro_value (keys (%global_substitute_macro)) {
+		if ($output_line =~ /$macro_value/) {
+		    $output_line = &postproc_match_and_replace ($output_line, $macro_value, $global_substitute_macro{$macro_value}, $SUBSTITUTE);	    
+		}
+	    }
+	}
+    }
+    
+    return (@output_lines);
+}
+
+# Subroutine to do post-processing macro matching and replacement,
+# with special handling for IP addresses.
+sub postproc_match_and_replace {
+    my ($line, $macro_value, $macro_name, $append) = @_;
+
+    # Special case handling of macro value matches for IP addresses.
+    # Only match and replace if the IP address is anchored on the left
+    # side by beginning of line, colon, or left bracket and on the right side
+    # by end of line, colon, period, or right bracket.
+    #
+    # Note that this special casing is NOT done on the front end (preproc
+    # macros), as we assume the match rule will contain the context for
+    # anchoring the match--if we stuck things in it could break a rule
+    # and would be very counter-intuitive to the builder of the config.
+    my $IPv4_REGEXP = '^\d{1,3}\\\.\d{1,3}\\\.\d{1,3}\\\.\d{1,3}$';
+    my $IPv6_REGEXP = '^(((?=(?>.*?::)(?!.*::)))(::)?(([0-9A-F]{1,4})::?){0,5}|((?5):){6})(\2((?5)(::?|$)){0,2}|((25[0-5]|(2[0-4]|1[0-9]|[1-9])?[0-9])(\.|$)){4}|(?5):(?5))(?<![^:]:)(?<!\.)\z';
+    my $START_TOKENS = '^|[\s:\[]';
+    my $END_TOKENS = '[\s:\.\]]|$';
+
+    # Replace all occurrences that are neither preceded nor followed by
+    # numeric including hex digits, using negative lookbehind and negative
+    # lookahead. Might be better to do this instead of the start and end
+    # tokens, as well.
+    if ($macro_value =~ /^$IPv4_REGEXP$|^$IPv6_REGEXP$/i) {
+	if ($line =~ /$START_TOKENS$macro_value$END_TOKENS/) {	
+	    if ($append) {
+		$line =~ s/(?<![\da-f])($macro_value)(?![\da-f])/$1\[$macro_name\]/g;
+	    }
+	    else {
+		$line =~ s/(?<![\da-f])($macro_value)(?![\da-f])/$macro_name/g;		
+	    }
+	}
+    }
+    else {
+	if ($append) {
+	    $line =~ s/($macro_value)/$1\[$macro_name\]/g;
+	}
+	else {
+	    $line =~ s/$macro_value/$macro_name/g;	
+	}
+    }
+    return ($line);
+}

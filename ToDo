@@ -1,13 +1,26 @@
 BUGS
 
+Apparently it is possible to set up session-with/session-without rules
+that result in a blank notification message.
+
 Should really lock size file, only read and write necessary logfile
 entries.
 
+Could use general cleanup, more sensible config file parsing (e.g.,
+make use of global/host/log context and restrict directives appropriately,
+build some useful subroutines to eliminate duplication, have some errors
+displayed instead of everything emailed.
+
+Set up a separate user, use privilege separation and pledge.
+
 FEATURES:
 
-* Add macros? Or a way to set baseline log settings for multiple hosts
-  that can be enhanced for a specific host? (Macros might be the easiest
-  way to implement.)
+* Add match-table and exclude-table, which give a filename of a lookup
+  table -- extra argument that goes with match/exclude, or replaces it?
+  Should tell what part of the log string to compare against lines of the
+  table. Table contents should also be able to be regexps. (Would this
+  be any more efficient? If not, no value.)
+
 * The cyclog/multilog logic for looking at prior log files should
   also be implemented for standard logfiles that have been rotated.
 * Add action to re-log specific indicators from a log entry into
@@ -17,7 +30,6 @@ FEATURES:
   client IP, protocol, permitted or blocked, mail from/rcpt to/subject,
   etc. Such a log would be useful for auto-generation of block and monitor
   lists for pf. This might be a replacement for the below script idea?
-* Add enrich: [{x,y},{x,y}] which will substitute y for x or append "[y]" after x in matching line output. (Or could be done via execute...)
 * Finish action: execute <script>
 * Create a separate parsing script for both pf and DNS query logs,
     which keeps a database of observed IP addresses/ports and IP
@@ -31,25 +43,6 @@ FEATURES:
 and so any new commands which immediately followed the last seen, within
 the same minute, will not be shown in the next run--it will stop just before
 them.
-
-To support process accounting files:
-
-1. Use date/time stamp instead of size. (mtime is already captured in
-    size file)
-2. On each run, parse files from present to past until matching
-   time stamp is hit.  Start with first file, then only go to the
-   next if the time stamp isn't hit.  (This isn't really parsing,
-   need to pipe through lastcomm, would be nice to reverse the
-   sequence.)
-
-Perhaps it would be easier if it was specialcased by generating a
-normal logfile out of the process accounting logs?  Each time? Or via
-a separate process like pflogs? (Started specialcasing it at top,
-also need to special case in the subroutine, similar to cyclog?)
-
-Will normal match/exclude work? Not for the time component, or for
-multiple users.  The multiple users part would work if I could have
-multiple distinct match/exclude pairs, which would be useful in general.
 
 It would be nice to add a time component after the regexp. Maybe
    days:<day-of-week-list-or-range> hours:<hour-of-week-list-or-range>
@@ -98,7 +91,7 @@ Set up some examples...
 
 match: /lippard use of sudo/ days:Sun-Thu hours:0-5,22-24 days:Fri-Sat hours:05
 exclude: none
-action: text jim.lippard@gmail.com
+action: text user@host
 
 Actually, don't like weekdays/weekends, as the above example illustrates,
 unless "weekend" means Fri-Sat, not Sat-Sun.
