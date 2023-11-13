@@ -538,7 +538,7 @@ sub parse_config {
 		    }
 		    if (($value eq 'all') || &valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && &valid_regexp ($1))) {
 			# Do preproc macro substitution.
-			$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%\w+%%/);
+			$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w0-9-_]+%%/);
 			push (@{$match_hash{$current_logfile}}, $value);
 			if ($value =~ /^session-with/) {
 			    $current_match_session_match_flag = 1;
@@ -567,7 +567,7 @@ sub parse_config {
 			    exit;
 			}
 			# Do preproc macro substitution.
-			$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%\w+%%/);
+			$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w0-9-_]+%%/);
 			push (@{$exclude_hash{$current_logfile}}, $value);
 		    }
 		    else {
@@ -1464,7 +1464,7 @@ sub preproc_macro_substitution {
     $more_to_process = 1;
 
     while ($more_to_process) {
-	if ($regexp_line =~ /%%(\w+)%%/) {
+	if ($regexp_line =~ /%%([\w0-9-_]+)%%/) {
 	    $macro_name = $1;
 	    $global_macro = 0;
 	    if (!defined ($preproc_macro{$macro_name})) {
