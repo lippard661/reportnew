@@ -1,7 +1,8 @@
 BUGS
 
 Apparently it is possible to set up session-with/session-without rules
-that result in a blank notification message.
+that result in a blank notification message. (Likely due to excess
+capture group in match rules.)
 
 Should really lock size file, only read and write necessary logfile
 entries.
@@ -10,6 +11,17 @@ Could use general cleanup, more sensible config file parsing (e.g.,
 make use of global/host/log context and restrict directives appropriately,
 build some useful subroutines to eliminate duplication, have some errors
 displayed instead of everything emailed.
+
+Macro post-processing will improperly match IP addresses that contain
+other IP addresses, and do substitution or appending inside the full
+IP address. One way to solve (a tough one) is to have post-processing track
+which macros are used in each match line and only do appending or substitution
+for those, even including the context of the match from the match line,
+which should be sufficient to prevent the false positive matches.
+Easier quick fix is to special-case IP address macros, and when searching
+for them, anchor each end against likely separators (beginning of line,
+:, whitespace for the left hand side, end of line, :, ., whitespace for
+the right hand side). (DONE, also uses right bracket for right hand side)
 
 Set up a separate user, use privilege separation and pledge.
 
