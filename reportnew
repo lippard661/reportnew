@@ -149,6 +149,7 @@ my $MKTEMP = '/usr/bin/mktemp';
 my $PS = '/bin/ps';
 my $SENDMAIL = '/usr/sbin/sendmail';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
+my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
 my $VERSION = 'reportnew 1.16b of 30 December 2023';
 
@@ -261,6 +262,9 @@ if ($^O eq 'openbsd') {
     unveil ($PS, 'x');
     unveil ($SENDMAIL, 'x');
     unveil ($TAI64NLOCAL, 'x');
+
+    # Needed to parse dates on process accounting logs.
+    unveil ($ZONEINFO_DIR, 'r');
 
     foreach $logfile (@logfiles) {
 	$logdir = dirname ($logfile);
