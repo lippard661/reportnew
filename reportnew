@@ -93,6 +93,9 @@
 #    file system access to read-only for logs, execute-only for commands, and
 #    read/write/create for /tmp.
 # Modified 30 December 2023 by Jim Lippard to call pledge correctly.
+# Modified 1 January 2024 by Jim Lippard so that first look at process
+#    accounting logs in a new year doesn't go to the beginning (call to
+#    parsedate was not using PREFER_PAST).
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -151,7 +154,7 @@ my $SENDMAIL = '/usr/sbin/sendmail';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.16b of 30 December 2023';
+my $VERSION = 'reportnew 1.16c of 1 January 2024';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1132,7 +1135,7 @@ sub read_process_acct_log {
 	    ($command, $flags, $user, $tty, $time_info) = split (/\s+/, $_, 5);
 	    ($cpu, $secs, $day_name, $month, $day, $time, $duration) = split (/\s+/, $time_info, 7);
 	    $time = $day_name . ' ' . $month . ' ' . $day . ' ' . $time;
-	    $time_dec = parsedate ($time);
+	    $time_dec = parsedate ($time, PREFER_PAST => 1);
 	    $duration =~ s/^\((.*)\)$/$1/;
 
 	    # Stop this once we reach an entry earlier than last check.
