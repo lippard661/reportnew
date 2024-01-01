@@ -4,9 +4,6 @@ Apparently it is possible to set up session-with/session-without rules
 that result in a blank notification message. (Likely due to excess
 capture group in match rules.)
 
-Should really lock size file, only read and write necessary logfile
-entries.
-
 Could use general cleanup, more sensible config file parsing (e.g.,
 make use of global/host/log context and restrict directives appropriately,
 build some useful subroutines to eliminate duplication, have some errors
