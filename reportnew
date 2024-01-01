@@ -96,6 +96,8 @@
 # Modified 1 January 2024 by Jim Lippard so that first look at process
 #    accounting logs in a new year doesn't go to the beginning (call to
 #    parsedate was not using PREFER_PAST).
+# Modified 1 January 2024 by Jim Lippard to clean up size file code and
+#    implement file locking.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -122,6 +124,7 @@
 
 use strict;
 use Digest::SHA qw( sha256_hex );
+use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Copy;
 #use Privileges::Drop;
@@ -162,6 +165,8 @@ my $DEFAULT_SIZE_FILE_DIR = '/etc/reportnew';
 my $DEFAULT_SIZE_FILE_NAME = 'reportnew.size';
 my $CONFIG_SUFFIX = ".conf";
 my $SIZE_SUFFIX = ".size";
+
+my $SIZE_FILE_LOCK_TIMEOUT_LIMIT = 10;
 
 my $PROCESS_ACCOUNTING_LOG = '/var/account/acct';
 my $MAX_PROCESS_ACCOUNTING_FILE = 3;
@@ -255,7 +260,7 @@ if ($^O eq 'openbsd') {
     my (%unveiled_dirs, $logdir);
 
     # Pledge. stdio is already included.
-    pledge ('exec', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'access', 'ps');
+    pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock', 'ps') || die "Cannot pledge promises. $!\n";
     
     # Allow execution of commands.
     unveil ($ECHO, 'x');
@@ -452,7 +457,7 @@ sub parse_config {
     $current_context = $GLOBAL_CONTEXT;
     $have_global_postproc_macros = 0;
     $have_postproc_macros = 0;
-    if (open (CONFIG, $config_file)) {
+    if (open (CONFIG, '<', $config_file)) {
 	while (<CONFIG>) {
 	    $line_num++;
 	    if (!/^\s*#|^\s*$/) {
@@ -856,7 +861,7 @@ sub check_logfile {
 
     # Logfile has grown.
     if ($size > $old_size) {
-	if (open (LOG, $logfile)) {
+	if (open (LOG, '<', $logfile)) {
 	    seek (LOG, $old_size, 0) if ($old_size > 0);
 	    while (<LOG>) {
 		chop;
@@ -891,7 +896,7 @@ sub check_logfile {
 				push (@{$notify_arrays[$idx]}, $date . ' ' . $line);
 			    }
 			    elsif ((substr ($date, 0, 1) eq '@') && (length ($date) == 25) && (-e$TAI64NLOCAL)) { # multilog
-				open (TAICONVERT, "$ECHO \"$date\" | $TAI64NLOCAL|");
+				open (TAICONVERT, '-|', "$ECHO \"$date\" | $TAI64NLOCAL");
 				$date = <TAICONVERT>;
 				close (TAICONVERT);
 				chop ($date);
@@ -1015,7 +1020,7 @@ sub first_log_line_sha256_digest {
     my ($logfile) = @_;
     my ($first_line, $sha256_digest);
 
-    if (open (LOG, $logfile)) {
+    if (open (LOG, '<', $logfile)) {
 	$first_line = <LOG>;
 	close (LOG);
 	if (defined ($first_line)) {
@@ -1045,7 +1050,7 @@ sub first_log_line_time {
     my $timezone = $TIME_ZONE;
     my $rfc3339_timezone = 'UTC';
 
-    if (open (LOG, $logfile)) {
+    if (open (LOG, '<', $logfile)) {
 	$first_line = <LOG>;
 	close (LOG);
 	if (defined ($first_line)) {
@@ -1121,7 +1126,7 @@ sub read_process_acct_log {
 	    $acct_file = $acct_log;
 	}
 
-	if (!open (LASTCOMM, "$LASTCOMM -f $acct_file|")) {
+	if (!open (LASTCOMM, '-|', "$LASTCOMM -f $acct_file")) {
 	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
 	    exit; # or just return?
 	}
@@ -1158,7 +1163,7 @@ sub read_process_acct_log {
     chop ($temp_logfile);
 
     # Open temp file for writing.
-    if (!open (TEMPFILE, ">$temp_logfile")) {
+    if (!open (TEMPFILE, '>', $temp_logfile)) {
 	    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 	    exit; # or just return?
 	}
@@ -1204,7 +1209,10 @@ sub read_size_file {
 	}
     }
     else {
-	if (open (SIZEFILE, $size_file)) {
+	if (open (SIZEFILE, '<', $size_file)) {
+	    if (!flock (SIZEFILE, LOCK_SH)) {
+		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
+	    }
 	    while (<SIZEFILE>) {
 		chop;
 		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = split (/,/);
@@ -1227,6 +1235,9 @@ sub read_size_file {
 		    }
 		    $log_processing_pid{$logfile} = $processing_pid;
 		}
+	    }
+	    if (!flock (SIZEFILE, LOCK_UN)) {
+		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
 	    }
 	    close (SIZEFILE);
 	}
@@ -1342,7 +1353,7 @@ sub send_notify {
     }
 
     else {
-	open (MAIL, "|$SENDMAIL -t");
+	open (MAIL, '|-', "$SENDMAIL -t");
 	print MAIL "From: Reporter <$email_sender>\n";
 	print MAIL "To: $notify_list\n";
 	print MAIL "Subject: $hostname $logfile\n\n";
@@ -1378,7 +1389,7 @@ sub send_text {
     }
 
     else {
-	open (MAIL, "|$SENDMAIL -t $notify_list");
+	open (MAIL, '|-', "$SENDMAIL -t $notify_list");
 	foreach $line (@lines) {
 	    print MAIL "$line\n";
 	}
@@ -1399,41 +1410,115 @@ sub send_error {
 }
 
 # Write out size file.
-# Since other processes could be operating (though this is not normally
-# expected behavior), we write output to a new size file in the temp
-# dir from the current size file except for what we're updating, then
-# copy it back over the old one.
-# If no current logfile is specified or the current sizefile cannot
-# be opened, then we write out everything.
+# This is always called immediately after a read_size_file, though one
+# which might skip the current logfile.
+# If current_logfile is not specified or the size file doesn't exist
+# or can't be opened for reading but can be opened for writing and locked,
+# we write out everything.
+# If it's a new logfile that isn't in the size file, we just append it
+# to the end.
+# Otherwise, we read everything in and overwrite with the just-read data
+# except for the log file we're updating.
 sub write_size_file {
     my ($size_file, $current_logfile, $start_or_end) = @_;
     my ($logfile, $sha256_digest, $my_pid);
-    my ($temp_dir, $temp_in_file, $write_all_logfiles);
+    my ($write_all_logfiles,
+	$lock_timeout_limit, @size_file_lines, $size_file_line);
 
-    if (!defined ($current_logfile)) {
-	$write_all_logfiles = 1;
+    # If we're just adding a new logfile to the end of the size file,
+    # do that.
+    if (defined ($current_logfile) && $start_or_end == $LOG_APPEND) {
+	if (!open (SIZEFILE, '>>', $size_file)) {
+	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for appending. $!");
+	    exit;
+	}
+	$lock_timeout_limit = time() + $SIZE_FILE_LOCK_TIMEOUT_LIMIT;
+	until (flock (SIZEFILE, LOCK_EX | LOCK_NB)) {
+	    if (time() > $lock_timeout_limit) {
+		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for writing. $!");
+		exit;
+	    }
+	    sleep 1;
+	}
+	print SIZEFILE "$current_logfile,$log_size{$current_logfile},$log_mtime{$current_logfile},$log_checktime{$current_logfile},null,0\n";
+	if (!flock (SIZEFILE, LOCK_UN)) {
+	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after appending. $!");
+	    exit;
+	}
+	close (SIZEFILE);
+	return;
+    }
+
+    # If we're just changing a single logfile, read in the current
+    # size file without parsing (but we do lock).
+    if (defined ($current_logfile) && (-e $size_file)) {
+	$write_all_logfiles = 0;
+	if (open (SIZEFILE, '<', $size_file)) {
+	    if (flock (SIZEFILE, LOCK_SH)) {
+		@size_file_lines = <SIZEFILE>;
+	    }
+	    else {
+		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
+		exit;
+	    }
+	}
+	else {
+	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for reading. $!");
+	    exit;
+	}
+	if (!flock (SIZEFILE, LOCK_UN)) {
+	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
+	    exit;
+	}
+	close (SIZEFILE);
     }
     else {
-	$write_all_logfiles = 0;
-	if ($start_or_end == $LOG_APPEND) {
-	    # just write new logfile to end and exit
-	    open (SIZEFILE, ">>$size_file"); # ignore errors?
-	    print SIZEFILE "$current_logfile,$log_size{$current_logfile},$log_mtime{$current_logfile},$log_checktime{$current_logfile},null,0\n";
-	    close (SIZEFILE);
-	    return;
-	}
+	$write_all_logfiles = 1;
     }
 
-    # Create temp directory to write data to.
-    $temp_dir = `$MKTEMP -d -q /tmp/reportnew.XXXXXXX`;
-    chop ($temp_dir);
-    $temp_in_file = basename ($size_file);
+    # Now, we write everything out, either with what we have or with what
+    # was just read from the size file except for our current logfile.
+    if (!open (SIZEFILE, '>', $size_file)) {
+	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
+	exit;
+    }
 
-    $write_all_logfiles = 1 if (!open (SIZEFILE, $size_file));
+    $lock_timeout_limit = time() + $SIZE_FILE_LOCK_TIMEOUT_LIMIT;
+    until (flock (SIZEFILE, LOCK_EX | LOCK_NB)) {
+	if (time() > $lock_timeout_limit) {
+	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for writing. $!");
+	    exit;
+	}
+	sleep 1;
+    }
 
-    if (open (TEMPSIZEFILE, ">$temp_dir/$temp_in_file")) {
-	if ($write_all_logfiles) {
-	    foreach $logfile (@logfiles) {
+    # If we're writing out all log files, do that.
+    if ($write_all_logfiles) {
+	foreach $logfile (@logfiles) {
+	    # Write out 'null' if blank. Should only be for process accounting logs.
+	    if (!defined ($log_sha256_digest{$logfile})) {
+		$sha256_digest = 'null';
+	    }
+	    else {
+		$sha256_digest = $log_sha256_digest{$logfile};
+		$sha256_digest = 'null' if ($sha256_digest eq '');
+	    }
+
+	    # Write it all out.
+	    if ($logfile eq $current_logfile && $start_or_end == $LOG_PROCESSING_START) {
+		$my_pid = $$;
+	    }
+	    else {
+		$my_pid = 0;
+	    }
+	    print SIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},$sha256_digest,$my_pid\n";
+	}
+    }
+    else { # just changing current log info
+	foreach $size_file_line (@size_file_lines) {
+	    chop ($size_file_line);
+	    ($logfile) = split (/,/, $size_file_line);
+	    if ($logfile eq $current_logfile) {
 		# Write out 'null' if blank. Should only be for process accounting logs.
 		if (!defined ($log_sha256_digest{$logfile})) {
 		    $sha256_digest = 'null';
@@ -1450,48 +1535,20 @@ sub write_size_file {
 		else {
 		    $my_pid = 0;
 		}
-		print TEMPSIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},$sha256_digest,$my_pid\n";
+		print SIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},$sha256_digest,$my_pid\n";
+	    }
+	    else {
+		print SIZEFILE "$size_file_line\n";
 	    }
 	}
-	else { # just changing current log info
-	    while (<SIZEFILE>) {
-		chop;
-		($logfile) = split (/,/, $_);
-		if ($logfile eq $current_logfile) {
-		    # Write out 'null' if blank. Should only be for process accounting logs.
-		    if (!defined ($log_sha256_digest{$logfile})) {
-			$sha256_digest = 'null';
-		    }
-		    else {
-			$sha256_digest = $log_sha256_digest{$logfile};
-			$sha256_digest = 'null' if ($sha256_digest eq '');
-		    }
-			
-		    # Write it all out.
-		    if ($logfile eq $current_logfile && $start_or_end == $LOG_PROCESSING_START) {
-			$my_pid = $$;
-		    }
-		    else {
-			$my_pid = 0;
-		    }
-		    print TEMPSIZEFILE "$logfile,$log_size{$logfile},$log_mtime{$logfile},$log_checktime{$logfile},$sha256_digest,$my_pid\n";
-		}
-		else {
-		    print TEMPSIZEFILE "$_\n";
-		}
-	    }
-	    close (SIZEFILE);
-	}
-	close (TEMPSIZEFILE);
+    }
 
-	# Copy it back and remove temp dir.
-	copy ("$temp_dir/$temp_in_file", $size_file);
-	unlink ("$temp_dir/$temp_in_file");
-	rmdir ($temp_dir);
+    # Unlock and close size file.
+    if (!flock (SIZEFILE, LOCK_UN)) {
+	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after writing. $!");
+	exit;
     }
-    else {
-	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
-    }
+    close (SIZEFILE);
 }
 
 # Subroutine to return 1 if process exists, 0 otherwise.
