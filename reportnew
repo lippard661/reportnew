@@ -272,9 +272,6 @@ if ($^O eq 'openbsd') {
     # Allow writing to and creating files and dirs in /tmp.
     unveil ('/tmp', 'rwc');
 
-    # Allow reading and writing to size file.
-    unveil ($size_file, 'rwc');
-
     # Unveil directory where config file is, so that any macros
     # with file import can be processed.
     my $macro_dir = dirname ($config_file);
@@ -296,6 +293,9 @@ if ($^O eq 'openbsd') {
 	    $unveiled_dirs{$logdir} = 1;
 	}
     }
+
+    # Allow reading and writing to size file.
+    unveil ($size_file, 'rwc');
 
     # Now lock it to just those.
     unveil ();
