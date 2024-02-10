@@ -5,7 +5,7 @@ Supports syslog, cyclog, multilog, and BSD process accounting logs. Runs periodi
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.16c.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2024-pkg.pub
+reportnew-1.17.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2024-pkg.pub
 
 Current version is reportnew-1.17 of 10 February 2024.
 
