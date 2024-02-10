@@ -299,7 +299,6 @@ if ($^O eq 'openbsd') {
 
     # Now lock it to just those.
     unveil ();
-    
 }
 
 # Modified to read and write size file after each log processed, so that
@@ -445,7 +444,6 @@ foreach $logfile (@logfiles) {
     # Read all other logs from size file, then update this one.
     &read_size_file ($size_file, $logfile);
     &write_size_file ($size_file, $logfile, $LOG_PROCESSING_END);
-    
 }
 
 ### Subroutines.
@@ -626,10 +624,8 @@ sub parse_config {
 		    $email_sender = $value;
 		}
 		elsif ($directive eq 'log') {
-		    if ((!defined ($current_host) || $current_host eq $HOSTNAME) && !-e $value) {
-			&send_error ($config_file, "Logfile does not exist in log directive on line $line_num.  $value");
-			exit;
-		    }
+		    # No longer check for logfile existence here due to need
+		    # to unveil first.
 		    if (grep ($_ eq $value, @logfiles)) {
 			&send_error ($config_file, "Previously defined logfile on line $line_num. $value");
 			exit;
