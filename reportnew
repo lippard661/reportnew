@@ -283,7 +283,7 @@ if ($^O eq 'openbsd') {
 # Unveil log dirs from config and lock.
 # If script execution actions are added, will need to unveil here.
 if ($^O eq 'openbsd') {
-    my (%unveiled_dirs, $logdir);
+    my (%unveiled_dirs, $logdir, $size_file_dir);
 
     # Unveil log directories.
     foreach $logfile (@logfiles) {
@@ -296,6 +296,12 @@ if ($^O eq 'openbsd') {
 
     # Allow reading and writing to size file.
     unveil ($size_file, 'rwc');
+    # Need to unveil containing dir with rwc in order to create
+    # size file if it doesn't already exist.
+    if (!-e $size_file) {
+	$size_file_dir = dirname ($size_file);
+	unveil ($size_file_dir, 'rwc');
+    }
 
     # Now lock it to just those.
     unveil ();
