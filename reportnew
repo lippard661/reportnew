@@ -481,8 +481,12 @@ sub parse_config {
 			exit;
 		    }
 		    # Allow importation of macro value from a file in same
-		    # dir as config file.
-		    if ($macro_value =~ /^<file:(.*)>$/) {
+		    # dir as config file. Only expand if either in global
+		    # context or if in host context for current host.
+		    if ($macro_value =~ /^<file:(.*)>$/ &&
+			(($current_context == $GLOBAL_CONTEXT) ||
+			 ($current_context == $HOST_CONTEXT &&
+			 $current_host eq $HOSTNAME))){
 			$macro_file = $1;
 			$macro_dir = dirname ($config_file);
 			if ($macro_file !~  /^[\w0-9-_\.]+$/) {
