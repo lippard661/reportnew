@@ -251,16 +251,9 @@ if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
     $config_file .= $CONFIG_SUFFIX;
 }
 
-&parse_config ($config_file);
-
-# If OpenBSD, use unveil to identify each log file for read-only access and
-# the temp dir for read/write. Need to include rotated logs, so we
-# just do all log directories.
-# If I ever add script execution, that will require changes here.
-# Also use pledge.
+# If on OpenBSD, use pledge and unveil. Do as much as possible before
+# parsing the config, then finish unveiling after the config is parsed.
 if ($^O eq 'openbsd') {
-    my (%unveiled_dirs, $logdir);
-
     # Pledge. stdio is already included.
     pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock', 'ps') || die "Cannot pledge promises. $!\n";
     
@@ -276,6 +269,26 @@ if ($^O eq 'openbsd') {
     # Needed to parse dates on process accounting logs.
     unveil ($ZONEINFO_DIR, 'r');
 
+    # Allow writing to and creating files and dirs in /tmp.
+    unveil ('/tmp', 'rwc');
+
+    # Allow reading and writing to size file.
+    unveil ($size_file, 'rwc');
+
+    # Unveil directory where config file is, so that any macros
+    # with file import can be processed.
+    my $macro_dir = dirname ($config_file);
+    unveil ($macro_dir, 'r');
+}
+
+&parse_config ($config_file);
+
+# Unveil log dirs from config and lock.
+# If script execution actions are added, will need to unveil here.
+if ($^O eq 'openbsd') {
+    my (%unveiled_dirs, $logdir);
+
+    # Unveil log directories.
     foreach $logfile (@logfiles) {
 	$logdir = dirname ($logfile);
 	if (!defined ($unveiled_dirs{$logdir})) {
@@ -284,14 +297,9 @@ if ($^O eq 'openbsd') {
 	}
     }
 
-    # Allow writing to and creating files and dirs in /tmp.
-    unveil ('/tmp', 'rwc');
-
-    # Allow reading and writing to size file.
-    unveil ($size_file, 'rwc');
-    
     # Now lock it to just those.
     unveil ();
+    
 }
 
 # Modified to read and write size file after each log processed, so that
