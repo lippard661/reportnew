@@ -294,8 +294,14 @@ if ($^O eq 'openbsd') {
 	}
     }
 
-    # Allow reading and writing to size file.
-    unveil ($size_file, 'rwc');
+    # Need to unveil containing dir of size file, which can but
+    # need not be same as containing dir of config file.
+    $size_file_dir = dirname ($size_file);
+    unveil ($size_file_dir, 'r');
+    
+    # Allow reading from and writing to size file.
+    unveil ($size_file, 'rw');
+    
     # Need to unveil containing dir with rwc in order to create
     # size file if it doesn't already exist.
     if (!-e $size_file) {
