@@ -300,7 +300,7 @@ if ($^O eq 'openbsd') {
     unveil ($size_file_dir, 'r');
     
     # Allow reading from and writing to size file.
-    unveil ($size_file, 'rw');
+    unveil ($size_file, 'rwc');
     
     # Need to unveil containing dir with rwc in order to create
     # size file if it doesn't already exist.
