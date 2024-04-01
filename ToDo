@@ -24,6 +24,19 @@ Set up a separate user, use privilege separation and pledge.
 
 FEATURES:
 
+* Would be nice to use IP files as macros, but not clear how to make
+  a macro match an IP address (v4 or v6) that falls within a CIDR range
+  referenced in a file via regexp. Requires special-casing the match itself,
+  not just a macro. (Perhaps combine with next suggested feature, match-table?)
+  Could be done as a pair of new types of post-processing macros, ip4/ip6,
+  that would be implemented either globally or at the host level, in order
+  to label--but that would be REALLY expensive; it doesn't work as a
+  pre-processing macro but could be a special type of match or exclude?
+  (match: ip4-file:filename / exclude: ip6-file:filename)? that would only
+  run once per reportnew execution so wouldn't be too expensive.
+  This isn't that useful for pf logs, where it would be more useful to
+  use labels which are displayed in the log output.
+
 * Add match-table and exclude-table, which give a filename of a lookup
   table -- extra argument that goes with match/exclude, or replaces it?
   Should tell what part of the log string to compare against lines of the

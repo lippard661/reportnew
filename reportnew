@@ -100,6 +100,10 @@
 #    implement file locking.
 # Modified 10 February 2024 by Jim Lippard to allow importing macro values
 #    from files.
+# Modified 16 March 2024 by Jim Lippard to ignore comment lines in imported
+#    files.
+# Modified 31 March 2024 by Jim Lippard to properly complain about garbled
+#    lines in size file.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -159,7 +163,7 @@ my $SENDMAIL = '/usr/sbin/sendmail';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.17 of 10 February 2024';
+my $VERSION = 'reportnew 1.17a of 1 April 2024';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -520,8 +524,8 @@ sub parse_config {
 			    $macro_value = "";
 			    while (<FILE>) {
 				chop;
-				# ignore blank lines
-				if (!/^\s*$/) {
+				# ignore blank lines and comments
+				if (!/^\s*$|^\s*#.*$/) {
 				    if ($macro_value eq "") {
 					$macro_value = $_;
 				    }
@@ -1273,6 +1277,9 @@ sub read_size_file {
 	    while (<SIZEFILE>) {
 		chop;
 		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = split (/,/);
+		if (!defined ($size)) { # bad line in size file
+		    &send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_\n");
+		}
 		if (!grep ($_ eq $logfile, @logfiles)) {
 		    &send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Logfile $logfile in size file is not in config file.");
 		}
