@@ -1277,7 +1277,7 @@ sub read_size_file {
 	    while (<SIZEFILE>) {
 		chop;
 		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = split (/,/);
-		if (!defined ($size)) { # bad line in size file
+		if (!defined ($processing_pid)) { # bad line in size file
 		    &send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_\n");
 		}
 		if (!grep ($_ eq $logfile, @logfiles)) {
