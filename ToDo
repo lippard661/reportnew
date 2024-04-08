@@ -24,6 +24,8 @@ Set up a separate user, use privilege separation and pledge.
 
 FEATURES:
 
+* Provide a way to write match output to a new log. (new action)
+
 * Would be nice to use IP files as macros, but not clear how to make
   a macro match an IP address (v4 or v6) that falls within a CIDR range
   referenced in a file via regexp. Requires special-casing the match itself,
