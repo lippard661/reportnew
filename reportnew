@@ -106,6 +106,8 @@
 #    lines in size file.
 # Modified 8 April 2024 by Jim Lippard to fix uninitialized $processing_pid
 #    bug when size file is first created, make alert action use line breaks.
+# Modified 14 April 2024 by Jim Lippard to handle process accounting logs
+#    directly on OpenBSD for greater efficiency.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -142,6 +144,11 @@ use Time::ParseDate;
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 
+use POSIX qw( ctime fmod );
+use constant AHZ => 64;
+use constant SECSPERHOUR => 60 * 60;
+use constant SECSPERMIN => 60;
+
 ### Constants.
 
 my $HOSTNAME = `/bin/hostname`;
@@ -163,9 +170,10 @@ my $MKTEMP = '/usr/bin/mktemp';
 my $PS = '/bin/ps';
 my $SENDMAIL = '/usr/sbin/sendmail';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
+my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.17b of 8 April 2024';
+my $VERSION = 'reportnew 1.18 of 14 April 2024';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -275,6 +283,9 @@ if ($^O eq 'openbsd') {
     # Needed to parse dates on process accounting logs.
     unveil ($ZONEINFO_DIR, 'r');
 
+    # Need for username resolution on process accounting logs.
+    unveil ($ETC_DIR, 'r');
+
     # Allow writing to and creating files and dirs in /tmp.
     unveil ('/tmp', 'rwc');
 
@@ -329,12 +340,21 @@ foreach $logfile (@logfiles) {
     &read_size_file ($size_file);
     next if ($log_processing_pid{$logfile} != 0 && &pid_exists ($log_processing_pid{$logfile}));
     &write_size_file ($size_file, $logfile, $LOG_PROCESSING_START); # save PID
-    
+
     if ($logfile eq $PROCESS_ACCOUNTING_LOG) {
+	# On OpenBSD, we still create a temp logfile from process
+	# accounting logs, but do so directly instead of by calling
+	# lastcomm, and we find the starting point more efficiently.
+	if ($^O eq 'openbsd') {
+	    $temp_logfile = &openbsd_read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile});
+	}
+	# Otherwise:
 	# Read process accounting logs out to the last time seen, or
 	# for all of it, and write it out to a tmp file, $temp_logfile,
 	# putting it into chronological order instead of reverse.
-	$temp_logfile = &read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile});
+	else {
+	    $temp_logfile = &read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile});
+	}
 	# Then use check_logfile on the temp file, disregarding the size,
 	# which is set to 0, just as for files in cyclogs.
 	($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
@@ -846,7 +866,8 @@ sub check_logfile {
     }
 
     # Note: this is sometimes operating on a temp file in the case of gzipped
-    # rotated logfiles. So mtime will always be > old_mtime for those
+    # rotated logfiles or process accounting logs. So mtime will always
+    # be > old_mtime for those
     # files -- but we've already verified that that's the case before
     # we got here so it shouldn't break anything.
     # If an old rotated log is larger than the last log file we looked
@@ -1167,6 +1188,288 @@ sub identify_rotated_logs {
     }
 
     return ($rotated_logs_flag, @rotated_logs);
+}
+
+# Subroutine to read process accounting log files directly.
+sub openbsd_read_process_acct_log {
+    my ($acct_log, $checktime) = @_;
+    my ($found_first_log, $found_first_record, $idx, $start_idx,
+	$acct_file, $acct_file_size, $acct_file_mtime,
+	$prev_acct_file_size, $old_size,
+	$processing_records);
+    my ($command, $utime, $stime, $etime, $io, $btime, $uid, $gid,
+	$mem, $tty, $pid, $flags);
+    my ($date_time, $user, $cpu, $time, $delta, $duration);
+    my %DEV_NAME = (
+	"-1", "__",
+	"256","tty",
+	"2048","tty00",
+	"2049","tty01",
+	"2050","tty02",
+	"2051","tty03",
+	"2052","tty04",
+	"2053","tty05",
+	"2054","tty06",
+	"2055","tty07",
+	"2056","tty08",
+	"2057","tty09",
+	"2058","tty0a",
+	"2059","tty0b",
+	"3072","ttyC0",
+	"3073","ttyC1",
+	"3074","ttyC2",
+	"3075","ttyC3",
+	"3076","ttyC4",
+	"3077","ttyC5",
+	"3078","ttyC6",
+	"3079","ttyC7",
+	"3080","ttyC8",
+	"3081","ttyC9",
+	"3082","ttyCa",
+	"3083","ttyCb",
+	"3327","ttyCcfg",
+	"16896","ttyU0",
+	"16897","ttyU1",
+	"16898","ttyU2",
+	"16899","ttyU3",
+	"24064","ttyVI00",
+	"24074","ttyVI10",
+	"24084","ttyVI20",
+	"24094","ttyVI30",
+	"24104","ttyVI40",
+	"9728","ttyc0",
+	"9729","ttyc1",
+	"9730","ttyc2",
+	"9731","ttyc3",
+	"9732","ttyc4",
+	"9733","ttyc5",
+	"9734","ttyc6",
+	"9735","ttyc7",
+	"1280","ttyp0",
+	"1281","ttyp1",
+	"1282","ttyp2",
+	"1283","ttyp3",
+	"1284","ttyp4",
+	"1285","ttyp5",
+	"1286","ttyp6",
+	"1287","ttyp7",
+	"1288","ttyp8",
+	"1289","ttyp9",
+	"1316","ttypA",
+	"1317","ttypB",
+	"1318","ttypC",
+	"1319","ttypD",
+	"1320","ttypE",
+	"1321","ttypF",
+	"1322","ttypG",
+	"1323","ttypH",
+	"1324","ttypI",
+	"1325","ttypJ",
+	"1326","ttypK",
+	"1327","ttypL",
+	"1328","ttypM",
+	"1329","ttypN",
+	"1330","ttypO",
+	"1331","ttypP",
+	"1332","ttypQ",
+	"1333","ttypR",
+	"1334","ttypS",
+	"1335","ttypT",
+	"1336","ttypU",
+	"1337","ttypV",
+	"1338","ttypW",
+	"1339","ttypX",
+	"1340","ttypY",
+	"1341","ttypZ",
+	"1290","ttypa",
+	"1291","ttypb",
+	"1292","ttypc",
+	"1293","ttypd",
+	"1294","ttype",
+	"1295","ttypf",
+	"1296","ttypg",
+	"1297","ttyph",
+	"1298","ttypi",
+	"1299","ttypj",
+	"1300","ttypk",
+	"1301","ttypl",
+	"1302","ttypm",
+	"1303","ttypn",
+	"1304","ttypo",
+	"1305","ttypp",
+	"1306","ttypq",
+	"1307","ttypr",
+	"1308","ttyps",
+	"1309","ttypt",
+	"1310","ttypu",
+	"1311","ttypv",
+	"1312","ttypw",
+	"1313","ttypx",
+	"1314","ttypy",
+	"1315","ttypz"
+	);
+	
+    $found_first_log = 0;
+    $found_first_record = 0;
+    $processing_records = 0;
+
+    # If $log_mtime{$acct_log} < $checktime, there's nothing to do, but
+    # this should never happen. Let's work backwards checking the older
+    # logs to find a start point, then work forward from there.
+    # Skip this if checktime = 0;
+    if ($checktime) {
+	$old_size = $log_size{$acct_log};
+	($prev_acct_file_size, $acct_file_mtime) = &read_size ($acct_log);
+	for ($idx = 0; $idx <= $MAX_PROCESS_ACCOUNTING_FILE; $idx++) {
+	    $acct_file = $acct_log . '.' . $idx;
+	    ($acct_file_size, $acct_file_mtime) = &read_size ($acct_file);
+
+	    if ($acct_file_mtime < $checktime) {
+		$start_idx = $idx - 1;
+		$found_first_log = 1;
+		last;
+	    }
+	    $prev_acct_file_size = $acct_file_size;
+	}
+    }
+    # If we didn't find one (or if $checktime=0), then everything is new
+    # and we start with the oldest.
+    if (!$found_first_log) {
+	$start_idx = $MAX_PROCESS_ACCOUNTING_FILE;
+	$found_first_record = 1;
+    }
+
+    # So now we start from the oldest with changes, and look for a first
+    # record unless we're processing everything.
+    for ($idx = $start_idx; $idx >= -1; $idx--) {
+	if ($idx == -1) {
+	    $acct_file = $acct_log;
+	}
+	else {
+	    $acct_file = $acct_log . '.' . $idx;
+	}
+
+	# Open file and look for first record if we need it. Once
+	# we have a first record, open temp file and start writing out
+	# to it.
+	if (open (ACCTLOG, '<', $acct_file)) {
+	    $/ = \64; # read 64-byte records
+	    # If this is the old file, let's seek to
+	    # one record before where we left off.
+	    if ($found_first_log && !$found_first_record &&
+		$prev_acct_file_size > 640 &&
+		$old_size < $prev_acct_file_size &&
+		$old_size % 64 == 0) {
+		seek (ACCTLOG, $old_size - 64, 0);
+		# would like to test if this record is older than
+		# checktime, if not, should do binary search or start
+		# at beginning.
+	    }
+
+	    while (<ACCTLOG>) {
+		($command, $utime, $stime, $etime, $io, $btime, $uid, $gid, $mem, $tty, $pid, $flags) = unpack ("A24 S< S< S< S< Q< L< L< L< l< L< b32", $_);
+		if ($btime > $checktime && !$processing_records) {
+		    $found_first_record = 1;
+		    $processing_records = 1;
+
+		    # Create temp file.
+		    $temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
+		    chop ($temp_logfile);
+
+		    # Open temp file for writing.
+		    if (!open (TEMPFILE, '>', $temp_logfile)) {
+			&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+			exit; # or just return?
+		    }
+		}
+		if ($processing_records) {
+		    $date_time = ctime ($btime);
+		    # Remove year.
+		    $date_time = substr ($date_time, 0, length ($date_time) - 6);
+		    # Go from raw device number to name.
+		    if (defined ($DEV_NAME{$tty})) {
+			$tty = $DEV_NAME{$tty};
+		    }
+		    else {
+			$tty = '??';
+		    }
+		    # Convert uid to user.
+		    $user = getpwuid($uid);
+		    # Command + pid.
+		    $command = "$command\[$pid\]";
+		    # Process flags.
+		    $flags = &flagbits ($flags);
+		    # User time plus system time.
+		    $cpu = (&expand ($utime) + &expand ($stime)) / AHZ;
+		    $cpu = sprintf "%.2f", $cpu; # was %6.2f for formatted cols
+		    $delta = &expand ($etime) / AHZ;
+		    $duration = sprintf "%1.0f:%02.0f:%05.2f", $delta / SECSPERHOUR,
+			fmod ($delta, SECSPERHOUR) / SECSPERMIN,
+			fmod ($delta, SECSPERMIN);
+		    print TEMPFILE "$date_time $tty $user $command $flags $cpu secs $duration\n";
+		}
+	    }
+	}
+	else {
+	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
+	    exit;
+	}
+	close (ACCTLOG);
+	$/ = '
+';
+    }
+
+    if (!$found_first_record || !$processing_records) {
+	# This should provoke an error and exit, we never wrote anything
+	# out.
+	&send_error ($acct_file, "Could not find any new records in acct file $acct_file (OpenBSD method). This shouldn't happen.");
+	exit;
+    }
+    # Otherwise, close the temp file and return log path.
+    close (TEMPFILE);
+	
+    return ($temp_logfile);
+}
+
+# Subroutine to expand accounting time.
+sub expand {
+    my ($time) = @_;
+    my $newtime;
+
+    $newtime = $time & 017777;
+    $time >>= 13;
+    while ($time) {
+        $time--;
+        $newtime <<= 3;
+    }
+    return ($newtime);
+}
+
+# Subroutine to return process flags in human-readable form.
+# Might want to re-do this with unpacking flags to hex and
+# using bitwise operators. (0x02 was ASU, now removed)
+#    vec ($AFORK, 0, 8) = 0x01; # F
+#    vec ($AMAP, 0, 8) = 0x04; # M
+#    vec ($ACORE, 0, 8) = 0x08; # D
+#    vec ($AXSIG, 0, 8) = 0x10; # X
+#    vec ($APLEDGE, 0, 8) = 0x20; # P
+#    vec ($ATRAP, 0, 8) = 0x40; # T
+#    vec ($AUNVEIL, 0, 8) = 0x80; # U
+#    vec ($APINSYS, 0, 8) = 0x200; # S
+#    vec ($ABTCFI, 0, 8) = 0x400; # B
+sub flagbits {
+    my ($flag) = @_;
+    my ($output, $idx);
+    my $flagcodes = 'F-MDXPTU-SB';
+
+    $output = '-';
+    for ($idx = 0; $idx <= 32; $idx++) {
+	if (substr ($flag, $idx, 1) eq '1') {
+	    $output .= substr ($flagcodes, $idx, 1);
+	}
+    }
+
+    return ($output);
 }
 
 # Subroutine to read process accounting log files using lastcomm.
