@@ -24,6 +24,13 @@ Set up a separate user, use privilege separation and pledge.
 
 FEATURES:
 
+* Handle process accounting logs directly on OpenBSD rather than via
+  lastcomm. Only real obstacle is no way to call devname system call
+  in perl without XSUB, so a lookup table is temporarily hard-coded
+  and can be updated with data from:
+     stat -f "%r,%N%n" /dev/tty*
+  and a little editing.
+  
 * Provide a way to write match output to a new log. (new action)
 
 * Would be nice to use IP files as macros, but not clear how to make
