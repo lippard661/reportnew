@@ -24,7 +24,7 @@ Set up a separate user, use privilege separation and pledge.
 
 FEATURES:
 
-* Handle process accounting logs directly on OpenBSD rather than via
+* (DONE) Handle process accounting logs directly on OpenBSD rather than via
   lastcomm. Only real obstacle is no way to call devname system call
   in perl without XSUB, so a lookup table is temporarily hard-coded
   and can be updated with data from:
@@ -32,6 +32,7 @@ FEATURES:
   and a little editing.
   
 * Provide a way to write match output to a new log. (new action)
+  (can be approximated with "alert" action)
 
 * Would be nice to use IP files as macros, but not clear how to make
   a macro match an IP address (v4 or v6) that falls within a CIDR range

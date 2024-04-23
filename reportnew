@@ -112,6 +112,13 @@
 #    appropriately for process accounting logs (to match end of most recent
 #    log processing for OpenBSD, and start of most recent log procesing for
 #    the old lastcomm/reverse order processing).
+# Modified 22 April 2024 by Jim Lippard to remove 'ps' pledge by using
+#    kill to verify existence of running processes instead of calling ps.
+# Modified 23 April 2024 by Jim Lippard to use IO::Uncompress::Gunzip
+#    instead of calling gunzip command, Sys::Hostname instead of hostname
+#    command. Use OpenBSD::MkTemp on OpenBSD. Still need exec for sendmail,
+#    tai64nlocal/echo (could use Time::TAI64 and Mail::Send; latter requires
+#    escaping leading dots on message body lines).
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -141,10 +148,17 @@ use Digest::SHA qw( sha256_hex );
 use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Copy;
+use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
 #use Privileges::Drop;
+use Sys::Hostname;
 use Time::HiRes qw( gettimeofday );
 use Time::ParseDate;
+# required for multilog format
+#use Time::TAI64 qw( :tai64n );
+#my $TimeTAI64_module = 1;
+my $TimeTAI64_module = 0;
 
+use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp mkstemp );
 use if $^O eq "openbsd", "OpenBSD::Unveil";
 use if $^O eq "openbsd", "OpenBSD::Pledge";
 
@@ -155,8 +169,7 @@ use constant SECSPERMIN => 60;
 
 ### Constants.
 
-my $HOSTNAME = `/bin/hostname`;
-chop ($HOSTNAME);
+my $HOSTNAME = hostname();
 my ($SHORT_HOSTNAME, $DOMAINNAME) = split (/\./, $HOSTNAME, 2);
 
 ### Set to your security admin.
@@ -167,17 +180,18 @@ my $EMAIL_SENDER = 'nobody@' . $DOMAINNAME;
 ### Set to your log time zone (used only in one subroutine below).
 my $TIME_ZONE = 'MST';
 
-my $ECHO = '/bin/echo';
-my $GUNZIP = '/usr/bin/gunzip';
 my $LASTCOMM = '/usr/bin/lastcomm';
 my $MKTEMP = '/usr/bin/mktemp';
-my $PS = '/bin/ps';
 my $SENDMAIL = '/usr/sbin/sendmail';
-my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.18a of 17 April 2024';
+# For alternative means of decoding TAI64 timestamps on multilogs.
+# If used on OpenBSD, must uncomment unveil lines for these commands below.
+my $ECHO = '/bin/echo';
+my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
+
+my $VERSION = 'reportnew 1.18b of 23 April 2024';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -273,16 +287,19 @@ if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
 # parsing the config, then finish unveiling after the config is parsed.
 if ($^O eq 'openbsd') {
     # Pledge. stdio is already included.
-    pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock', 'ps') || die "Cannot pledge promises. $!\n";
+    # proc required for pid testing and any exec requirements.
+    # exec required for $ECHO/$TAI64NLOCAL if using multilogs without
+    #      Time::TAI64.
+    # exec required for sendmail.
+    pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock') || die "Cannot pledge promises. $!\n";
     
-    # Allow execution of commands.
-    unveil ($ECHO, 'x');
-    unveil ($GUNZIP, 'x');
-    unveil ($LASTCOMM, 'x');
-    unveil ($MKTEMP, 'x');
-    unveil ($PS, 'x');
+    # Allow execution of commands. $LASTCOMM, $MKTEMP excluded since
+    # they're not used on OpenBSD.
     unveil ($SENDMAIL, 'x');
-    unveil ($TAI64NLOCAL, 'x');
+    # For TAI64 timestamp decoding in the absence of Time::TAI64,
+    # uncomment if required and using OpenBSD.
+    #unveil ($ECHO, 'x');
+    #unveil ($TAI64NLOCAL, 'x');
 
     # Needed to parse dates on process accounting logs.
     unveil ($ZONEINFO_DIR, 'r');
@@ -988,11 +1005,16 @@ sub check_logfile {
 				$date = localtime ($date);
 				push (@{$notify_arrays[$idx]}, $date . ' ' . $line);
 			    }
-			    elsif ((substr ($date, 0, 1) eq '@') && (length ($date) == 25) && (-e$TAI64NLOCAL)) { # multilog
-				open (TAICONVERT, '-|', "$ECHO \"$date\" | $TAI64NLOCAL");
-				$date = <TAICONVERT>;
-				close (TAICONVERT);
-				chop ($date);
+			    elsif ((substr ($date, 0, 1) eq '@') && (length ($date) == 25)) { # multilog
+				if ($TimeTAI64_module) {
+#				    $date = tai64nlocal ($date);
+				}
+				elsif (-e $TAI64NLOCAL) {
+				    open (TAICONVERT, '-|', "$ECHO \"$date\" | $TAI64NLOCAL");
+				    $date = <TAICONVERT>;
+				    close (TAICONVERT);
+				    chop ($date);
+				}
 				$line =~ s/\b([a-f0-9]{8})\b/join(".", unpack("C*", pack("H8", $1)))/eg;
 				push (@{$notify_arrays[$idx]}, $date . ' ' . $line);
 			    }
@@ -1086,14 +1108,21 @@ sub gunzip_logfile {
     my ($logfile) = @_;
     my ($temp_dir, $temp_in_file, $temp_out_file, $temp_logfile);
 
-    $temp_dir = `$MKTEMP -d -q /tmp/reportnew.XXXXXXX`;
-    chop ($temp_dir);
+    if ($^O eq 'openbsd') {
+	$temp_dir = mkdtemp ("/tmp/reportnew.XXXXXXX");
+    }
+    else {
+	$temp_dir = `$MKTEMP -d -q /tmp/reportnew.XXXXXXX`;
+	chop ($temp_dir);
+    }
     $temp_in_file = basename ($logfile);
     $temp_out_file = substr ($temp_in_file, 0, length ($temp_in_file) - 3);
     $temp_logfile = $temp_dir . '/' . $temp_out_file;
 
     copy ($logfile, "$temp_dir/$temp_in_file");
-    system "$GUNZIP $temp_dir/$temp_in_file -o $temp_logfile";
+    gunzip "$temp_dir/$temp_in_file" => $temp_logfile or
+	&send_error ($logfile, "gunzip failed: $GunzipError");
+#    system "$GUNZIP $temp_dir/$temp_in_file -o $temp_logfile";
 
     return ($temp_logfile);
 }
@@ -1210,6 +1239,7 @@ sub openbsd_read_process_acct_log {
 	$mem, $tty, $pid, $flags);
     my ($date_time, $user, $cpu, $time, $delta, $duration);
     my ($new_checktime);
+    my ($temp_fh);
     my %DEV_NAME = (
 	"-1", "__",
 	"256","tty",
@@ -1385,13 +1415,22 @@ sub openbsd_read_process_acct_log {
 		    $processing_records = 1;
 
 		    # Create temp file.
-		    $temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
-		    chop ($temp_logfile);
+		    if ($^O eq 'openbsd') {
+			($temp_fh, $temp_logfile) = mkstemp ("/tmp/reportnew.XXXXXXX");
+			if (!defined ($temp_logfile)) {
+			    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+			    exit; # or just return?
+			}
+		    }
+		    else {
+			$temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
+			chop ($temp_logfile);
 
-		    # Open temp file for writing.
-		    if (!open (TEMPFILE, '>', $temp_logfile)) {
-			&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
-			exit; # or just return?
+			# Open temp file for writing.
+			if (!open ($temp_fh, '>', $temp_logfile)) {
+			    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+			    exit; # or just return?
+			}
 		    }
 		}
 		if ($processing_records) {
@@ -1418,7 +1457,7 @@ sub openbsd_read_process_acct_log {
 		    $duration = sprintf "%1.0f:%02.0f:%05.2f", $delta / SECSPERHOUR,
 			fmod ($delta, SECSPERHOUR) / SECSPERMIN,
 			fmod ($delta, SECSPERMIN);
-		    print TEMPFILE "$date_time $tty $user $command $flags $cpu secs $duration\n";
+		    print $temp_fh "$date_time $tty $user $command $flags $cpu secs $duration\n";
 		}
 	    }
 	}
@@ -1438,7 +1477,7 @@ sub openbsd_read_process_acct_log {
 	exit;
     }
     # Otherwise, close the temp file and return log path.
-    close (TEMPFILE);
+    close ($temp_fh);
 	
     return ($temp_logfile, $new_checktime);
 }
@@ -1492,6 +1531,7 @@ sub read_process_acct_log {
 	$cpu, $secs, $day_name, $month, $day, $time, $duration,
 	$time_dec);
     my ($new_checktime);
+    my ($temp_fh);
 
 # Read process accounting logs, out to end or to $checktime, whichever
 # comes first.  Write out to temp file, in reverse order, with more
@@ -1556,22 +1596,31 @@ sub read_process_acct_log {
     # Now write out @lastcomm_logs to a temp file in reverse order.
 
     # Create temp file.
-    $temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
-    chop ($temp_logfile);
-
-    # Open temp file for writing.
-    if (!open (TEMPFILE, '>', $temp_logfile)) {
+    if ($^O eq 'openbsd') {
+	($temp_fh, $temp_logfile) = mkstemp ("/tmp/reportnew.XXXXXXX");
+	if (!defined ($temp_logfile)) {
 	    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 	    exit; # or just return?
 	}
+    }
+    else {
+	$temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
+	chop ($temp_logfile);
+
+	# Open temp file for writing.
+	if (!open ($temp_fh, '>', $temp_logfile)) {
+	    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+	    exit; # or just return?
+	}
+    }
 
     # Print out each log line to the temp file.
     foreach $log_line (reverse (@lastcomm_logs)) {
-	print TEMPFILE "$log_line\n";
+	print $temp_fh "$log_line\n";
     }
 
     # Close temp file.
-    close (TEMPFILE);
+    close ($temp_fh);
 
     # Return the filename.
     return ($temp_logfile, $new_checktime);
@@ -1955,11 +2004,11 @@ sub write_size_file {
 # Subroutine to return 1 if process exists, 0 otherwise.
 sub pid_exists {
     my ($pid) = @_;
-    my $ps_output;
-    
-    $ps_output = `$PS -p $pid`;
-    $ps_output =~ s/^.*\n//; # remove header
-    return 1 if length ($ps_output) > 1;
+
+    if (kill (0, $pid) || $!) {
+	return 1 unless $! eq 'No such process';
+    }
+
     return 0;
 }
     
