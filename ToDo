@@ -24,6 +24,12 @@ Set up a separate user, use privilege separation and pledge.
 
 FEATURES:
 
+* Add ability to include files signed with a detached signify signature,
+with signify pubkey file specified in config prior to use in global
+section of config. .sig file is 152 chars, verification occurs at time
+macro is loaded in config parsing. Verification code can be borrowed from
+sigtree.
+
 * (DONE) Handle process accounting logs directly on OpenBSD rather than via
   lastcomm. Only real obstacle is no way to call devname system call
   in perl without XSUB, so a lookup table is temporarily hard-coded
