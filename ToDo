@@ -20,11 +20,12 @@ for them, anchor each end against likely separators (beginning of line,
 :, whitespace for the left hand side, end of line, :, ., whitespace for
 the right hand side). (DONE, also uses right bracket for right hand side)
 
-Set up a separate user, use privilege separation and pledge.
+Set up a separate user, use privilege separation and pledge (pledge and
+unveil DONE, not privsep and separate user).
 
 FEATURES:
 
-* Add ability to include files signed with a detached signify signature,
+* (DONE) Add ability to include files signed with a detached signify signature,
 with signify pubkey file specified in config prior to use in global
 section of config. .sig file is 152 chars, verification occurs at time
 macro is loaded in config parsing. Verification code can be borrowed from
