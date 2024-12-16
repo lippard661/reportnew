@@ -7,9 +7,9 @@ Now uses and requires Signify.pm for signed include files.
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.19a.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2024-pkg.pub
+reportnew-1.20.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2024-pkg.pub
 
-Current version is reportnew-1.19a of 2 August 2024.
+Current version is reportnew-1.20 of 16 December 2024.
 
 "frequency" in config file comments is not implemented; config file doesn't include an example of
 the within-log correlation, here is an example used for alerting on an SMTP session of concern with
