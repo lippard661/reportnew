@@ -25,6 +25,17 @@ unveil DONE, not privsep and separate user).
 
 FEATURES:
 
+* (DONE) Option (1): Add ability to include a file of macro
+definitions, which may be signed. Option (2): Replace
+begin-host/end-host with "hosts: <all|<host list>>" which can be used
+repeatedly throughout a config to define sections relevant to each
+host.  Went with option (2); begin-host/end-host remain for backwards
+compatibility.  This allows a multi-host config to be much shorter by
+removing redundancy; my own config was reduced by more than 33%. The
+implementation means that config parsing skips all lines not relevant
+to the current host; if you want to do a check of config syntax, a new
+-c (config check) option has been added which will spot errors.
+
 * (DONE) Add ability to include files signed with a detached signify signature,
 with signify pubkey file specified in config prior to use in global
 section of config. .sig file is 152 chars, verification occurs at time

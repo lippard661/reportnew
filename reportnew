@@ -122,6 +122,10 @@
 # Modified 5 July 2024 by Jim Lippard to allow signedfile include macros
 #    and add signify_publickey global directive.
 # Modified 28 July 2024 by Jim Lippard to use Signify.pm.
+# Modified 16 December 2024 by Jim Lippard for new config file format and
+#    to add -c config check option and -d debug option (for existing
+#    debug_flag). Remains backward compatible with the begin-host/end-host
+#    format.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -151,6 +155,7 @@ use Digest::SHA qw( sha256_hex );
 use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Copy;
+use Getopt::Std;
 use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
 #use Privileges::Drop;
 use Signify;
@@ -196,7 +201,7 @@ my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 my $ECHO = '/bin/echo';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.19a of 2 August 2024';
+my $VERSION = 'reportnew 1.20a of 16 December 2024';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -225,6 +230,7 @@ my $LOG_APPEND = 3;
 
 my $GLOBAL_CONTEXT = 1;
 my $HOST_CONTEXT = 2;
+my $SKIPPING = 3;
 my $LOG_CONTEXT = 3; # not used, uses !defined($current_logfile)
 
 ### Variables.
@@ -266,6 +272,9 @@ use vars qw(
 # Other global variables.
 use vars qw(
     $debug_mode
+    $config_check
+    %opts
+    %defined_hosts
     );
 
 # Local variables in main program.
@@ -275,7 +284,10 @@ my ($rotated_logs_flag, $processed_rotated_log_flag, @rotated_logs, $rotated_log
 
 ### Main program.
 
-$debug_mode = 0;
+getopts ('cd', \%opts) || die "Usage: reportnew [-c (check)|-d (debug)] [config-file]\n";
+
+$config_check = $opts{'c'};
+$debug_mode = $opts{'d'} || $config_check; # config_check implies debug_mode;
 
 if ($#ARGV == 0) {
     $config_file = $ARGV[0];
@@ -284,7 +296,7 @@ elsif ($#ARGV < 0) {
     $config_file = "$DEFAULT_CONFIG_DIR/$DEFAULT_CONFIG_NAME";
 }
 else {
-    die "Usage: reportnew [config-file]\n";
+    die "Usage: reportnew [-c (check)|-d (debug)] [config-file]\n";
 }
 
 if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
@@ -328,6 +340,11 @@ if ($^O eq 'openbsd') {
 }
 
 &parse_config ($config_file);
+
+if ($config_check) {
+    print "No issues identified in config file.\n";
+    exit;
+}
 
 # Unveil log dirs from config and lock.
 # If script execution actions are added, will need to unveil here.
@@ -544,6 +561,11 @@ sub parse_config {
 	    $line_num++;
 	    if (!/^\s*#|^\s*$/) {
 		chop;
+		# if SKIPPING, don't resume until we see another "hosts:",
+		# unless doing a config_check.
+		next if ($current_context == $SKIPPING &&
+			 !/^\s*hosts:/ &&
+			 !$config_check);
 		# Macro definitions.
 		if (/^([\w0-9-_]+)\s*=\s*\"(\S+)\"(.*$)/) {
 		    $macro_name = $1;
@@ -659,201 +681,214 @@ sub parse_config {
 		    }
 		}
 		elsif (/^.*:.*$/) {
-		($directive, $value) = split (/:\s*/, $_, 2);
-		if ($directive eq 'begin-host') {
-		    if (defined ($master_notify) && !defined ($current_host)) {
-			$all_host_master_notify = $master_notify;
-		    }
-		    $current_host = $value;
-		    $current_context = $HOST_CONTEXT;
-		}
-		elsif ($directive eq 'end-host') {
-		    if ($current_host ne $value) {
-			&send_error ($config_file, "end-host directive does not match begin-host directive (which uses \"$current_host\") on line $line_num. $value\n");
-			exit;
-		    }
-		    if ($current_host eq $HOSTNAME) {
-			last;
-		    }
-		    $current_host = "";
-		    undef $master_notify;
-		    undef @logfiles;
-		    undef %match_hash;
-		    undef %exclude_hash;
-		    undef %action_hash;
-		    undef %preproc_macro;
-		    undef %append_macro;
-		    undef %substitute_macro;
-		    $have_postproc_macros = 0;
-		}
-		elsif ($directive eq 'master_notify') {
-		    if (defined ($master_notify)) {
-			&send_error ($config_file, "Second master_notify directive on line $line_num. $value");
-			exit;
-		    }
-		    $master_notify = $value;
-		}
-		elsif ($directive eq 'size_file') {
-		    if (defined ($size_file)) {
-			&send_error ($config_file, "Second size_file directive on line $line_num. $value");
-			exit;
-		    }
-		    $size_file = $value;
-		}
-		elsif ($directive eq 'email_sender') {
-		    if (defined ($email_sender)) {
-			&send_error ($config_file, "Second email_sender directive on line $line_num. $value");
-			exit;
-		    }
-		    $email_sender = $value;
-		}
-		elsif ($directive eq 'signify_pubkey') {
-		    if (defined ($signify_pubkey)) {
-			&send_error ($config_file, "Second signify_pubkey directive on line $line_num. $value");
-			exit;
-		    }
-		    $signify_pubkey = $value;
-		    if ($signify_pubkey !~  /^[\w0-9-_\.]+$/) {
-			&send_error ($config_file, "Invalid signify_pubkey file name \"$signify_pubkey\" line $line_num. $_\n");
-			exit;
-		    }
-		    $signify_pubkey .= '.pub' if (substr ($signify_pubkey, length ($signify_pubkey) - 4, 4)) ne '.pub';
-		    if (!-e "$SIGNIFY_DIR/$signify_pubkey") {
-			&send_error ($config_file, "Signify public key doesn't exist, \"$signify_pubkey\" on line $line_num. $_\n");
-			exit;
-		    }
-		    if (!-r "$SIGNIFY_DIR/$signify_pubkey") {
-			&send_error ($config_file, "Signify public key is not readable, \"$signify_pubkey\" on line $line_num. $_\n");
-			exit;		
-		    }
-		}
-		elsif ($directive eq 'log') {
-		    # No longer check for logfile existence here due to need
-		    # to unveil first.
-		    if (grep ($_ eq $value, @logfiles)) {
-			&send_error ($config_file, "Previously defined logfile on line $line_num. $value");
-			exit;
-		    }
-		    push (@logfiles, $value);
-		    $current_logfile = $value;
-		}
-		elsif ($directive eq 'match') {
-		    if (!defined ($current_logfile)) {
-			&send_error ($config_file, "No log directive corresponding to match directive on line $line_num. $_");
-			exit;
-		    }
-		    if (($value eq 'all') || &valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && &valid_regexp ($1))) {
-			# Do preproc macro substitution.
-			$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w0-9-_]+%%/);
-			push (@{$match_hash{$current_logfile}}, $value);
-			if ($value =~ /^session-with/) {
-			    $current_match_session_match_flag = 1;
+		    ($directive, $value) = split (/:\s*/, $_, 2);
+
+		    if ($directive eq 'hosts') {
+			if (defined ($master_notify) && !defined ($current_host)) {
+			    $all_host_master_notify = $master_notify;
+			}
+			if (&my_host ($line_num, $value)) {
+			    $current_context = $HOST_CONTEXT;
+			    $current_host = $HOSTNAME;
 			}
 			else {
-			    $current_match_session_match_flag = 0;
+			    $current_context = $SKIPPING;
 			}
 		    }
-		    else {
-			&send_error ($config_file, "Invalid match directive on line $line_num. $_");
-			exit;
+		    elsif ($directive eq 'begin-host') {
+			if (defined ($master_notify) && !defined ($current_host)) {
+			    $all_host_master_notify = $master_notify;
+			}
+			$current_host = $value;
+			$current_context = $HOST_CONTEXT;
 		    }
-		}
-		elsif ($directive eq 'exclude') {
-		    if (!defined ($current_logfile)) {
-			&send_error ($config_file, "No log directive corresponding to exclude directive on line $line_num. $_");
-			exit;
-		    }
-		    if (($value eq 'none') || &valid_regexp ($value) || ($value =~ /^session-without (.*$)/ && &valid_regexp ($1))) {
-			if ($value =~ /^session-without/ && !$current_match_session_match_flag) {
-			    &send_error ($config_file, "Exclude directive is a session match but corresponding match directive is not on line $line_num. $_");
+		    elsif ($directive eq 'end-host') {
+			if ($current_host ne $value) {
+			    &send_error ($config_file, "end-host directive does not match begin-host directive (which uses \"$current_host\") on line $line_num. $value\n");
 			    exit;
 			}
-			elsif ($value !~ /^session-without/ && $current_match_session_match_flag) {
-			    &send_error ($config_file, "Exclude directive is not a session match but corresponding match directive is on line $line_num. $_");
+			if ($current_host eq $HOSTNAME) {
+			    last;
+			}
+			$current_host = "";
+			undef $master_notify;
+			undef @logfiles;
+			undef %match_hash;
+			undef %exclude_hash;
+			undef %action_hash;
+			undef %preproc_macro;
+			undef %append_macro;
+			undef %substitute_macro;
+			$have_postproc_macros = 0;
+		    }
+		    elsif ($directive eq 'master_notify') {
+			if (defined ($master_notify)) {
+			    &send_error ($config_file, "Second master_notify directive on line $line_num. $value");
 			    exit;
 			}
-			# Do preproc macro substitution.
-			$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w0-9-_]+%%/);
-			push (@{$exclude_hash{$current_logfile}}, $value);
+			$master_notify = $value;
 		    }
-		    else {
-			&send_error ($config_file, "Invalid exclude directive on line $line_num. $_");
+		    elsif ($directive eq 'size_file') {
+			if (defined ($size_file)) {
+			    &send_error ($config_file, "Second size_file directive on line $line_num. $value");
+			    exit;
+			}
+			$size_file = $value;
 		    }
-		}
-		elsif ($directive eq 'action') {
-		    if (!defined ($current_logfile)) {
-			&send_error ($config_file, "No log directive corresponding to action directive on line $line_num. $_");
-			exit;
+		    elsif ($directive eq 'email_sender') {
+			if (defined ($email_sender)) {
+			    &send_error ($config_file, "Second email_sender directive on line $line_num. $value");
+			    exit;
+			}
+			$email_sender = $value;
 		    }
-		    # Parse action (action, whitespace, value).
-		    if ($value !~ /\s/) {
-			$action = $value;
-			undef $action_value;
+		    elsif ($directive eq 'signify_pubkey') {
+			if (defined ($signify_pubkey)) {
+			    &send_error ($config_file, "Second signify_pubkey directive on line $line_num. $value");
+			    exit;
+			}
+			$signify_pubkey = $value;
+			if ($signify_pubkey !~  /^[\w0-9-_\.]+$/) {
+			    &send_error ($config_file, "Invalid signify_pubkey file name \"$signify_pubkey\" line $line_num. $_\n");
+			    exit;
+			}
+			$signify_pubkey .= '.pub' if (substr ($signify_pubkey, length ($signify_pubkey) - 4, 4)) ne '.pub';
+			if (!-e "$SIGNIFY_DIR/$signify_pubkey") {
+			    &send_error ($config_file, "Signify public key doesn't exist, \"$signify_pubkey\" on line $line_num. $_\n");
+			    exit;
+			}
+			if (!-r "$SIGNIFY_DIR/$signify_pubkey") {
+			    &send_error ($config_file, "Signify public key is not readable, \"$signify_pubkey\" on line $line_num. $_\n");
+			    exit;	
+			}
 		    }
-		    else {
-			($action, $action_value) = split (/\s+/, $value, 2);
+		    elsif ($directive eq 'log') {
+			# No longer check for logfile existence here due to need
+			# to unveil first.
+			if (grep ($_ eq $value, @logfiles)) {
+			    &send_error ($config_file, "Previously defined logfile on line $line_num. $value");
+			    exit;
+			}
+			push (@logfiles, $value);
+			$current_logfile = $value;
 		    }
-		    # action: notify
-		    if ($action eq 'notify') {
-			if (defined ($action_value)) {
-			    # Should probably validate email format?
-			    push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+		    elsif ($directive eq 'match') {
+			if (!defined ($current_logfile)) {
+			    &send_error ($config_file, "No log directive corresponding to match directive on line $line_num. $_");
+			    exit;
+			}
+			if (($value eq 'all') || &valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && &valid_regexp ($1))) {
+			    # Do preproc macro substitution.
+			    $value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w0-9-_]+%%/);
+			    push (@{$match_hash{$current_logfile}}, $value);
+			    if ($value =~ /^session-with/) {
+				$current_match_session_match_flag = 1;
+			    }
+			    else {
+				$current_match_session_match_flag = 0;
+			    }
 			}
 			else {
-			    &send_error ($config_file, "Missing email address(es) following \"notify\" action in action directive on line $line_num. $_");
+			    &send_error ($config_file, "Invalid match directive on line $line_num. $_");
 			    exit;
 			}
 		    }
-		    # action: text
-		    elsif ($action eq 'text') {
-			if (defined ($action_value)) {
-			    # Should probably validate email format?
-			    push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+		    elsif ($directive eq 'exclude') {
+			if (!defined ($current_logfile)) {
+			    &send_error ($config_file, "No log directive corresponding to exclude directive on line $line_num. $_");
+			    exit;
+			}
+			if (($value eq 'none') || &valid_regexp ($value) || ($value =~ /^session-without (.*$)/ && &valid_regexp ($1))) {
+			    if ($value =~ /^session-without/ && !$current_match_session_match_flag) {
+				&send_error ($config_file, "Exclude directive is a session match but corresponding match directive is not on line $line_num. $_");
+				exit;
+			    }
+			    elsif ($value !~ /^session-without/ && $current_match_session_match_flag) {
+				&send_error ($config_file, "Exclude directive is not a session match but corresponding match directive is on line $line_num. $_");
+				exit;
+			    }
+			    # Do preproc macro substitution.
+			    $value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w0-9-_]+%%/);
+			    push (@{$exclude_hash{$current_logfile}}, $value);
 			}
 			else {
-			    &send_error ($config_file, "Missing email address(es) following \"text\" action in action directive on line $line_num. $_");
-			    exit;
+			    &send_error ($config_file, "Invalid exclude directive on line $line_num. $_");
 			}
 		    }
-		    # action: alert
-		    elsif ($action eq 'alert') {
-			if (defined ($action_value)) {
-			    &send_error ($config_file, "Extraneous data following \"alert\" action in action directive on line $line_num. $_");
+		    elsif ($directive eq 'action') {
+			if (!defined ($current_logfile)) {
+			    &send_error ($config_file, "No log directive corresponding to action directive on line $line_num. $_");
 			    exit;
 			}
-			push (@{$action_hash{$current_logfile}}, $action);
-		    }
-		    # action: execute
-		    elsif ($action eq 'execute') {
-			if (defined ($action_value)) {
-			    push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+			# Parse action (action, whitespace, value).
+			if ($value !~ /\s/) {
+			    $action = $value;
+			    undef $action_value;
 			}
 			else {
-			    &send_error ($config_file, "Missing script name following \"execute\" action in action directive on line $line_num. $_");
+			    ($action, $action_value) = split (/\s+/, $value, 2);
+			}
+			# action: notify
+			if ($action eq 'notify') {
+			    if (defined ($action_value)) {
+				# Should probably validate email format?
+				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+			    }
+			    else {
+				&send_error ($config_file, "Missing email address(es) following \"notify\" action in action directive on line $line_num. $_");
+				exit;
+			    }
+			}
+			# action: text
+			elsif ($action eq 'text') {
+			    if (defined ($action_value)) {
+				# Should probably validate email format?
+				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+			    }
+			    else {
+				&send_error ($config_file, "Missing email address(es) following \"text\" action in action directive on line $line_num. $_");
+				exit;
+			    }
+			}
+			# action: alert
+			elsif ($action eq 'alert') {
+			    if (defined ($action_value)) {
+				&send_error ($config_file, "Extraneous data following \"alert\" action in action directive on line $line_num. $_");
+				exit;
+			    }
+			    push (@{$action_hash{$current_logfile}}, $action);
+			}
+			# action: execute
+			elsif ($action eq 'execute') {
+			    if (defined ($action_value)) {
+				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+			    }
+			    else {
+				&send_error ($config_file, "Missing script name following \"execute\" action in action directive on line $line_num. $_");
+				exit;
+			    }
+			}
+			# Other actions?
+			else {
+			    &send_error ($config_file, "Unknown action specified in action directive on line $line_num. $_");
 			    exit;
 			}
 		    }
-		    # Other actions?
+		    # For backwards compatibility.
+		    elsif ($directive eq 'notify') {
+			if (!defined ($current_logfile)) {
+			    &send_error ($config_file, "No log directive corresponding to notify directive on line $line_num. $_");
+			    exit;
+			}
+			push (@{$action_hash{$current_logfile}}, "$directive,$value");
+			# need to specify that action=notify, and add
+			# separate code to parse new action: directive.
+		    }
 		    else {
-			&send_error ($config_file, "Unknown action specified in action directive on line $line_num. $_");
+			&send_error ($config_file, "Unknown directive on line $line_num. $_");
 			exit;
 		    }
 		}
-		# For backwards compatibility.
-		elsif ($directive eq 'notify') {
-		    if (!defined ($current_logfile)) {
-			&send_error ($config_file, "No log directive corresponding to notify directive on line $line_num. $_");
-			exit;
-		    }
-		    push (@{$action_hash{$current_logfile}}, "$directive,$value");
-		    # need to specify that action=notify, and add
-		    # separate code to parse new action: directive.
-		}
-		else {
-		    &send_error ($config_file, "Unknown directive on line $line_num. $_");
-		    exit;
-		}
-	    }
 	    }
 	}
 	close (CONFIG);
@@ -940,6 +975,29 @@ sub verify_signify_sig {
 	&send_error ($config_file, "@errors");
 	return 0;
     }
+}
+
+# Subroutine to return 1 if a host list includes the current host or "all"
+# and 0 otherwise.
+sub my_host {
+    my ($line_num, $host_list) = @_;
+    my (@hosts, $host);
+
+    return 1 if ($host_list eq 'all');
+
+    @hosts = split (/\s+/, $host_list);
+    if ($config_check) {
+	foreach $host (@hosts) {
+	    if (!defined ($defined_hosts{$host})) {
+		print "New host name in \"hosts:\" directive on line $line_num. $host\n";
+		$defined_hosts{$host} = 1;
+	    }
+	}
+    }
+
+    return 1 if (grep (/^$SHORT_HOSTNAME$/, @hosts));
+    return 1 if (grep (/^$HOSTNAME$/, @hosts));
+    return 0;
 }
 
 # Look through a log file for any changed lines; add them to
