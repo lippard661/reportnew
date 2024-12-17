@@ -719,6 +719,7 @@ sub parse_config {
 			}
 			elsif (!$multihost_config) {
 			    $multihost_config = 1;
+			    $oldstyle_multihost = 1;
 			}
 			if (defined ($master_notify) && !defined ($current_host)) {
 			    $all_host_master_notify = $master_notify;
