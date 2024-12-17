@@ -7,9 +7,17 @@ Now uses and requires Signify.pm for signed include files.
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.20.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2024-pkg.pub
+reportnew-1.20a.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2024-pkg.pub
 
-Current version is reportnew-1.20 of 16 December 2024.
+Current version is reportnew-1.20a of 17 December 2024.
+
+Multiple hosts can be supported with a single config file using either
+   hosts: <hostname-list>
+to identify sections applicable to a set of space-separated hosts, or alternatively,
+   begin-host: <hostname>
+   ...
+   end-host: <hostname>
+to have a single unique section in the config file for each host. The former is preferred for compactness, simplicity, and eliminating redundancy between similarly-configured hosts.  reportnew -c can be used to check a config for possible syntax errors.
 
 "frequency" in config file comments is not implemented; config file doesn't include an example of
 the within-log correlation, here is an example used for alerting on an SMTP session of concern with
