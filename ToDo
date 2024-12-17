@@ -1,5 +1,11 @@
 BUGS
 
+(Fixed 1.20a) -c option doesn't properly handle the fact that the same
+log file may be defined in different ways for different hosts -- it
+either needs to run through the config separately for each defined
+host or it needs to specifically check to make sure there are no
+conflicts within a single host's context.
+
 Apparently it is possible to set up session-with/session-without rules
 that result in a blank notification message. (Likely due to excess
 capture group in match rules.)
