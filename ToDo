@@ -1,5 +1,9 @@
 BUGS
 
+(Fixed 1.20b) Aborts and complains in process accounting log processing
+on a new system that doesn't yet have the max rotated process accounting
+log in place yet.
+
 (Fixed 1.20a) -c option doesn't properly handle the fact that the same
 log file may be defined in different ways for different hosts -- it
 either needs to run through the config separately for each defined
