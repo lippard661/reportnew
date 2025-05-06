@@ -7,10 +7,9 @@ Now uses and requires Signify.pm for signed include files.
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.20b.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2024-pkg.pub
-Next signify public key is https://www.discord.org/lippard/software/discord.org-2025-pkg.pub
+reportnew-1.21.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2025-pkg.pub
 
-Current version is reportnew-1.20b of 22 December 2024.
+Current version is reportnew-1.21 of 6 May 2025.
 
 Multiple hosts can be supported with a single config file using either
    hosts: <hostname-list>
