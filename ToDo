@@ -35,6 +35,18 @@ unveil DONE, not privsep and separate user).
 
 FEATURES:
 
+* (DONE 1.21) Move size file to /var/run/reportnew, never unveil config
+  file dir for writing or file creation. OR just actually create the size
+  file before locking things down, and do another pledge to remove
+  cpath/unveil.
+
+* (DONE 1.21) Add include-macro-file: / include-macro-signedfile:
+   (1) Move macro parsing to a separate subroutine, that parses a line
+       at a time and can accept or reject "<file:/signed-file:xx>" values
+       per flag.
+   (2) Use that subroutine to implement the new directive. Can have macro
+       values that are included within those included macro files.
+
 * (DONE) Option (1): Add ability to include a file of macro
 definitions, which may be signed. Option (2): Replace
 begin-host/end-host with "hosts: <all|<host list>>" which can be used
