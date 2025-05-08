@@ -136,6 +136,8 @@
 #    include-macro-signedfile to allow files of full macro definitions
 #    in addition to files of macro values. Create size file if it doesn't
 #    exist to reduce unveil surface and pledges.
+# Modified 8 May 2025 by Jim Lippard to do additional unveiling for signify
+#    checking and use full signify public key path.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -211,7 +213,7 @@ my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 my $ECHO = '/bin/echo';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.21 of 6 May 2025';
+my $VERSION = 'reportnew 1.21a of 8 May 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -332,7 +334,9 @@ if ($^O eq 'openbsd') {
     #unveil ($ECHO, 'x');
     #unveil ($TAI64NLOCAL, 'x');
     # Signify for signed include files in macros.
-    unveil ($SIGNIFY, 'x');
+    unveil ($SIGNIFY, 'rx');
+    unveil (dirname ($SIGNIFY), 'rx');
+    unveil ($SIGNIFY_DIR, 'rx');
     unveil ('/dev/null', 'rw');
 
     # Needed to parse dates on process accounting logs.
@@ -705,6 +709,7 @@ sub parse_config {
 			    &send_error ($config_file, "Signify public key is not readable, \"$signify_pubkey\" on line $line_num. $_\n");
 			    exit;	
 			}
+			$signify_pubkey = $SIGNIFY_DIR . '/' . $signify_pubkey;
 		    }
 		    elsif ($directive eq 'log') {
 			# No longer check for logfile existence here due to need

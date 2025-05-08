@@ -1,5 +1,9 @@
 BUGS
 
+(Fixed 1.21a) Insufficient unveiling causes failures in
+include-macro-signedfile (but, strangely, caused no such issues for
+<signedfile:xx> for values using the exact same syntax to Signify.pm.
+
 (Fixed 1.20b) Aborts and complains in process accounting log processing
 on a new system that doesn't yet have the max rotated process accounting
 log in place yet.
