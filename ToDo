@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.21b) Process accounting log handling uses getpwuid assuming
+all users are defined in the passwd file.
+
 (Fixed 1.21a) Insufficient unveiling causes failures in
 include-macro-signedfile (but, strangely, caused no such issues for
 <signedfile:xx> for values using the exact same syntax to Signify.pm.

@@ -138,6 +138,8 @@
 #    exist to reduce unveil surface and pledges.
 # Modified 8 May 2025 by Jim Lippard to do additional unveiling for signify
 #    checking and use full signify public key path.
+# Modified 6 July 2025 by Jim Lippard to use uid in process accounting logs
+#    if there's no corresponding user in passwd file.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -213,7 +215,7 @@ my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 my $ECHO = '/bin/echo';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.21a of 8 May 2025';
+my $VERSION = 'reportnew 1.21b of 20 July 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1736,8 +1738,8 @@ sub openbsd_read_process_acct_log {
 		    else {
 			$tty = '??';
 		    }
-		    # Convert uid to user.
-		    $user = getpwuid($uid);
+		    # Convert uid to user (or use uid if no user in passwd file).
+		    $user = getpwuid($uid) || $uid;
 		    # Command + pid.
 		    $command = "$command\[$pid\]";
 		    # Process flags.
