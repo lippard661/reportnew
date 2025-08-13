@@ -1,5 +1,7 @@
 BUGS
 
+(Fixed 1.21c) Allow whitespace in macro definitions.
+
 (Fixed 1.21b) Process accounting log handling uses getpwuid assuming
 all users are defined in the passwd file.
 

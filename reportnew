@@ -140,6 +140,8 @@
 #    checking and use full signify public key path.
 # Modified 6 July 2025 by Jim Lippard to use uid in process accounting logs
 #    if there's no corresponding user in passwd file.
+# Modified 13 August 2025 by Jim Lippard to allow whitespace (not just
+#    non-whitespace) in macro definitions.
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -215,7 +217,7 @@ my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 my $ECHO = '/bin/echo';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.21b of 20 July 2025';
+my $VERSION = 'reportnew 1.21c of 13 August 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -596,7 +598,7 @@ sub parse_config {
 			 !/^\s*hosts:/ &&
 			 !$config_check);
 		# Macro definitions.
-		if (/^([\w0-9-_]+)\s*=\s*\"(\S+)\"(.*$)/) {
+		if (/^([\w0-9-_]+)\s*=\s*\"(.+)\"(.*$)/) {
 		    $macro_name = $1;
 		    $macro_value = $2;
 		    $macro_options = $3;
