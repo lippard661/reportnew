@@ -44,6 +44,10 @@ unveil DONE, not privsep and separate user).
 
 FEATURES:
 
+* (DONE 1.22) Support Linux process accounting logs (at least for
+  Debian/Proxmox). (Done with lastcomm output, not native parsing of
+  file, saving for a later effort.)
+
 * (DONE 1.21) Move size file to /var/run/reportnew, never unveil config
   file dir for writing or file creation. OR just actually create the size
   file before locking things down, and do another pledge to remove
