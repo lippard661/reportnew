@@ -44,6 +44,9 @@ unveil DONE, not privsep and separate user).
 
 FEATURES:
 
+* (DONE 1.23) Support Linux journal logs. (Support syslog by identifier
+  or facility, and ".service" units.)
+
 * (DONE 1.22) Support Linux process accounting logs (at least for
   Debian/Proxmox). (Done with lastcomm output, not native parsing of
   file, saving for a later effort.)

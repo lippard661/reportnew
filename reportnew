@@ -144,6 +144,10 @@
 #    non-whitespace) in macro definitions.
 # Modified 14 September 2025 by Jim Lippard to change path of process
 #    accounting log and handle lastcomm format for Linux, add -V version.
+# Modified 16 September 2025 by Jim Lippard to support pulling logs from
+#    Linux journals using journalctl.
+#
+#
 # To Do:
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
@@ -175,6 +179,7 @@ use File::Basename;
 use File::Copy;
 use Getopt::Std;
 use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
+use POSIX qw( strftime );
 #use Privileges::Drop;
 use Signify;
 use Sys::Hostname;
@@ -207,6 +212,10 @@ my $EMAIL_SENDER = 'nobody@' . $DOMAINNAME;
 ### Set to your log time zone (used only in one subroutine below).
 my $TIME_ZONE = 'MST';
 
+# for Linux journal logs.
+my $JOURNALCTL = '/usr/bin/journalctl';
+my $SYSTEMCTL = '/usr/bin/systemctl';
+
 my $LASTCOMM = '/usr/bin/lastcomm';
 my $MKTEMP = '/usr/bin/mktemp';
 my $SENDMAIL = '/usr/sbin/sendmail';
@@ -219,7 +228,7 @@ my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 my $ECHO = '/bin/echo';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.22 of 15 September 2025';
+my $VERSION = 'reportnew 1.23 of 17 September 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -242,6 +251,7 @@ my $NL = '
 my $LOG_TYPE_STANDARD_LOG = 0;
 my $LOG_TYPE_CYCLOG_OR_MULTILOG = 1;
 my $LOG_TYPE_PROCESS_ACCOUNTING = 2;
+my $LOG_TYPE_LINUX_JOURNAL = 3;
 
 my $LOG_PROCESSING_START = 1;
 my $LOG_PROCESSING_END = 2;
@@ -287,6 +297,12 @@ use vars qw(
     %log_sha256_digest
     %log_processing_pid
     );
+
+# Global variables for linux journal logs.
+use vars qw(
+    @linux_journal_units
+    @linux_journal_syslog_facilities
+);
 
 # Other global variables.
 use vars qw(
@@ -380,6 +396,7 @@ if ($^O eq 'openbsd') {
 
     # Unveil log directories.
     foreach $logfile (@logfiles) {
+	next if $logfile =~ /^journal /; # shouldn't happen.
 	$logdir = dirname ($logfile);
 	if (!defined ($unveiled_dirs{$logdir})) {
 	    unveil ($logdir, "r");
@@ -450,6 +467,31 @@ foreach $logfile (@logfiles) {
 			    $log_checktime{$logfile}, $log_sha256_digest{$logfile},
 			    $match_hash_ref{$logfile},
 			    $exclude_hash_ref{$logfile}, $action_hash_ref{$logfile}, $LOG_TYPE_PROCESS_ACCOUNTING);
+
+	# Unlink $temp_logfile.
+	unlink ($temp_logfile);
+    }
+    elsif ($logfile =~ /^journal /) {
+	# Similar to process accounting files, we handle Linux journal logs
+	# by writing out the relevant information to a temporary log file,
+	# and don't care about tracking size. We use the last read time as
+	# the start time (with journalctl --since).
+	# Options:
+	# journal unit <unit>
+	#    journalctl -u <unit> --since <last_check_time>
+	# journal syslog-id <identifier>
+	#    journalctl -t <identifier> --since <last_check_time>
+	# journal syslog-facility <facility>
+	#    journalctl --facility=<facility> --since <last_check_time>
+	($temp_logfile, $log_checktime{$logfile}) = &read_linux_journal ($logfile, $log_checktime{$logfile});
+	# Then use check_logfile on the temp file, disregarding the size,
+	# which is set to 0, just as for files in cyclogs.
+	my $ignore_checktime;
+	($log_size{$logfile}, $log_mtime{$logfile}, $ignore_checktime, $log_sha256_digest{$logfile}) =
+	    &check_logfile ($temp_logfile, 0, $log_mtime{$logfile},
+			    $log_checktime{$logfile}, $log_sha256_digest{$logfile},
+			    $match_hash_ref{$logfile},
+			    $exclude_hash_ref{$logfile}, $action_hash_ref{$logfile}, $LOG_TYPE_LINUX_JOURNAL, $logfile);
 
 	# Unlink $temp_logfile.
 	unlink ($temp_logfile);
@@ -585,6 +627,7 @@ sub parse_config {
 	$action, $action_value, $current_match_session_match_flag);
     my ($macro_name, $macro_value, $macro_options, $macro_file, $macro_dir);
     my ($multihost_config, $oldstyle_multihost, $found_my_host);
+    my ($linux_journal_unit, $linux_journal_syslogid, $linux_journal_syslogfacility);
 
     $line_num = 0;
     $specified_host = 0;
@@ -595,6 +638,9 @@ sub parse_config {
     $multihost_config = 0;
     $oldstyle_multihost = 0;
     $found_my_host = 0;
+    $linux_journal_unit = 0;
+    $linux_journal_syslogid = 0;
+    $linux_journal_syslogfacility = 0;
     if (open (CONFIG, '<', $config_file)) {
 	while (<CONFIG>) {
 	    $line_num++;
@@ -726,6 +772,7 @@ sub parse_config {
 		    elsif ($directive eq 'log') {
 			# No longer check for logfile existence here due to need
 			# to unveil first.
+			# First, see if we already have this log file.
 			if (grep ($_ eq $value, @logfiles)) {
 			    if ($config_check && $multihost_config && !$oldstyle_multihost) {
 				my (@hosts, $host);
@@ -744,6 +791,22 @@ sub parse_config {
 			    else {
 				&send_error ($config_file, "Previously defined logfile on line $line_num. $value");
 				exit;
+			    }
+			}
+			# Do minimal validation on log name.
+			if (!&valid_logfile_format ($value)) {
+			    &send_error ($config_file, "Invalid logfile name on line $line_num. $value");
+			    exit;
+			}
+			if ($value =~ /^journal (unit|syslog-id|syslog-facility)/) {
+			    if ($1 eq 'unit') {
+				$linux_journal_unit = 1;
+			    }
+			    elsif ($1 eq 'syslog-id') {
+				$linux_journal_syslogid = 1;
+			    }
+			    else {
+				$linux_journal_syslogfacility = 1;
 			    }
 			}
 			push (@logfiles, $value);
@@ -967,6 +1030,75 @@ sub parse_config {
 	}
 	$action_hash_ref{$current_logfile} = \@{$action_hash{$current_logfile}};
     }
+
+    # If there are linux journal logs, pull validation data.
+    if ($linux_journal_unit) {
+	@linux_journal_units = &get_linux_journal_units;
+    }
+    if ($linux_journal_syslogfacility) {
+	@linux_journal_syslog_facilities = &get_linux_journal_syslog_facilities;
+    }
+    if ($linux_journal_syslogid) {
+	# don't currently validate.
+    }
+}
+
+# Minimal validation on logfile name. Lots of room for improvement.
+# Also not great to be checking the linux journal format in so many
+# places.
+sub valid_logfile_format {
+    my ($logfile) = @_;
+
+    if ($logfile =~ /\.\./) {
+	return 0;
+    }
+    elsif ($logfile =~ /^\/[\w\-_\.\/]+$/) {
+	return 1;
+    }
+    elsif ($logfile =~ /^journal (unit|syslog-id|syslog-facility) ([\w\-_0-9\.]+)$/) {
+	return 1;
+    }
+
+    return 0;
+}
+
+# Subroutine to get linux journal units. Only loaded active and with
+# names ending in ".service".
+sub get_linux_journal_units {
+    my @units;
+
+    if (open (SYSTEMCTL, '-|', "$SYSTEMCTL list-units")) {
+	while (<SYSTEMCTL>) {
+	    chomp;
+	    if (/^\s*(.*\.service).*loaded active/) {
+		push (@units, $1);
+	    }
+	}
+	close (SYSTEMCTL);
+    }
+    else {
+	&send_error ($config_file, "Cannot pull journal units from $SYSTEMCTL. $!\n");
+	exit;
+    }
+    return (@units);
+}
+
+# Subroutine to get available linux journal syslog facilities.
+sub get_linux_journal_syslog_facilities {
+    my @facilities;
+
+    if (open (JOURNALCTL, '-|', "$JOURNALCTL --facility=help")) {
+	while (<JOURNALCTL>) {
+	    chomp;
+	    push (@facilities, $_) unless (/Available facilities:/);
+	}
+	close (JOURNALCTL);
+    }
+    else {
+	&send_error ($config_file, "Cannot pull syslog facilities from $JOURNALCTL. $!\n");
+	exit;
+    }
+    return (@facilities);
 }
 
 # Macro parsing moved out to separate subroutine (poorly modularized)
@@ -1164,7 +1296,7 @@ sub my_host {
 # size file reference is different from the name of the file actually
 # being checked. (Should this be the same for cyclog/multilog?)
 sub check_logfile {
-    my ($logfile, $old_size, $old_mtime, $old_checktime, $old_sha256_digest, $match_ref, $exclude_ref, $action_ref, $log_type) = @_;
+    my ($logfile, $old_size, $old_mtime, $old_checktime, $old_sha256_digest, $match_ref, $exclude_ref, $action_ref, $log_type, $logfile_name) = @_;
     my ($ref_logfile, $size, $mtime, $checktime, $date, $line, $idx,
 	@match_hashes, @exclude_hashes, @action_hashes,
 	$match, $exclude, $action, $action_value,
@@ -1176,6 +1308,9 @@ sub check_logfile {
 
     if ($log_type == $LOG_TYPE_PROCESS_ACCOUNTING) {
 	$ref_logfile = $PROCESS_ACCOUNTING_LOG;
+    }
+    elsif ($log_type == $LOG_TYPE_LINUX_JOURNAL) {
+	$ref_logfile = $logfile_name;
     }
     elsif (&is_gzip ($logfile)) {
 	$gzip_temp_log_flag = 1;
@@ -1225,7 +1360,7 @@ sub check_logfile {
 	    $old_size = 0;
 	}
     }
-    else { # process accounting logs
+    else { # process accounting logs, linux journal logs
 	# We're always going to check for process accounting logs and
 	# cyclogs/multilogs.  Used to say $size = $old_size + 1, but
 	# since a change above, $size is size of /var/account/acct,
@@ -1938,6 +2073,89 @@ sub read_process_acct_log {
     close ($temp_fh);
 
     # Return the filename.
+    return ($temp_logfile, $new_checktime);
+}
+
+# Read log information from Linux journal into a temp file to process.
+# This subroutine trusts the config parser to have validated the
+# arguments.
+sub read_linux_journal {
+    my ($logfile, $checktime) = @_;
+    my ($temp_logfile, $temp_fh, $new_checktime);
+    my (@time_components, $time_string, $full_time, $since_string);
+    my $selection_args;
+    my $NO_ENTRIES = '-- No entries --';
+
+    # Create temp file.
+    $temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
+    chop ($temp_logfile);
+
+    # Open temp file for writing.
+    if (!open ($temp_fh, '>', $temp_logfile)) {
+	&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+	exit; # or just return?
+    }
+
+    # Convert last checktime to English.
+    if ($checktime != 0) {
+	@time_components = localtime ($checktime);
+	$time_string = strftime "%Y-%m-%d %H:%M:%S", @time_components;
+	$full_time = sprintf "%s.%06d", $time_string, $checktime;
+	$since_string = '--since "' . $full_time . '"';
+    }
+    else {
+	$since_string = '';
+    }
+
+    # Formulate selection arguments.
+    if ($logfile =~ /journal unit ([\w\.]+)$/) {
+	my $unit_arg = $1;
+	if (!grep (/^$unit_arg$/, @linux_journal_units)) {
+	    &send_error ($logfile, "Specified journal unit $unit_arg is not enabled.");
+	    exit; # or just return?
+	}
+	$selection_args = '-u ' . $unit_arg;
+    }
+    elsif ($logfile =~ /journal syslog-id (\w+)$/) {
+	my $syslogid_arg = $1;
+	# no check today
+	$selection_args = '-t ' . $syslogid_arg;
+    }
+    elsif ($logfile =~ /journal syslog-facility ([\w\d]+)$/) {
+	my $syslog_facility_arg = $1;
+	if (!grep (/^$syslog_facility_arg$/, @linux_journal_syslog_facilities)) {
+	    &send_error ($logfile, "Specified journal syslog facility $syslog_facility_arg is not defined.");
+	    exit; # or just return?    
+	}
+	$selection_args = '--facility=' . $syslog_facility_arg;
+    }
+    else {
+	&send_error ($logfile, "Could not parse journal logfile name. $logfile");
+	exit; # or just return?
+    }
+    
+    # Append date if checktime nonzero.
+    $selection_args .= ' ' . $since_string unless (!$checktime);
+
+    # Open journalctl to read log lines.
+    if (!open (JOURNAL, '-|', "$JOURNALCTL $selection_args")) {
+	&send_error ($logfile, "Could not open file handle for $JOURNALCTL. $!");
+	exit; # or just return?
+    }
+
+    while (<JOURNAL>) {
+	print $temp_fh "$_" unless (/^$NO_ENTRIES$/);
+    }
+
+    # Set new checktime.
+    $new_checktime = gettimeofday();
+
+    # Close journalctl.
+    close (JOURNAL);
+
+    # Close temp file.
+    close ($temp_fh);
+    
     return ($temp_logfile, $new_checktime);
 }
 
