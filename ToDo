@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.23a) Linux process accounting doesn't properly handle the flag/time
+boundary when times have more digits than usual.
+
 (Fixed 1.21c) Allow whitespace in macro definitions.
 
 (Fixed 1.21b) Process accounting log handling uses getpwuid assuming
