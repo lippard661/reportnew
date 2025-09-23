@@ -47,6 +47,9 @@ unveil DONE, not privsep and separate user).
 
 FEATURES:
 
+* (DONE 1.23b) Add Linux process accounting sample to reportnew.conf
+  appropriate for Proxmox/Debian.
+
 * (DONE 1.23) Support Linux journal logs. (Support syslog by identifier
   or facility, and ".service" units.)
 
