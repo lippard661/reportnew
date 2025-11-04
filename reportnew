@@ -155,7 +155,7 @@
 #    calling mktemp, do better validation on TAI64 dates, avoid shell
 #    when invoking sendmail, use chomp instead of chop, create temp dir
 #    once per execution, set umask so all created files are only readable
-#    by root user.
+#    by root user, remove tai64nlocal command method for TAI64 log files.
 #
 #
 # To Do:
@@ -232,11 +232,6 @@ my $SENDMAIL = '/usr/sbin/sendmail';
 my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
-
-# For alternative means of decoding TAI64 timestamps on multilogs.
-# If used on OpenBSD, must uncomment unveil lines for these commands below.
-my $ECHO = '/bin/echo';
-my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
 my $VERSION = 'reportnew 1.24 of 4 November 2025';
 
@@ -359,18 +354,12 @@ if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
 if ($^O eq 'openbsd') {
     # Pledge. stdio is already included.
     # proc required for pid testing and any exec requirements.
-    # exec required for $ECHO/$TAI64NLOCAL if using multilogs without
-    #      Time::TAI64.
     # exec required for sendmail.
     pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock') || die "Cannot pledge promises. $!\n";
     
     # Allow execution of commands. $LASTCOMM excluded since
     # it's not used on OpenBSD.
     unveil ($SENDMAIL, 'x');
-    # For TAI64 timestamp decoding in the absence of Time::TAI64,
-    # uncomment if required and using OpenBSD.
-    #unveil ($ECHO, 'x');
-    #unveil ($TAI64NLOCAL, 'x');
     # Signify for signed include files in macros.
     unveil ($SIGNIFY, 'rx');
     unveil (dirname ($SIGNIFY), 'rx');
@@ -445,13 +434,8 @@ if ($^O eq 'openbsd') {
 umask 0077;
 
 # Create a temp_dir.
-if ($^O eq 'openbsd') {
-    $temp_dir = mkdtemp ("/tmp/reportnew.XXXXXXX");
-}
-else {
-    $temp_dir = mkdtemp ('/tmp/reportnew.XXXXXXX');
-    chomp ($temp_dir);
-}
+$temp_dir = mkdtemp ("/tmp/reportnew.XXXXXXX");
+chomp ($temp_dir);
 
 # Modified to read and write size file after each log processed, so that
 # if something fails on processing, work already done isn't repeated.
@@ -1463,14 +1447,8 @@ sub check_logfile {
 			    }
 			    elsif ((substr ($date, 0, 1) eq '@') && (length ($date) == 25) && $date =~ /^\@[\da-f]{24}$/) { # multilog
 				if ($TimeTAI64_module) {
+# Uncomment if using multilog/cyclog.				    
 #				    $date = tai64nlocal ($date);
-				}
-				elsif (-e $TAI64NLOCAL) {
-				    # Only use shell if no TAI64 perl module but tha tai64nlocal command is present.
-				    open (TAICONVERT, '-|', "$ECHO \"$date\" | $TAI64NLOCAL");
-				    $date = <TAICONVERT>;
-				    close (TAICONVERT);
-				    chomp ($date);
 				}
 				$line =~ s/\b([a-f0-9]{8})\b/join(".", unpack("C*", pack("H8", $1)))/eg;
 				push (@{$notify_arrays[$idx]}, $date . ' ' . $line);
