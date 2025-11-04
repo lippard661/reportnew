@@ -442,7 +442,7 @@ if ($^O eq 'openbsd') {
 }
 
 # Any files we create are rw for root only.
-umask 0066;
+umask 0077;
 
 # Create a temp_dir.
 if ($^O eq 'openbsd') {
