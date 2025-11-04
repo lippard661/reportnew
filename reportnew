@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 # Originally written 15 February 1999 by Jim Lippard as short hack script.
 # Rewritten 25 February 1999 by Jim Lippard to use config file and be
 #    a bit fancier.  Early a.m. 26 February: changed some error messages,
@@ -151,16 +151,20 @@
 # Modified 21 September 2025 by Jim Lippard to improve error message that
 #    comes from OpenBSD process accounting when it gets turned off, clean
 #    up some regexes.
+# Modified 4 November 2025 by Jim Lippard to use File::Temp instead of
+#    calling mktemp, do better validation on TAI64 dates, avoid shell
+#    when invoking sendmail, use chomp instead of chop, create temp dir
+#    once per execution, set umask so all created files are only readable
+#    by root user.
 #
 #
 # To Do:
+#    - validate email addresses that can be passed to &send_notify.
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
 #    - Add time range checking option for match and exclude (new directive?)
 
 # Suggested enhancements:
-# * Create temp dir on first need and delete after last need, instead of
-#   creating it for each rotated log file.
 # * Process all rotated logs and original log, as well as all components
 #   of cyclogs or multilogs, together and process all notifications for them
 #   together at once instead of once per match per file.
@@ -178,10 +182,12 @@
 ### Required packages.
 
 use strict;
+use warnings;
 use Digest::SHA qw( sha256_hex );
 use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Copy;
+use if $^O ne "openbsd", "File::Temp", qw( :mktemp tempfile );
 use Getopt::Std;
 use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
 use POSIX qw( strftime );
@@ -222,7 +228,6 @@ my $JOURNALCTL = '/usr/bin/journalctl';
 my $SYSTEMCTL = '/usr/bin/systemctl';
 
 my $LASTCOMM = '/usr/bin/lastcomm';
-my $MKTEMP = '/usr/bin/mktemp';
 my $SENDMAIL = '/usr/sbin/sendmail';
 my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
@@ -233,7 +238,7 @@ my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 my $ECHO = '/bin/echo';
 my $TAI64NLOCAL = '/usr/local/bin/tai64nlocal';
 
-my $VERSION = 'reportnew 1.23b of 23 September 2025';
+my $VERSION = 'reportnew 1.24 of 4 November 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -270,7 +275,7 @@ my $LOG_CONTEXT = 3; # not used, uses !defined($current_logfile)
 ### Variables.
 
 # Filenames.
-use vars qw($config_file $size_file);
+use vars qw($config_file $size_file $temp_dir);
 
 # Global variables from config file.
 use vars qw(
@@ -359,8 +364,8 @@ if ($^O eq 'openbsd') {
     # exec required for sendmail.
     pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock') || die "Cannot pledge promises. $!\n";
     
-    # Allow execution of commands. $LASTCOMM, $MKTEMP excluded since
-    # they're not used on OpenBSD.
+    # Allow execution of commands. $LASTCOMM excluded since
+    # it's not used on OpenBSD.
     unveil ($SENDMAIL, 'x');
     # For TAI64 timestamp decoding in the absence of Time::TAI64,
     # uncomment if required and using OpenBSD.
@@ -436,6 +441,18 @@ if ($^O eq 'openbsd') {
     unveil ();
 }
 
+# Any files we create are rw for root only.
+umask 0066;
+
+# Create a temp_dir.
+if ($^O eq 'openbsd') {
+    $temp_dir = mkdtemp ("/tmp/reportnew.XXXXXXX");
+}
+else {
+    $temp_dir = mkdtemp ('/tmp/reportnew.XXXXXXX');
+    chomp ($temp_dir);
+}
+
 # Modified to read and write size file after each log processed, so that
 # if something fails on processing, work already done isn't repeated.
 
@@ -455,14 +472,14 @@ foreach $logfile (@logfiles) {
 	# accounting logs, but do so directly instead of by calling
 	# lastcomm, and we find the starting point more efficiently.
 	if ($^O eq 'openbsd') {
-	    ($temp_logfile, $log_checktime{$logfile}) = &openbsd_read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile});
+	    ($temp_logfile, $log_checktime{$logfile}) = &openbsd_read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
 	}
 	# Otherwise:
 	# Read process accounting logs out to the last time seen, or
 	# for all of it, and write it out to a tmp file, $temp_logfile,
 	# putting it into chronological order instead of reverse.
 	else {
-	    ($temp_logfile, $log_checktime{$logfile}) = &read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile});
+	    ($temp_logfile, $log_checktime{$logfile}) = &read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
 	}
 	# Then use check_logfile on the temp file, disregarding the size,
 	# which is set to 0, just as for files in cyclogs.
@@ -488,7 +505,7 @@ foreach $logfile (@logfiles) {
 	#    journalctl -t <identifier> --since <last_check_time>
 	# journal syslog-facility <facility>
 	#    journalctl --facility=<facility> --since <last_check_time>
-	($temp_logfile, $log_checktime{$logfile}) = &read_linux_journal ($logfile, $log_checktime{$logfile});
+	($temp_logfile, $log_checktime{$logfile}) = &read_linux_journal ($logfile, $log_checktime{$logfile}, $temp_dir);
 	# Then use check_logfile on the temp file, disregarding the size,
 	# which is set to 0, just as for files in cyclogs.
 	my $ignore_checktime;
@@ -619,6 +636,9 @@ foreach $logfile (@logfiles) {
     &write_size_file ($size_file, $logfile, $LOG_PROCESSING_END);
 }
 
+# Remove temp dir.
+rmdir ($temp_dir);
+
 ### Subroutines.
 
 # Subroutine to parse configuration file.
@@ -650,7 +670,7 @@ sub parse_config {
 	while (<CONFIG>) {
 	    $line_num++;
 	    if (!/^\s*#|^\s*$/) {
-		chop;
+		chomp;
 		# if SKIPPING, don't resume until we see another "hosts:",
 		# unless doing a config_check.
 		next if ($current_context == $SKIPPING &&
@@ -957,7 +977,7 @@ sub parse_config {
 			    my $include_file_line_num = 0;
 			    while (<INCLUDEFILE>) {
 				$include_file_line_num++;
-				chop;
+				chomp;
 				# ignore blank lines and comments
 				if (!/^\s*$|^\s*#.*$/) {
 				    if (/^([\w\-]+)\s*=\s*\"(\S+)\"(.*$)/) {
@@ -1163,7 +1183,7 @@ sub parse_macro {
 	if (open (VALUEFILE, '<', $macro_file)) {
 	    $macro_value = "";
 	    while (<VALUEFILE>) {
-		chop;
+		chomp;
 		# ignore blank lines and comments
 		if (!/^\s*$|^\s*#.*$/) {
 		    if ($macro_value eq "") {
@@ -1320,7 +1340,7 @@ sub check_logfile {
     elsif (&is_gzip ($logfile)) {
 	$gzip_temp_log_flag = 1;
 	$ref_logfile = $logfile;
-	$logfile = &gunzip_logfile ($ref_logfile);
+	$logfile = &gunzip_logfile ($ref_logfile, $temp_dir);
     }
     else {
 	$ref_logfile = $logfile;
@@ -1410,7 +1430,7 @@ sub check_logfile {
 	if (open (LOG, '<', $logfile)) {
 	    seek (LOG, $old_size, 0) if ($old_size > 0);
 	    while (<LOG>) {
-		chop;
+		chomp;
 		# Cycle through match/exclude hashes for each line.
 		# Action is performed at end if notify--could be
 		#   performed within this loop for other actions
@@ -1441,15 +1461,16 @@ sub check_logfile {
 				$date = localtime ($date);
 				push (@{$notify_arrays[$idx]}, $date . ' ' . $line);
 			    }
-			    elsif ((substr ($date, 0, 1) eq '@') && (length ($date) == 25)) { # multilog
+			    elsif ((substr ($date, 0, 1) eq '@') && (length ($date) == 25) && $date =~ /^\@[\da-f]{24}$/) { # multilog
 				if ($TimeTAI64_module) {
 #				    $date = tai64nlocal ($date);
 				}
 				elsif (-e $TAI64NLOCAL) {
+				    # Only use shell if no TAI64 perl module but tha tai64nlocal command is present.
 				    open (TAICONVERT, '-|', "$ECHO \"$date\" | $TAI64NLOCAL");
 				    $date = <TAICONVERT>;
 				    close (TAICONVERT);
-				    chop ($date);
+				    chomp ($date);
 				}
 				$line =~ s/\b([a-f0-9]{8})\b/join(".", unpack("C*", pack("H8", $1)))/eg;
 				push (@{$notify_arrays[$idx]}, $date . ' ' . $line);
@@ -1467,7 +1488,7 @@ sub check_logfile {
 	    close (LOG);
 
 	    # If we were processing a gunzipped temp file, delete it.
-	    &cleanup_gunzip_temp ($logfile) if $gzip_temp_log_flag;
+	    unlink ($logfile) if ($gzip_temp_log_flag && $logfile =~ /^$temp_dir/);
 
 	    # Perform action on corresponding matches, and reset
 	    # @notify_lines for the next match/exclude/action.
@@ -1541,16 +1562,9 @@ sub is_gzip {
 
 # Subroutine to unzip zipped logfile into a temp dir.
 sub gunzip_logfile {
-    my ($logfile) = @_;
-    my ($temp_dir, $temp_in_file, $temp_out_file, $temp_logfile);
+    my ($logfile, $temp_dir) = @_;
+    my ($temp_in_file, $temp_out_file, $temp_logfile);
 
-    if ($^O eq 'openbsd') {
-	$temp_dir = mkdtemp ("/tmp/reportnew.XXXXXXX");
-    }
-    else {
-	$temp_dir = `$MKTEMP -d -q /tmp/reportnew.XXXXXXX`;
-	chop ($temp_dir);
-    }
     $temp_in_file = basename ($logfile);
     $temp_out_file = substr ($temp_in_file, 0, length ($temp_in_file) - 3);
     $temp_logfile = $temp_dir . '/' . $temp_out_file;
@@ -1558,22 +1572,8 @@ sub gunzip_logfile {
     copy ($logfile, "$temp_dir/$temp_in_file");
     gunzip "$temp_dir/$temp_in_file" => $temp_logfile or
 	&send_error ($logfile, "gunzip failed: $GunzipError");
-#    system "$GUNZIP $temp_dir/$temp_in_file -o $temp_logfile";
 
     return ($temp_logfile);
-}
-
-# Subroutine to delete gunzipped temp file and temp dir.
-sub cleanup_gunzip_temp {
-    my ($logfile) = @_;
-    my ($temp_dir);
-
-    # Don't delete anything not in /tmp.
-    return if (substr ($logfile, 0, 4) ne '/tmp');
-    $temp_dir = dirname ($logfile);
-
-    unlink ($logfile);
-    unlink ($temp_dir);
 }
 
 # Subroutine to return a SHA256 hash of the first log line (or 0).
@@ -1585,7 +1585,7 @@ sub first_log_line_sha256_digest {
 	$first_line = <LOG>;
 	close (LOG);
 	if (defined ($first_line)) {
-	    chop ($first_line);
+	    chomp ($first_line);
 	    $sha256_digest = sha256_hex ($first_line);
 	    return ($sha256_digest);
 	}
@@ -1615,7 +1615,7 @@ sub first_log_line_time {
 	$first_line = <LOG>;
 	close (LOG);
 	if (defined ($first_line)) {
-	    chop ($first_line);
+	    chomp ($first_line);
 	    if ($first_line =~ /^($DATE_STRING|$DATE_STRING2|$RFC3339_date_string)/) {
 		$date = $1;
 		$timezone = $rfc3339_timezone if ($date =~ /^$RFC3339_date_string/);
@@ -1666,7 +1666,7 @@ sub identify_rotated_logs {
 
 # Subroutine to read process accounting log files directly.
 sub openbsd_read_process_acct_log {
-    my ($acct_log, $checktime) = @_;
+    my ($acct_log, $checktime, $temp_dir) = @_;
     my ($found_first_log, $found_first_record, $idx, $start_idx,
 	$acct_file, $acct_file_size, $acct_file_mtime,
 	$prev_acct_file_size, $old_size,
@@ -1860,21 +1860,15 @@ sub openbsd_read_process_acct_log {
 
 		    # Create temp file.
 		    if ($^O eq 'openbsd') {
-			($temp_fh, $temp_logfile) = mkstemp ("/tmp/reportnew.XXXXXXX");
+			($temp_fh, $temp_logfile) = mkstemp ("$temp_dir/reportnew.XXXXXXX");
 			if (!defined ($temp_logfile)) {
 			    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 			    exit; # or just return?
 			}
 		    }
 		    else {
-			$temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
-			chop ($temp_logfile);
-
-			# Open temp file for writing.
-			if (!open ($temp_fh, '>', $temp_logfile)) {
-			    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
-			    exit; # or just return?
-			}
+			# create and open
+			($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
 		    }
 		}
 		if ($processing_records) {
@@ -1969,7 +1963,7 @@ sub flagbits {
 
 # Subroutine to read process accounting log files using lastcomm.
 sub read_process_acct_log {
-    my ($acct_log, $checktime) = @_;
+    my ($acct_log, $checktime, $temp_dir) = @_;
     my ($idx, $acct_file, @lastcomm_logs, $log_line, $temp_logfile);
     my ($command, $flags, $user, $tty, $time_info,
 	$cpu, $secs, $day_name, $month, $day, $time, $duration,
@@ -2009,7 +2003,7 @@ sub read_process_acct_log {
 	    # Parse line, check time.  If lastcomm time <= $check_time,
 	    # then set $idx to $MAX_PROCESS_ACCOUNTING_FILE+1 and exit with next.
 	    if (substr ($_, length ($_) - 1, 1) eq $NL) {
-		chop;
+		chomp;
 	    }
 
 	    # Linux has older format with no duration.
@@ -2053,21 +2047,20 @@ sub read_process_acct_log {
 
     # Create temp file.
     if ($^O eq 'openbsd') {
-	($temp_fh, $temp_logfile) = mkstemp ("/tmp/reportnew.XXXXXXX");
+	($temp_fh, $temp_logfile) = mkstemp ("$temp_dir/reportnew.XXXXXXX");
 	if (!defined ($temp_logfile)) {
 	    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 	    exit; # or just return?
 	}
     }
     else {
-	$temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
-	chop ($temp_logfile);
-
-	# Open temp file for writing.
-	if (!open ($temp_fh, '>', $temp_logfile)) {
+	# create and open
+	($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
+	if (!defined ($temp_logfile)) {
 	    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 	    exit; # or just return?
 	}
+	chomp ($temp_logfile);
     }
 
     # Print out each log line to the temp file.
@@ -2086,21 +2079,20 @@ sub read_process_acct_log {
 # This subroutine trusts the config parser to have validated the
 # arguments.
 sub read_linux_journal {
-    my ($logfile, $checktime) = @_;
+    my ($logfile, $checktime, $temp_dir) = @_;
     my ($temp_logfile, $temp_fh, $new_checktime);
     my (@time_components, $time_string, $full_time, $since_string);
     my $selection_args;
     my $NO_ENTRIES = '-- No entries --';
 
     # Create temp file.
-    $temp_logfile = `$MKTEMP -q /tmp/reportnew.XXXXXXX`;
-    chop ($temp_logfile);
-
-    # Open temp file for writing.
-    if (!open ($temp_fh, '>', $temp_logfile)) {
+    # create and open
+    ($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
+    if (!defined ($temp_logfile)) {
 	&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 	exit; # or just return?
     }
+    chomp ($temp_logfile);
 
     # Convert last checktime to English.
     if ($checktime != 0) {
@@ -2200,7 +2192,7 @@ sub read_size_file {
 		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
 	    }
 	    while (<SIZEFILE>) {
-		chop;
+		chomp;
 		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = split (/,/);
 		if (!defined ($processing_pid)) { # bad line in size file
 		    &send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_\n");
@@ -2342,7 +2334,7 @@ sub send_notify {
     }
 
     else {
-	open (MAIL, '|-', "$SENDMAIL -t");
+	open (MAIL, '|-', $SENDMAIL, '-t');
 	print MAIL "From: Reporter <$email_sender>\n";
 	print MAIL "To: $notify_list\n";
 	print MAIL "Subject: $hostname $logfile\n\n";
@@ -2505,7 +2497,7 @@ sub write_size_file {
     }
     else { # just changing current log info
 	foreach $size_file_line (@size_file_lines) {
-	    chop ($size_file_line);
+	    chomp ($size_file_line);
 	    ($logfile) = split (/,/, $size_file_line);
 	    if ($logfile eq $current_logfile) {
 		# Write out 'null' if blank. Should only be for process accounting logs.
