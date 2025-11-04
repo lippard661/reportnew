@@ -1573,6 +1573,9 @@ sub gunzip_logfile {
     gunzip "$temp_dir/$temp_in_file" => $temp_logfile or
 	&send_error ($logfile, "gunzip failed: $GunzipError");
 
+    # Remove in file.
+    unlink ("$temp_dir/$temp_in_file");
+
     return ($temp_logfile);
 }
 
@@ -1858,7 +1861,7 @@ sub openbsd_read_process_acct_log {
 		    $found_first_record = 1;
 		    $processing_records = 1;
 
-		    # Create temp file.
+		    # Create temp file (OpenBSD only).
 		    if ($^O eq 'openbsd') {
 			($temp_fh, $temp_logfile) = mkstemp ("$temp_dir/reportnew.XXXXXXX");
 			if (!defined ($temp_logfile)) {
@@ -1866,9 +1869,13 @@ sub openbsd_read_process_acct_log {
 			    exit; # or just return?
 			}
 		    }
-		    else {
+		    else { # this shouldn't be reached
 			# create and open
 			($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
+			if (!defined ($temp_logfile)) {
+			    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+			    exit; # or just return?
+			}
 		    }
 		}
 		if ($processing_records) {
