@@ -156,6 +156,9 @@
 #    when invoking sendmail, use chomp instead of chop, create temp dir
 #    once per execution, set umask so all created files are only readable
 #    by root user, remove tai64nlocal command method for TAI64 log files.
+# Modified 12 November 2025 by Jim Lippard to use $macos_format instead of
+#    split for macOS process accounting logs, since command names can have
+#    spaces in them. Unfortunately, macOS Tahoe breaks process accounting.
 #
 #
 # To Do:
@@ -233,7 +236,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.24 of 4 November 2025';
+my $VERSION = 'reportnew 1.24a of 12 November 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1956,6 +1959,7 @@ sub read_process_acct_log {
     my ($new_checktime);
     my ($temp_fh);
     my $linux_format = 'A16 A7 A9 A9 A30';
+    my $macos_format = 'A11 A8 A9 A15 A40';
 
 # Read process accounting logs, out to end or to $checktime, whichever
 # comes first.  Write out to temp file, in reverse order, with more
@@ -1987,9 +1991,7 @@ sub read_process_acct_log {
 	while (<LASTCOMM>) {
 	    # Parse line, check time.  If lastcomm time <= $check_time,
 	    # then set $idx to $MAX_PROCESS_ACCOUNTING_FILE+1 and exit with next.
-	    if (substr ($_, length ($_) - 1, 1) eq $NL) {
-		chomp;
-	    }
+	    chomp;
 
 	    # Linux has older format with no duration.
 	    if ($^O eq 'linux') {
@@ -1998,7 +2000,12 @@ sub read_process_acct_log {
 	       $time_info =~ s/^\s*//;
 	       ($cpu, $secs, $day_name, $month, $day, $time) = split (/\s+/, $time_info, 6);
 	       $duration = '(0:00:00.00)'; # fake it for the calculation
-	    }	    
+	    }
+	    elsif ($^O eq 'darwin') {
+		# macOS can have spaces in command names.
+		($command, $flags, $user, $tty, $time_info) = unpack ($macos_format, $_);
+		($cpu, $secs, $day_name, $month, $day, $time, $duration) = split (/\s+/, $time_info, 7);
+	    }
 	    else { # OpenBSD, macOS
     	    	 ($command, $flags, $user, $tty, $time_info) = split (/\s+/, $_, 5);
 	    	 ($cpu, $secs, $day_name, $month, $day, $time, $duration) = split (/\s+/, $time_info, 7);
