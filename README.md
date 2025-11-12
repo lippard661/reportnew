@@ -1,15 +1,15 @@
 # reportnew
 Perl script to monitor logs for issues and issue alert emails, with some correlation capability within a log.
 
-Supports syslog, cyclog, multilog, BSD and Linux process accounting logs, and Linux journal logs. Runs periodically rather than continuously.
+Supports syslog, cyclog, multilog, BSD (and macOS pre-Tahoe) and Linux process accounting logs, and Linux journal logs. Runs periodically rather than continuously.
 
 Now uses and requires Signify.pm for signed include files.
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.24p0.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2025-pkg.pub
+reportnew-1.24a.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2025-pkg.pub
 
-Current version is reportnew-1.24 of 4 November 2025.
+Current version is reportnew-1.24a of 12 November 2025.
 
 Multiple hosts can be supported with a single config file using either
    hosts: <hostname-list>
