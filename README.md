@@ -1,7 +1,7 @@
 # reportnew
 Perl script to monitor logs for issues and issue alert emails, with some correlation capability within a log.
 
-Supports syslog, cyclog, multilog, BSD (and macOS pre-Tahoe) and Linux process accounting logs, and Linux journal logs. Runs periodically rather than continuously.
+Supports syslog, cyclog, multilog, BSD (and macOS) and Linux process accounting logs, and Linux journal logs. Runs periodically rather than continuously.
 
 Now uses and requires Signify.pm for signed include files.
 
