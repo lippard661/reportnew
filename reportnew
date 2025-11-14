@@ -1960,8 +1960,10 @@ sub read_process_acct_log {
 	$time_dec);
     my ($new_checktime);
     my ($temp_fh);
-    my $linux_format = 'A16 A7 A9 A9 A30';
-    my $macos_format = 'A11 A8 A9 A9 A42';
+    # last field A30+, no duration
+    my $linux_format = 'A16 A7 A9 A9 A*';
+    # last field A44+, includes duration
+    my $macos_format = 'A11 A8 A9 A9 A*';
 
 # Read process accounting logs, out to end or to $checktime, whichever
 # comes first.  Write out to temp file, in reverse order, with more
