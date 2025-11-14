@@ -1,5 +1,7 @@
 BUGS
 
+(Fixed 1.25) Fixed parsing bugs in macOS process accounting.
+
 (Fixed 1.23a) Linux process accounting doesn't properly handle the flag/time
 boundary when times have more digits than usual.
 
@@ -43,9 +45,23 @@ for them, anchor each end against likely separators (beginning of line,
 the right hand side). (DONE, also uses right bracket for right hand side)
 
 Set up a separate user, use privilege separation and pledge (pledge and
-unveil DONE, not privsep and separate user).
+unveil DONE, not privsep and separate user). Fork child and drop privs
+for each check_logfile call? Or pull out the root functionality
+into a small component that opens the log file handles and passes
+them to the child processes using IO::FDPass (in CPAN but not standard)?
+Former seems simpler and could allow a bit of parallelization; there's
+no central coordination required since each log generates a separate
+action. (Child would need to return new sizes etc. so parent can write
+it to the size file at the end of the loop. Could have a new option to
+read and write size file that is for the child process to write it out
+and the parent to read it in, no lock required.  Open it for writing
+before dropping privs, in the temp dir.  Would need to drop privs in
+check_logfile, but this won't work for cyclog/multilog, not sure about
+where there are rotated logs, either.)
 
 FEATURES:
+
+* (DONE 1.25) Add macOS process accounting sample to reportnew.conf.
 
 * (DONE 1.23b) Add Linux process accounting sample to reportnew.conf
   appropriate for Proxmox/Debian.

@@ -158,7 +158,7 @@
 #    by root user, remove tai64nlocal command method for TAI64 log files.
 # Modified 12 November 2025 by Jim Lippard to use $macos_format instead of
 #    split for macOS process accounting logs, since command names can have
-#    spaces in them. Unfortunately, macOS Tahoe breaks process accounting.
+#    spaces in them.
 #
 #
 # To Do:
@@ -236,7 +236,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.24a of 12 November 2025';
+my $VERSION = 'reportnew 1.25 of 14 November 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -332,8 +332,8 @@ getopts ('cdV', \%opts) || die "Usage: reportnew [-c (check)|-d (debug)|-V (vers
 
 $config_check = $opts{'c'};
 $debug_mode = $opts{'d'} || $config_check; # config_check implies debug_mode;
-die "-V (version) cannot be used with other options.\n" if ($config_check || $debug_mode);
 if ($opts{'V'}) {
+    die "-V (version) cannot be used with other options.\n" if ($config_check || $debug_mode);
     print "$VERSION\n";
     exit;
 }
@@ -434,6 +434,7 @@ if ($^O eq 'openbsd') {
 }
 
 # Any files we create are rw for root only.
+my $old_umask = umask;
 umask 0077;
 
 # Create a temp_dir.
@@ -625,6 +626,7 @@ foreach $logfile (@logfiles) {
 
 # Remove temp dir.
 rmdir ($temp_dir);
+umask $old_umask;
 
 ### Subroutines.
 
@@ -1959,7 +1961,7 @@ sub read_process_acct_log {
     my ($new_checktime);
     my ($temp_fh);
     my $linux_format = 'A16 A7 A9 A9 A30';
-    my $macos_format = 'A11 A8 A9 A15 A40';
+    my $macos_format = 'A11 A8 A9 A9 A42';
 
 # Read process accounting logs, out to end or to $checktime, whichever
 # comes first.  Write out to temp file, in reverse order, with more
@@ -2004,6 +2006,8 @@ sub read_process_acct_log {
 	    elsif ($^O eq 'darwin') {
 		# macOS can have spaces in command names.
 		($command, $flags, $user, $tty, $time_info) = unpack ($macos_format, $_);
+		$flags =~ s/^\s*//;
+		$time_info =~ s/^\s*//;
 		($cpu, $secs, $day_name, $month, $day, $time, $duration) = split (/\s+/, $time_info, 7);
 	    }
 	    else { # OpenBSD, macOS
