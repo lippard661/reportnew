@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.25a) Fail if can't create temp dir, rearrange unveil order to make
+that less likely to happen in testing, improve macOS process accounting sample.
+
 (Fixed 1.25) Fixed parsing bugs in macOS process accounting.
 
 (Fixed 1.23a) Linux process accounting doesn't properly handle the flag/time

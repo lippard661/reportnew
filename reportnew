@@ -159,6 +159,9 @@
 # Modified 12 November 2025 by Jim Lippard to use $macos_format instead of
 #    split for macOS process accounting logs, since command names can have
 #    spaces in them.
+# Modified 15 November 2025 by Jim Lippard to rearrange unveil order slightly,
+#    fail if can't create temp dir, improve macOS process accounting sample in
+#    config file.
 #
 #
 # To Do:
@@ -236,7 +239,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.25 of 14 November 2025';
+my $VERSION = 'reportnew 1.25a of 15 November 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -360,6 +363,20 @@ if ($^O eq 'openbsd') {
     # exec required for sendmail.
     pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock') || die "Cannot pledge promises. $!\n";
     
+    # Needed to parse dates on process accounting logs.
+    unveil ($ZONEINFO_DIR, 'r');
+
+    # Need for username resolution on process accounting logs.
+    unveil ($ETC_DIR, 'r');
+
+    # Unveil directory where config file is, so that any macros
+    # with file import can be processed.
+    my $macro_dir = dirname ($config_file);
+    unveil ($macro_dir, 'r');
+
+    # Allow writing to and creating files and dirs in /tmp.
+    unveil ('/tmp', 'rwc');
+
     # Allow execution of commands. $LASTCOMM excluded since
     # it's not used on OpenBSD.
     unveil ($SENDMAIL, 'x');
@@ -368,20 +385,6 @@ if ($^O eq 'openbsd') {
     unveil (dirname ($SIGNIFY), 'rx');
     unveil ($SIGNIFY_DIR, 'rx');
     unveil ('/dev/null', 'rw');
-
-    # Needed to parse dates on process accounting logs.
-    unveil ($ZONEINFO_DIR, 'r');
-
-    # Need for username resolution on process accounting logs.
-    unveil ($ETC_DIR, 'r');
-
-    # Allow writing to and creating files and dirs in /tmp.
-    unveil ('/tmp', 'rwc');
-
-    # Unveil directory where config file is, so that any macros
-    # with file import can be processed.
-    my $macro_dir = dirname ($config_file);
-    unveil ($macro_dir, 'r');
 }
 
 &parse_config ($config_file);
@@ -438,7 +441,7 @@ my $old_umask = umask;
 umask 0077;
 
 # Create a temp_dir.
-$temp_dir = mkdtemp ("/tmp/reportnew.XXXXXXX");
+$temp_dir = mkdtemp ('/tmp/reportnew.XXXXXXX') || die "Cannot create temp dir. $!\n";
 chomp ($temp_dir);
 
 # Modified to read and write size file after each log processed, so that
