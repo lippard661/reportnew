@@ -2126,7 +2126,7 @@ sub read_process_acct_log {
 sub read_linux_journal {
     my ($logfile, $checktime, $temp_dir) = @_;
     my ($temp_logfile, $temp_fh, $new_checktime);
-    my (@time_components, $time_string, $full_time, $since_string);
+    my (@time_components, $time_string, $full_time);
     my @selection_args;
     my $NO_ENTRIES = '-- No entries --';
 
@@ -2144,10 +2144,6 @@ sub read_linux_journal {
 	@time_components = localtime ($checktime);
 	$time_string = strftime "%Y-%m-%d %H:%M:%S", @time_components;
 	$full_time = sprintf "%s.%06d", $time_string, $checktime;
-	$since_string = '"' . $full_time . '"';
-    }
-    else {
-	$since_string = '';
     }
 
     # Formulate selection arguments.
@@ -2178,7 +2174,7 @@ sub read_linux_journal {
     }
     
     # Append date if checktime nonzero.
-    push (@selection_args, '--since', $since_string) unless (!$checktime);
+    push (@selection_args, '--since', $full_time) unless (!$checktime);
 
     # Open journalctl to read log lines.
     if (!open (JOURNAL, '-|', $JOURNALCTL, @selection_args)) {
