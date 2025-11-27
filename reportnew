@@ -2144,7 +2144,7 @@ sub read_linux_journal {
 	@time_components = localtime ($checktime);
 	$time_string = strftime "%Y-%m-%d %H:%M:%S", @time_components;
 	$full_time = sprintf "%s.%06d", $time_string, $checktime;
-	$since_string = '--since "' . $full_time . '"';
+	$since_string = '"' . $full_time . '"';
     }
     else {
 	$since_string = '';
@@ -2178,7 +2178,7 @@ sub read_linux_journal {
     }
     
     # Append date if checktime nonzero.
-    push (@selection_args, $since_string) unless (!$checktime);
+    push (@selection_args, '--since', $since_string) unless (!$checktime);
 
     # Open journalctl to read log lines.
     if (!open (JOURNAL, '-|', $JOURNALCTL, @selection_args)) {
