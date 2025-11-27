@@ -162,6 +162,14 @@
 # Modified 15 November 2025 by Jim Lippard to rearrange unveil order slightly,
 #    fail if can't create temp dir, improve macOS process accounting sample in
 #    config file.
+# Modified 22 November 2025 by Jim Lippard to change read_size to get_size
+#    to avoid possible implication that it's related to reading from the size
+#    file. Do minimal validation on email addresses.
+#    Fix minor bug in non-OpenBSD process accounting.
+# Modified 25 November 2025 by Jim Lippard to open $JOURNALCTL without
+#    invoking shell. Fix bug in identify_rotated_logs not matching gzips.
+#    Preparation for privilege separation/running all log checks as
+#    _reportnew when run as root.
 #
 #
 # To Do:
@@ -239,7 +247,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.25a of 15 November 2025';
+my $VERSION = 'reportnew 1.25b of 27 November 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -436,7 +444,8 @@ if ($^O eq 'openbsd') {
     unveil ();
 }
 
-# Any files we create are rw for root only.
+# Any files we create are rw for root (or running user, non-priv works
+# fine for process accounting) only.
 my $old_umask = umask;
 umask 0077;
 
@@ -530,6 +539,8 @@ foreach $logfile (@logfiles) {
 		# we'll seek to the right position. We verify by checking
 		# the SHA256 digest of the first line to see if it matches
 		# what was there before. This check also occurs in check_logfile.
+		# This will "work" on a gzip but could have high rate of
+		# false positives.
 		if (!$processed_rotated_log_flag) {
 		    # If first line is different from what we last saw,
 		    # then start from the beginning.
@@ -583,7 +594,7 @@ foreach $logfile (@logfiles) {
 		next if ($cyclog_file eq 'lock'); # multilog format
 		next if ($cyclog_file eq 'state'); # multilog format
 		$cyclog_file = $logfile . '/' . $cyclog_file;
-		($size, $mtime) = &read_size ($cyclog_file);
+		($size, $mtime) = &get_size ($cyclog_file);
 		next if ($mtime < $old_log_checktime);
 		# If we get here, then we've found the oldest changed file
 		# (since we last checked).
@@ -749,6 +760,10 @@ sub parse_config {
 			    &send_error ($config_file, "Second master_notify directive on line $line_num. $value");
 			    exit;
 			}
+			if (!&valid_email ($value)) {
+			    &send_error ($config_file, "Invalid email address in master_notify directive on line $line_num. $value");
+			    exit;
+			}
 			$master_notify = $value;
 		    }
 		    elsif ($directive eq 'size_file') {
@@ -888,7 +903,14 @@ sub parse_config {
 			# action: notify
 			if ($action eq 'notify') {
 			    if (defined ($action_value)) {
-				# Should probably validate email format?
+				# Minimal email validation.
+				my @check_emails = split (/,\s*/, $action_value);
+				foreach my $check_email (@check_emails) {
+				    if (!&valid_email ($check_email)) {
+					&send_error ($config_file, "Invalid email address(es) following \"notify\" action in action directive on line $line_num. $_");
+					exit;
+				    }
+				}
 				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
 			    }
 			    else {
@@ -1060,6 +1082,18 @@ sub parse_config {
     }
 }
 
+# Minimal validation on email address.  Better to use
+# Mail::RFC822::Address's valid.
+sub valid_email {
+    my ($email) = @_;
+
+    if ($email =~ /.+\@.+\..+/) {
+	return 1;
+    }
+
+    return 0;
+}
+
 # Minimal validation on logfile name. Lots of room for improvement.
 # Also not great to be checking the linux journal format in so many
 # places.
@@ -1081,10 +1115,11 @@ sub valid_logfile_format {
 
 # Subroutine to get linux journal units. Only loaded active and with
 # names ending in ".service".
+# Doesn't require privileges.
 sub get_linux_journal_units {
     my @units;
 
-    if (open (SYSTEMCTL, '-|', "$SYSTEMCTL list-units")) {
+    if (open (SYSTEMCTL, '-|', $SYSTEMCTL, 'list-units')) {
 	while (<SYSTEMCTL>) {
 	    chomp;
 	    if (/^\s*(.*\.service).*loaded active/) {
@@ -1101,10 +1136,11 @@ sub get_linux_journal_units {
 }
 
 # Subroutine to get available linux journal syslog facilities.
+# Doesn't require privileges.
 sub get_linux_journal_syslog_facilities {
     my @facilities;
 
-    if (open (JOURNALCTL, '-|', "$JOURNALCTL --facility=help")) {
+    if (open (JOURNALCTL, '-|', $JOURNALCTL, '--facility=help')) {
 	while (<JOURNALCTL>) {
 	    chomp;
 	    push (@facilities, $_) unless (/Available facilities:/);
@@ -1346,7 +1382,7 @@ sub check_logfile {
     # If an old rotated log is larger than the last log file we looked
     # at, we're still checking the first log line to see if we need
     # to look at the whole log file, but we only compute that when needed.
-    ($size, $mtime) = &read_size ($logfile);
+    ($size, $mtime) = &get_size ($logfile);
 
     # Determine if we are processing a file we have already seen before,
     # or if it's a new one.
@@ -1536,7 +1572,7 @@ sub check_logfile {
     return ($size, $mtime, $checktime, $sha256_digest);
 }
 
-# Is logfile a gzip file?
+# Is logfile a gzip file? (Named like one, that is. No test for file magic.)
 sub is_gzip {
     my ($logfile) = @_;
 
@@ -1566,6 +1602,7 @@ sub gunzip_logfile {
 }
 
 # Subroutine to return a SHA256 hash of the first log line (or 0).
+# This subroutine may be touching files only accessible by root.
 sub first_log_line_sha256_digest {
     my ($logfile) = @_;
     my ($first_line, $sha256_digest);
@@ -1619,6 +1656,8 @@ sub first_log_line_time {
 # Identify any rotated logs which have modification times more recent than
 # our last check. Was going to check here if the first one found had a line
 # newer than our last check, but I don't want to unzip files twice.
+# Was ignoring gzips for a few versions.
+# This subroutine may be touching files only accessible by root.
 sub identify_rotated_logs {
     my ($logfile, $old_checktime) = @_;
     my ($logdir, $logbase, @files, $file, $size, $mtime);
@@ -1633,12 +1672,13 @@ sub identify_rotated_logs {
 
     # Read directory, searching for matching files.
     # Assumes a single-digit number of rotated logs.
+    # Added match for gzips; sizes may be less meaningful.
     if (opendir (DIR, $logdir)) {
-	@files = grep (/^$logbase\.\d$/, readdir (DIR));
+	@files = grep (/^$logbase\.\d(\.gz){0,1}$/, readdir (DIR));
 
 	# Find files that have been modified since our last check.
 	foreach $file (reverse (sort (@files))) {
-	    ($size, $mtime) = &read_size ("$logdir/$file");
+	    ($size, $mtime) = &get_size ("$logdir/$file");
 	    if ($mtime > $old_checktime) { # a rotated log that needs checking
 		if (!$rotated_logs_flag) { # first one we find
 		    $rotated_logs_flag = 1;
@@ -1785,7 +1825,7 @@ sub openbsd_read_process_acct_log {
     # Skip this if checktime = 0;
     if ($checktime) {
 	$old_size = $log_size{$acct_log};
-	($prev_acct_file_size, $acct_file_mtime) = &read_size ($acct_log);
+	($prev_acct_file_size, $acct_file_mtime) = &get_size ($acct_log);
 	for ($idx = 0; $idx <= $MAX_PROCESS_ACCOUNTING_FILE; $idx++) {
 	    $acct_file = $acct_log . '.' . $idx;
 	    if (-e $acct_file) {
@@ -1794,7 +1834,7 @@ sub openbsd_read_process_acct_log {
 	    else {
 		last;
 	    }
-	    ($acct_file_size, $acct_file_mtime) = &read_size ($acct_file);
+	    ($acct_file_size, $acct_file_mtime) = &get_size ($acct_file);
 
 	    if ($acct_file_mtime < $checktime) {
 		$start_idx = $idx - 1;
@@ -1985,13 +2025,16 @@ sub read_process_acct_log {
     for ($idx = -1; $idx <= $MAX_PROCESS_ACCOUNTING_FILE; $idx++) {
 	if ($idx >= 0) {
 	    $acct_file = $acct_log . '.' . $idx;
+	    # OK if these don't exist yet, only abort if the main one doesn't.
+	    # Assumes no skipped numbers--we stop at the first nonexistent one.
+	    last if (!-e $acct_file);
 	}
 	else {
 	    $acct_file = $acct_log;
 	    $new_checktime = gettimeofday();
 	}
 
-	if (!open (LASTCOMM, '-|', "$LASTCOMM -f $acct_file")) {
+	if (!open (LASTCOMM, '-|', $LASTCOMM, '-f', $acct_file)) {
 	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
 	    exit; # or just return?
 	}
@@ -2079,11 +2122,12 @@ sub read_process_acct_log {
 # Read log information from Linux journal into a temp file to process.
 # This subroutine trusts the config parser to have validated the
 # arguments.
+# Requires privileges.
 sub read_linux_journal {
     my ($logfile, $checktime, $temp_dir) = @_;
     my ($temp_logfile, $temp_fh, $new_checktime);
     my (@time_components, $time_string, $full_time, $since_string);
-    my $selection_args;
+    my @selection_args;
     my $NO_ENTRIES = '-- No entries --';
 
     # Create temp file.
@@ -2113,12 +2157,12 @@ sub read_linux_journal {
 	    &send_error ($logfile, "Specified journal unit $unit_arg is not enabled.");
 	    exit; # or just return?
 	}
-	$selection_args = '-u ' . $unit_arg;
+	@selection_args = ('-u', $unit_arg);
     }
     elsif ($logfile =~ /journal syslog-id ([\w\-\.]+)$/) {
 	my $syslogid_arg = $1;
 	# no check today
-	$selection_args = '-t ' . $syslogid_arg;
+	@selection_args = ('-t', $syslogid_arg);
     }
     elsif ($logfile =~ /journal syslog-facility ([\w\-\.]+)$/) {
 	my $syslog_facility_arg = $1;
@@ -2126,7 +2170,7 @@ sub read_linux_journal {
 	    &send_error ($logfile, "Specified journal syslog facility $syslog_facility_arg is not defined.");
 	    exit; # or just return?    
 	}
-	$selection_args = '--facility=' . $syslog_facility_arg;
+	@selection_args = ('--facility=' . $syslog_facility_arg);
     }
     else {
 	&send_error ($logfile, "Could not parse journal logfile name. $logfile");
@@ -2134,10 +2178,10 @@ sub read_linux_journal {
     }
     
     # Append date if checktime nonzero.
-    $selection_args .= ' ' . $since_string unless (!$checktime);
+    push (@selection_args, $since_string) unless (!$checktime);
 
     # Open journalctl to read log lines.
-    if (!open (JOURNAL, '-|', "$JOURNALCTL $selection_args")) {
+    if (!open (JOURNAL, '-|', $JOURNALCTL, @selection_args)) {
 	&send_error ($logfile, "Could not open file handle for $JOURNALCTL. $!");
 	exit; # or just return?
     }
@@ -2244,8 +2288,8 @@ sub read_size_file {
     }
 }
 
-# Read current log file size and mtime.
-sub read_size {
+# Get current log file size and mtime.
+sub get_size {
     my ($logfile) = @_;
     my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size, $atime,
 	$mtime, $ctime, $blksize, $blocks);
@@ -2371,7 +2415,8 @@ sub send_text {
     }
 
     else {
-	open (MAIL, '|-', "$SENDMAIL -t $notify_list");
+	open (MAIL, '|-', $SENDMAIL, '-t');
+	print MAIL "To: $notify_list\n\n";
 	foreach $line (@lines) {
 	    print MAIL "$line\n";
 	}

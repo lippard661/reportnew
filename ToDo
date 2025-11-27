@@ -1,5 +1,10 @@
 BUGS
 
+(Fixed 1.25b) Fix regexp in &identify_rotated_logs to match gzips again.
+
+(Fixed 1.25b) Don't abort on non-OpenBSD systems with process accounting logs
+if the older rotated logs don't exist yet (OpenBSD code already OK).
+
 (Fixed 1.25a) Fail if can't create temp dir, rearrange unveil order to make
 that less likely to happen in testing, improve macOS process accounting sample.
 
@@ -60,9 +65,24 @@ read and write size file that is for the child process to write it out
 and the parent to read it in, no lock required.  Open it for writing
 before dropping privs, in the temp dir.  Would need to drop privs in
 check_logfile, but this won't work for cyclog/multilog, not sure about
-where there are rotated logs, either.)
+where there are rotated logs, either.) If gunzip check/temp gunzip is moved
+out of check_logfile--like process accounting, make it a log type--then
+file handle could be passed in, and the open placed in the parent process
+and the check_logfile done in a child process.
 
 FEATURES:
+
+* Add privilege separation when run as root (use _reportnew:_reportnew
+  user and group if present). root for config parse, temp file dir creation,
+  journalctl actions, gunzips, and log file opens, _reportnew for all log
+  processing including all parts of process accounting (no privs required).
+
+* (DONE 1.25b) Added more commands to macOS process accounting sample.
+
+* (DONE 1.25b) Don't invoke shell when doing journalctl operations.
+
+* (DONE 1.25b) Added minimal email address validation for master_notify and
+notify action.
 
 * (DONE 1.25) Add macOS process accounting sample to reportnew.conf.
 
