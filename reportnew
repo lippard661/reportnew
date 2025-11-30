@@ -1873,8 +1873,8 @@ sub is_gzip {
     if (substr ($logfile, length ($logfile) -3, 3) eq '.gz') {
 	return 1 if (!-r $logfile); # assume it is
 	if ($gzip_fh = &nonpriv_open_fh ($logfile, $cyclog_flag, $raw_mode_flag)) {
-	    read (GZIP, $magic_bytes, 2);
-	    close (GZIP);
+	    read ($gzip_fh, $magic_bytes, 2);
+	    close ($gzip_fh);
 	    $magic_number = unpack ('S>', $magic_bytes); # unsigned, short, big endian
 	    return $magic_number == 0x1f8b;
 	}
