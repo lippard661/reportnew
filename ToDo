@@ -1,5 +1,9 @@
 BUGS
 
+(Fixed 1.26) &first_log_line_sha256_digest needs to look at the uncompressed
+line if it's a gzip (especially since before log rotation it likely wasn't
+gzipped).
+
 (Fixed 1.25b) Fix regexp in &identify_rotated_logs to match gzips again.
 
 (Fixed 1.25b) Don't abort on non-OpenBSD systems with process accounting logs
@@ -72,10 +76,14 @@ and the check_logfile done in a child process.
 
 FEATURES:
 
-* Add privilege separation when run as root (use _reportnew:_reportnew
-  user and group if present). root for config parse, temp file dir creation,
-  journalctl actions, gunzips, and log file opens, _reportnew for all log
+* (DONE 1.26) Add privilege separation when run as root
+  (use _reportnew:_reportnew user and group if present). root
+  for config parse, temp file dir creation, journalctl actions,
+  gunzips, and log file opens, _reportnew for all log
   processing including all parts of process accounting (no privs required).
+  New requirements when priv sep is used:
+  IO::FDPass (Linux: libio-fdpass-perl),
+  Privileges::Drop (Linux: libprivileges-drop-perl)
 
 * (DONE 1.25b) Added more commands to macOS process accounting sample.
 

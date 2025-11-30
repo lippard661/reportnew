@@ -170,6 +170,14 @@
 #    invoking shell. Fix bug in identify_rotated_logs not matching gzips.
 #    Preparation for privilege separation/running all log checks as
 #    _reportnew when run as root.
+# Modified 26-29 November 2025 by Jim Lippard to implement privilege
+#    separation when run as root and _reportnew user and group exist.
+#    Also currently requires use of -p option as well. Privilege
+#    separation will parse config and (on OpenBSD) do pledge and unveil,
+#    then set up a root listener and fork a child that drops privileges
+#    and runs as _reportnew:_reportnew, sending requests to the parent
+#    when root access is required to open files, get first line file hashes,
+#    or perform Linux journalctl commands.
 #
 #
 # To Do:
@@ -205,8 +213,8 @@ use if $^O ne "openbsd", "File::Temp", qw( :mktemp tempfile );
 use Getopt::Std;
 use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
 use POSIX qw( strftime );
-#use Privileges::Drop;
 use Signify;
+use Socket;
 use Sys::Hostname;
 use Time::HiRes qw( gettimeofday );
 use Time::ParseDate;
@@ -247,7 +255,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.25b of 27 November 2025';
+my $VERSION = 'reportnew 1.26 of 30 November 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -337,12 +345,18 @@ my ($logfile, $size, $mtime, $sha256_digest,  @cyclog_files, $cyclog_file,
     $old_log_checktime, $got_first_cyclog_file, $temp_logfile);
 my ($rotated_logs_flag, $processed_rotated_log_flag, @rotated_logs, $rotated_logfile);
 
+# For privilege separation.
+my ($user, $reporter_uid, $reporter_gid, $use_privsep,
+    $privsep_flag, $priv_flag, $nonpriv_flag,
+    $parent_sock, $child_sock);
+
 ### Main program.
 
-getopts ('cdV', \%opts) || die "Usage: reportnew [-c (check)|-d (debug)|-V (version)] [config-file]\n";
+getopts ('cdpV', \%opts) || die "Usage: reportnew [-c (check)|-d (debug)|-V (version)] [config-file]\n";
 
 $config_check = $opts{'c'};
 $debug_mode = $opts{'d'} || $config_check; # config_check implies debug_mode;
+$use_privsep = $opts{'p'};
 if ($opts{'V'}) {
     die "-V (version) cannot be used with other options.\n" if ($config_check || $debug_mode);
     print "$VERSION\n";
@@ -369,7 +383,7 @@ if ($^O eq 'openbsd') {
     # Pledge. stdio is already included.
     # proc required for pid testing and any exec requirements.
     # exec required for sendmail.
-    pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock') || die "Cannot pledge promises. $!\n";
+    pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock', 'unix') || die "Cannot pledge promises. $!\n";
     
     # Needed to parse dates on process accounting logs.
     unveil ($ZONEINFO_DIR, 'r');
@@ -402,6 +416,28 @@ if ($config_check) {
     exit;
 }
 
+# Determine if we're going to use privilege separation.
+# Conditions: If running as root and _reporter user and group exist.
+$user = $ENV{'LOGNAME'} || $ENV{'USER'} || $ENV{'USERNAME'} || 'unknown';
+$reporter_uid = getpwnam ('_reporter');
+$reporter_gid = getgrnam ('_reporter');
+
+if ($use_privsep && $user eq 'root' &&
+    defined ($reporter_uid) &&
+    defined ($reporter_gid)) {
+    $privsep_flag = 1;
+    $priv_flag = 0;
+    $nonpriv_flag = 0;
+
+    # Modules required for privilege separation.
+    if (!eval { require IO::FDPass; 1 }) {
+	die "Could not require IO::FDPass. $@\n";
+    }
+    if (!eval { require Privileges::Drop; 1 }) {
+	die "Could not require Privileges::Drop. $@\n";
+    }
+}
+
 # Unveil log dirs from config and lock.
 # If script execution actions are added, will need to unveil here.
 if ($^O eq 'openbsd') {
@@ -425,25 +461,31 @@ if ($^O eq 'openbsd') {
     # Allow reading from and writing to size file.
     # c required for append.
     unveil ($size_file, 'rwc');
-    
-    # Need to unveil containing dir with rwc in order to create
-    # size file if it doesn't already exist. Go ahead and create it.
-    if (!-e $size_file) {
-	$size_file_dir = dirname ($size_file);
-	unveil ($size_file_dir, 'rwc');
-	if (open (SIZEFILE, '>', "$size_file_dir/$size_file")) {
-	    close (SIZEFILE);
-	}
-	else {
-	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot create size file. $!");
-	}
-	unveil ($size_file_dir, 'r');
-    }
 
-    # Now lock it to just those.
-    unveil ();
+    # Don't lock yet.
 }
 
+# Need to temporarily unveil containing dir with rwc in order to create
+# size file if it doesn't already exist. Go ahead and create it.
+if (!-e $size_file) {
+    my $size_file_dir = dirname ($size_file);
+    unveil ($size_file_dir, 'rwc') if ($^O eq 'openbsd');
+    if (open (SIZEFILE, '>', "$size_file_dir/$size_file")) {
+	close (SIZEFILE);
+    }
+    else {
+	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot create size file. $!");
+    }
+    # If using privilege separation, give _reporter:_reporter ownership.
+    chown ($reporter_uid, $reporter_gid, $size_file) if ($privsep_flag);
+
+    # Remove unneeded access from dir.
+    unveil ($size_file_dir, 'r') if ($^O eq 'openbsd');
+}
+
+# Lock down unveiling.
+unveil() if ($^O eq 'openbsd');
+    
 # Any files we create are rw for root (or running user, non-priv works
 # fine for process accounting) only.
 my $old_umask = umask;
@@ -452,6 +494,44 @@ umask 0077;
 # Create a temp_dir.
 $temp_dir = mkdtemp ('/tmp/reportnew.XXXXXXX') || die "Cannot create temp dir. $!\n";
 chomp ($temp_dir);
+
+# Privilege separation, if running as root:
+# Parent will set up listener to access files requiring root access,
+# child will drop privileges and run as _reporter:_reporter.
+if ($privsep_flag) {
+    
+    # Create socket for interprocess communications.
+    ($parent_sock, $child_sock) = IO::Socket::UNIX->socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+	or die "socketpair: $!";
+
+    # Fork.
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+
+    # Parent, privileged listener.
+    if ($pid != 0) {
+	close $child_sock;
+
+	# This is the privileged process.
+	$priv_flag = 1;
+
+	# chown temp_dir to _reportnew so child has access.
+	chown ($reporter_uid, $reporter_gid, $temp_dir);
+
+	# Listen for requests that require privileges.
+	&priv_listener;
+
+	# Shutdown after EOF.
+	exit;
+    }
+
+    # Child.
+    close $parent_sock;
+#    setgid ($reporter_gid);
+#    setuid ($reporter_uid);
+    drop_uidgid ($reporter_uid, $reporter_gid);
+    $nonpriv_flag = 1;
+}
 
 # Modified to read and write size file after each log processed, so that
 # if something fails on processing, work already done isn't repeated.
@@ -585,51 +665,51 @@ foreach $logfile (@logfiles) {
 			    $exclude_hash_ref{$logfile}, $action_hash_ref{$logfile}, $LOG_TYPE_STANDARD_LOG);
     }
     else { # cyclog or multilog
-	if (opendir (CYCLOG, $logfile)) {
-	    @cyclog_files = grep (!/^\./, readdir (CYCLOG));
-	    closedir (CYCLOG);
-	    $got_first_cyclog_file = 0;
-	    $old_log_checktime = $log_checktime{$logfile};
-	    foreach $cyclog_file (sort (@cyclog_files)) {
-		next if ($cyclog_file eq 'lock'); # multilog format
-		next if ($cyclog_file eq 'state'); # multilog format
-		$cyclog_file = $logfile . '/' . $cyclog_file;
-		($size, $mtime) = &get_size ($cyclog_file);
-		next if ($mtime < $old_log_checktime);
-		# If we get here, then we've found the oldest changed file
-		# (since we last checked).
-		$got_first_cyclog_file++;
-		if ($got_first_cyclog_file == 1) {
-		    ($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
-			&check_logfile ($cyclog_file, $log_size{$logfile}, $log_mtime{$logfile},
-					$old_log_checktime,
-					$log_sha256_digest{$logfile},
-					$match_hash_ref{$logfile},
-					$exclude_hash_ref{$logfile},
-					$action_hash_ref{$logfile},
-					$LOG_TYPE_CYCLOG_OR_MULTILOG);
-		}
-		# For all the new files, we don't care about size or mtime.
-		else {
-		    ($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}) =
-			&check_logfile ($cyclog_file, 0, 0, 0,
-					$log_sha256_digest{$logfile},
-					$match_hash_ref{$logfile},
-					$exclude_hash_ref{$logfile},
-					$action_hash_ref{$logfile},
-					$LOG_TYPE_CYCLOG_OR_MULTILOG);
-		    # If we're on the last one, set the first line SHA256 digest.
-		    # (Count is number of last element, not number of elements.)
-		    # This is never reached if there is only one, but we've
-		    # already set SHA256 above for the first one (zeroth) as well.
-		    if ($got_first_cyclog_file > $#cyclog_files) {
-			$log_sha256_digest{$logfile} = &first_log_line_sha256_digest ($cyclog_file);
-		    }
+	@cyclog_files = &get_cyclog_files ($logfile);
+	if ($!) {
+	    &send_error ($logfile, "Could not open cyclog/multilog $logfile. $!");
+	}
+	elsif (!@cyclog_files) {
+	    &send_error ($logfile, "Empty cyclog/multilog $logfile. $!");
+	}
+	$got_first_cyclog_file = 0;
+	$old_log_checktime = $log_checktime{$logfile};
+	foreach $cyclog_file (sort (@cyclog_files)) {
+	    next if ($cyclog_file eq 'lock'); # multilog format
+	    next if ($cyclog_file eq 'state'); # multilog format
+	    $cyclog_file = $logfile . '/' . $cyclog_file;
+	    ($size, $mtime) = &get_size ($cyclog_file);
+	    next if ($mtime < $old_log_checktime);
+	    # If we get here, then we've found the oldest changed file
+	    # (since we last checked).
+	    $got_first_cyclog_file++;
+	    if ($got_first_cyclog_file == 1) {
+		($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
+		    &check_logfile ($cyclog_file, $log_size{$logfile}, $log_mtime{$logfile},
+				    $old_log_checktime,
+				    $log_sha256_digest{$logfile},
+				    $match_hash_ref{$logfile},
+				    $exclude_hash_ref{$logfile},
+				    $action_hash_ref{$logfile},
+				    $LOG_TYPE_CYCLOG_OR_MULTILOG);
+	    }
+	    # For all the new files, we don't care about size or mtime.
+	    else {
+		($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}) =
+		    &check_logfile ($cyclog_file, 0, 0, 0,
+				    $log_sha256_digest{$logfile},
+				    $match_hash_ref{$logfile},
+				    $exclude_hash_ref{$logfile},
+				    $action_hash_ref{$logfile},
+				    $LOG_TYPE_CYCLOG_OR_MULTILOG);
+		# If we're on the last one, set the first line SHA256 digest.
+		# (Count is number of last element, not number of elements.)
+		# This is never reached if there is only one, but we've
+		# already set SHA256 above for the first one (zeroth) as well.
+		if ($got_first_cyclog_file > $#cyclog_files) {
+		    $log_sha256_digest{$logfile} = &first_log_line_sha256_digest ($cyclog_file);
 		}
 	    } # foreach
-	} # if opendir successful
-	else {
-	    &send_error ($logfile, "Could not open cyclog/multilog $logfile. $!");
 	}
     }
 
@@ -643,6 +723,8 @@ rmdir ($temp_dir);
 umask $old_umask;
 
 ### Subroutines.
+
+## Config parsing and related subroutines to validate config elements.
 
 # Subroutine to parse configuration file.
 # As written you the global directives at the top in the sample config file
@@ -1113,6 +1195,7 @@ sub valid_logfile_format {
     return 0;
 }
 
+
 # Subroutine to get linux journal units. Only loaded active and with
 # names ending in ".service".
 # Doesn't require privileges.
@@ -1342,6 +1425,214 @@ sub my_host {
     return 0;
 }
 
+## Subroutines for privilege separation.
+
+# Subroutine for privileged process to listen for and process requests.
+# Request format:
+#  get-fd:logname[.N[.gz]] - get file descriptor and return it
+#  get-fd-raw:logname[.N[.gz]] - open in raw mode
+#  get-hash:logname[.N[.gz] - get SHA256 of first line and return it
+#  get-journal:logname:checktime - get Linux journal info and return temp file location and checktime.
+#  get-mclog-fd:logname:file - get file descriptor of specific file
+#  get-mclog-files:logname - get multilog/cyclog file list
+#  gunzip:logname[.N].gz - gunzip file and return temp file location
+# Exit when the socket is closed on the other side.
+sub priv_listener {
+    my ($req, $req_type, $req_rest, $req_logfile,
+	$req_canon_logfile, $req_checktime);
+    my ($first_line_hash);
+
+    while ($req = <$parent_sock>) {
+	chomp;
+	if ($req =~ /(^[\w-]+):(.*)$/) {
+	    $req_type = $1;
+	    $req_rest = $2;
+	    if ($req_type eq 'get-fd' ||
+		$req_type eq 'get-fd-raw' ||
+		$req_type eq 'get-hash') {
+		$req_logfile = $req_rest;
+		$req_canon_logfile = $req_rest;
+		if ($req_rest =~ /^(.*)(\.\d)(\.gz){0,1}$/) {
+		    $req_canon_logfile = $1;
+		}
+	    }
+	    elsif ($req_type eq 'get-journal') {
+		if ($req_rest =~ /^(.*):(\d+)$/) {
+		    $req_canon_logfile = $1;
+		    $req_logfile = $1;
+		    $req_checktime = $2;
+		}
+	    }
+	    elsif ($req_type eq 'get-mclog-files') {
+		$req_logfile = $req_rest;
+		$req_canon_logfile = $req_rest;
+	    }
+	    elsif ($req_type eq 'get-mclog-fd') {
+		if ($req_rest =~ /^(.*):(.*)$/) {
+		    $req_canon_logfile = $1;
+		    $req_logfile = $1 . '/' . $2;
+		}
+		else {
+		    warn "Privileged parent process received invalid get-mclog-fd request: $req\n";
+		    exit;
+		}
+	    }
+	    elsif ($req_type eq 'gunzip') {
+		$req_logfile = $req_rest;
+		if ($req_rest =~ /^(.*)(\.\d\.gz)$/) {
+		    $req_canon_logfile = $1;
+		}
+		else {
+		    warn "Privileged parent process received invalid gunzip request: $req\n";
+		    next;
+		}
+	    }
+	    else {
+		warn "Privileged parent process received invalid logfile request: $req\n";
+		next;
+	    }
+	}
+	unless (grep (/^$req_canon_logfile$/, @logfiles)) {
+	    warn "Privileged parent process received invalid logfile name: $req\n";
+	    next;
+	}
+	# Open logfile and return file descriptor.
+	if ($req_type eq 'get-fd' ||
+	    $req_type eq 'get-fd-raw' ||
+	    $req_type eq 'get-mclog-fd') {
+	    my $open_mode = '<';
+	    $open_mode = '<:raw' if ($req_type eq 'get-fd-raw');
+	    if (open (my $fh, $open_mode, $req_logfile)) {
+		print $parent_sock "success\n";
+		IO::FDPass::send ($parent_sock, fileno ($fh))
+		    or warn "IO::FDPass::send failed: $!\n";
+	    }
+	    else {
+		print $parent_sock "$!\n";
+		warn "Failed to open $req_logfile: $!\n";
+	    }
+	}
+	# Get hash of first line and return it.
+	elsif ($req_type eq 'get-hash') {
+	    $first_line_hash = &first_log_line_sha256_digest ($req_logfile);
+	    print $parent_sock "$first_line_hash\n";
+	    next;
+	}
+	# Linux journal file.
+	# Save to temp file for child process,
+	# return filename and checktime.
+	elsif ($req_type eq 'get-journal') {
+	    (my $temp_logfile, my $checktime) = &read_linux_journal ($req_logfile, $req_checktime, $temp_dir);
+	    chown ($reporter_uid, $reporter_gid, $temp_logfile);
+	    print $parent_sock "$temp_logfile,$checktime\n";
+	    next;
+	}
+	# Get cyclog/multilog files and return, comma-separated.
+	elsif ($req_type eq 'get-mclog-files') {
+	    my @cyclog_files = &get_cyclog_files ($req_logfile);
+	    if (@cyclog_files) {
+		my $first_file = 1;
+		foreach my $cyclog_file (@cyclog_files) {
+		    print $parent_sock ',' if (!$first_file);
+		    $first_file = 0;
+		    print $parent_sock "$cyclog_file";
+		}
+	    }
+	    print $parent_sock "\n"; # just a blank line if can't get any
+	    next;
+	}
+	# Gzip. Copy to temp file for child process, return filename.
+	elsif ($req_type eq 'gunzip') {
+	    (my $temp_logfile) = &gunzip_logfile ($req_logfile);
+	    chown ($reporter_uid, $reporter_gid, $temp_logfile);
+	    print $parent_sock "$temp_logfile\n";
+	    next;
+	}
+    }
+}
+
+# Subroutine to send a request to the privileged parent process and
+# get a response, for all except the file descriptor requests.
+sub send_priv_req {
+    my ($req) = @_;
+    my ($return_result);
+
+    if (!$privsep_flag) {
+	die "Call to &send_priv_req when not using privilege separation.\n";
+    }
+    elsif ($priv_flag) {
+	die "Call to &send_priv_req from privileged parent process.\n";
+    }
+
+    print $child_sock "$req\n";
+    $return_result = <$child_sock>;
+    chomp ($return_result) if (defined ($return_result));
+    return ($return_result);
+}
+
+# Subroutine as wrapper for file open. Open if readable, send priv request
+# if using privilege separation and running unprivileged.
+# Tries the open instead of checking -r so that $! gets returned with
+# an appropriate error message.
+sub nonpriv_open_fh {
+    my ($logfile, $cyclog_file_flag, $raw_mode_flag) = @_;
+    my ($log_fh, $open_mode, $mclog_dir, $mclogfile, $success_or_failure);
+
+    $open_mode = '<';
+    $open_mode = '<:raw' if ($raw_mode_flag);
+
+    if (open ($log_fh, $open_mode, $logfile)) {
+	return $log_fh;
+    }
+    elsif ($privsep_flag && $nonpriv_flag) {
+	if ($cyclog_file_flag) {
+	    $mclog_dir = dirname ($logfile);
+	    $mclogfile = basename ($logfile);
+	    # raw_mode_flag ignored
+	    &send_priv_req ("get-mclog-fd:$mclog_dir:$mclogfile");
+	}
+	elsif ($raw_mode_flag) {
+	    &send_priv_req ("get-fd-raw:$logfile");
+	}
+	else {
+	    &send_priv_req ("get-fd:$logfile");
+	}
+	$success_or_failure = <$child_sock>;
+	chomp ($success_or_failure);
+	if ($success_or_failure eq 'success') {
+	    $log_fh = IO::FDPass::recv ($child_sock);
+	    return $log_fh;
+	}
+	
+	$! = $success_or_failure;
+    }
+
+    return 0;
+}
+
+# Subroutine to get cyclog files in dir.
+# Could require privileges, but we try once without even with
+# privilege separation.
+sub get_cyclog_files {
+    my ($logfile) = @_;
+    my (@cyclog_files, $priv_response);
+    
+    if (opendir (CYCLOG, $logfile)) {
+	@cyclog_files = grep (!/^\./, readdir (CYCLOG));
+	closedir (CYCLOG);
+    }
+    elsif ($privsep_flag && $nonpriv_flag) {
+	$priv_response = &send_priv_req ("get-mclogfiles:$logfile");
+	if (defined ($priv_response)) {
+	    @cyclog_files = split (/,/, $priv_response);
+	}
+    }
+
+    return (@cyclog_files);
+}
+
+## Main log checker.
+
 # Look through a log file for any changed lines; add them to
 # the global variable @notify_lines and execute the corresponding action.
 #
@@ -1455,9 +1746,9 @@ sub check_logfile {
 
     # Logfile has grown.
     if ($size > $old_size) {
-	if (open (LOG, '<', $logfile)) {
-	    seek (LOG, $old_size, 0) if ($old_size > 0);
-	    while (<LOG>) {
+	if (my $log_fh = &nonpriv_open_fh ($logfile, $log_type == $LOG_TYPE_CYCLOG_OR_MULTILOG)) {
+	    seek ($log_fh, $old_size, 0) if ($old_size > 0);
+	    while (<$log_fh>) {
 		chomp;
 		# Cycle through match/exclude hashes for each line.
 		# Action is performed at end if notify--could be
@@ -1507,7 +1798,7 @@ sub check_logfile {
 		    }
 		}
 	    }
-	    close (LOG);
+	    close ($log_fh);
 
 	    # If we were processing a gunzipped temp file, delete it.
 	    unlink ($logfile) if ($gzip_temp_log_flag && $logfile =~ /^$temp_dir/);
@@ -1572,20 +1863,38 @@ sub check_logfile {
     return ($size, $mtime, $checktime, $sha256_digest);
 }
 
-# Is logfile a gzip file? (Named like one, that is. No test for file magic.)
+# Is logfile a gzip file? Name and, if possible, magic number test.
 sub is_gzip {
     my ($logfile) = @_;
+    my ($gzip_fh, $magic_bytes, $magic_number);
+    my $cyclog_flag = 0;
+    my $raw_mode_flag = 1;
 
+    if (substr ($logfile, length ($logfile) -3, 3) eq '.gz') {
+	return 1 if (!-r $logfile); # assume it is
+	if ($gzip_fh = &nonpriv_open_fh ($logfile, $cyclog_flag, $raw_mode_flag)) {
+	    read (GZIP, $magic_bytes, 2);
+	    close (GZIP);
+	    $magic_number = unpack ('S>', $magic_bytes); # unsigned, short, big endian
+	    return $magic_number == 0x1f8b;
+	}
+	return 1; # if we can't open, assume it is.
+    }
 
-    return 1 if (substr ($logfile, length ($logfile) - 3, 3) eq '.gz');
-
-    return (0);
+    return 0;
 }
 
 # Subroutine to unzip zipped logfile into a temp dir.
+# May require privileges.
 sub gunzip_logfile {
     my ($logfile, $temp_dir) = @_;
     my ($temp_in_file, $temp_out_file, $temp_logfile);
+
+    if (!-r $logfile &&
+	$privsep_flag && $nonpriv_flag) {
+	$temp_logfile = &send_priv_req ("gunzip:$logfile");
+	return ($temp_logfile);
+    }
 
     $temp_in_file = basename ($logfile);
     $temp_out_file = substr ($temp_in_file, 0, length ($temp_in_file) - 3);
@@ -1605,9 +1914,23 @@ sub gunzip_logfile {
 # This subroutine may be touching files only accessible by root.
 sub first_log_line_sha256_digest {
     my ($logfile) = @_;
-    my ($first_line, $sha256_digest);
+    my ($first_line, $sha256_digest, $gzip);
 
-    if (open (LOG, '<', $logfile)) {
+    if (!-r $logfile && $privsep_flag && $nonpriv_flag) {
+	$sha256_digest = &send_priv_req ("get-hash:$logfile");
+	return ($sha256_digest);
+    }
+    elsif (&is_gzip ($logfile)) {
+	$gzip = IO::Uncompress::Gunzip->new ($logfile)
+	    or die "gunzip failed: $GunzipError\n";
+	$first_line = <$gzip>;
+	if (defined ($first_line)) {
+	    chomp ($first_line);
+	    $sha256_digest = sha256_hex ($first_line);
+	    return ($sha256_digest);
+	}
+    }
+    elsif (open (LOG, '<', $logfile)) {
 	$first_line = <LOG>;
 	close (LOG);
 	if (defined ($first_line)) {
@@ -1657,7 +1980,7 @@ sub first_log_line_time {
 # our last check. Was going to check here if the first one found had a line
 # newer than our last check, but I don't want to unzip files twice.
 # Was ignoring gzips for a few versions.
-# This subroutine may be touching files only accessible by root.
+# Assumption: /var/log and all other log file locations are world-readable,
 sub identify_rotated_logs {
     my ($logfile, $old_checktime) = @_;
     my ($logdir, $logbase, @files, $file, $size, $mtime);
@@ -1694,6 +2017,7 @@ sub identify_rotated_logs {
 }
 
 # Subroutine to read process accounting log files directly.
+# Does not require root privileges.    
 sub openbsd_read_process_acct_log {
     my ($acct_log, $checktime, $temp_dir) = @_;
     my ($found_first_log, $found_first_record, $idx, $start_idx,
@@ -1995,6 +2319,7 @@ sub flagbits {
 }
 
 # Subroutine to read process accounting log files using lastcomm.
+# Does not require root privileges.
 sub read_process_acct_log {
     my ($acct_log, $checktime, $temp_dir) = @_;
     my ($idx, $acct_file, @lastcomm_logs, $log_line, $temp_logfile);
@@ -2129,6 +2454,17 @@ sub read_linux_journal {
     my (@time_components, $time_string, $full_time);
     my @selection_args;
     my $NO_ENTRIES = '-- No entries --';
+    my $req_response; # for privilege separation
+
+    if ($privsep_flag && $nonpriv_flag) {
+	$req_response = &send_priv_req ("get-journal:$logfile:$checktime");
+	if (defined ($req_response) && $req_response =~ /,/) {
+	    ($temp_logfile, $new_checktime) = split (/,/, $req_response);
+	    return ($temp_logfile, $new_checktime);
+	}
+	&send_error ($logfile, "Received unexpected response from privileged parent process trying to get Linux journal info from $logfile.");
+	exit; # or just return?
+    }
 
     # Create temp file.
     # create and open
