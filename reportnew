@@ -278,6 +278,7 @@ my $SIGNIFY_DIR = '/etc/signify';
 my $PROCESS_ACCOUNTING_LOG = '/var/account/acct'; # BSD and macOS location.
 $PROCESS_ACCOUNTING_LOG = '/var/log/account/pacct' if ($^O eq 'linux');
 my $MAX_PROCESS_ACCOUNTING_FILE = 3;
+$MAX_PROCESS_ACCOUNTING_FILE = 9 if ($^O eq 'linux'); # not really a max
 
 my $NL = '
 ';
@@ -909,7 +910,8 @@ sub parse_config {
 			    $use_privsep = 1;
 			}
 			elsif ($value eq 'no') {
-			    $use_privsep = 0 unless $use_privsep == 1;
+			    $use_privsep = 0 unless (defined ($use_privsep)
+						     && $use_privsep == 1);
 			}
 			else {
 			    &send_error ($config_file, "Invalid value for privsep directive on line $line_num, must be \"yes\" or \"no\". $value");
@@ -1512,7 +1514,9 @@ sub priv_listener {
 		    $req_canon_logfile = $1;
 		}
 	    }
-	    elsif ($req_type eq 'get-journal') {
+	    # These both have canonical logfile name:checktime.
+	    elsif ($req_type eq 'get-journal' ||
+		$req_type eq 'get-linux-pacct') {
 		if ($req_rest =~ /^(.*):([\d\.]+)$/) {
 		    $req_canon_logfile = $1;
 		    $req_logfile = $1;
@@ -1576,11 +1580,13 @@ sub priv_listener {
 	    print $parent_sock "$first_line_hash\n";
 	    next;
 	}
-	# Linux journal file.
+	# Linux journal file and Linux process accounting.
 	# Save to temp file for child process,
 	# return filename and checktime.
-	elsif ($req_type eq 'get-journal') {
-	    (my $temp_logfile, my $checktime) = &read_linux_journal ($req_logfile, $req_checktime, $temp_dir);
+	elsif ($req_type eq 'get-journal' || $req_type eq 'get-linux-pacct') {
+	    my ($temp_logfile, $checktime);
+	    ($temp_logfile, $checktime) = &read_linux_journal ($req_logfile, $req_checktime, $temp_dir) if ($req_type eq 'get-journal');
+	    ($temp_logfile, $checktime) = &read_process_acct_log ($req_logfile, $req_checktime, $temp_dir) if ($req_type eq 'get-linux-pacct');
 	    chown ($reporter_uid, $reporter_gid, $temp_logfile);
 	    print $parent_sock "$temp_logfile,$checktime\n";
 	    next;
@@ -2388,7 +2394,10 @@ sub flagbits {
 }
 
 # Subroutine to read process accounting log files using lastcomm.
-# Does not require root privileges.
+# Does not require root privileges on BSDs (including macOS), but
+# does on Linux.
+# Linux also gzips rotated process accounting logs and expects them
+# to be piped to lastcomm with zcat.
 sub read_process_acct_log {
     my ($acct_log, $checktime, $temp_dir) = @_;
     my ($idx, $acct_file, @lastcomm_logs, $log_line, $temp_logfile);
@@ -2401,10 +2410,21 @@ sub read_process_acct_log {
     my $linux_format = 'A16 A7 A9 A9 A*';
     # last field A44+, includes duration
     my $macos_format = 'A11 A8 A9 A9 A*';
+    my ($req_response); # for privsep
 
-# Read process accounting logs, out to end or to $checktime, whichever
-# comes first.  Write out to temp file, in reverse order, with more
-# standardized date/time stamps.  Return $temp_logfile name.
+    if ($^O eq 'linux' && $privsep_flag && $nonpriv_flag) {
+	$req_response = &send_priv_req ("get-linux-pacct:$logfile:$checktime");
+	if (defined ($req_response) && $req_response =~ /,/) {
+	    ($temp_logfile, $new_checktime) = split (/,/, $req_response);
+	    return ($temp_logfile, $new_checktime);
+	}
+	&send_error ($logfile, "Received unexpected response from privileged parent process trying to get Linux process accounting from $logfile.");
+	exit; # or just return?
+    }
+
+    # Read process accounting logs, out to end or to $checktime, whichever
+    # comes first.  Write out to temp file, in reverse order, with more
+    # standardized date/time stamps.  Return $temp_logfile name.
 
     # Do lastcomm, starting with the most recent and working backward,
     # reading lines into @lastcomm_logs with parsed date/time, until
