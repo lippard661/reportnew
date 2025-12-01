@@ -1609,7 +1609,7 @@ sub priv_listener {
 	}
 	# Gzip. Copy to temp file for child process, return filename.
 	elsif ($req_type eq 'gunzip') {
-	    (my $temp_logfile) = &gunzip_logfile ($req_logfile);
+	    (my $temp_logfile) = &gunzip_logfile ($req_logfile, $temp_dir);
 	    chown ($reporter_uid, $reporter_gid, $temp_logfile);
 	    print $parent_sock "$temp_logfile\n";
 	    next;
@@ -2235,7 +2235,7 @@ sub openbsd_read_process_acct_log {
 	if (&is_gzip ($acct_file)) {
 	    # gunzip into a temp file and look at that (doesn't currently
 	    # happen on OpenBSD).
-	    $acct_temp_logfile = &gunzip_logfile ($acct_file);
+	    $acct_temp_logfile = &gunzip_logfile ($acct_file, $temp_dir);
 	    $acct_file = $acct_temp_logfile;
 	}
 
@@ -2439,7 +2439,7 @@ sub read_process_acct_log {
     foreach $acct_file (sort @rotated_acct_logs) {
 	if (&is_gzip ($acct_file)) {
 	    # gunzip into a temp file and run lastcomm on that.
-	    $acct_temp_logfile = &gunzip_logfile ($acct_file);
+	    $acct_temp_logfile = &gunzip_logfile ($acct_file, $temp_dir);
 	    $acct_file = $acct_temp_logfile;
 	}
 
