@@ -7,9 +7,9 @@ Now uses and requires Signify.pm for signed include files.
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.26a.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2025-pkg.pub
+reportnew-1.26b.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2025-pkg.pub
 
-Current version is reportnew-1.26a of 30 November 2025.
+Current version is reportnew-1.26b of 1 December 2025.
 
 This version supports privilege separation on OpenBSD, macOS, and Linux.
 
