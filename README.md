@@ -11,7 +11,7 @@ reportnew-1.26a.tgz is a Legion of Dynamic Discord signify-signed OpenBSD packag
 
 Current version is reportnew-1.26a of 30 November 2025.
 
-This version supports privilege separation on OpenBSD and macOS, but it doesn't currently work with Linux process accounting (which requires privileges, unlike BSD).
+This version supports privilege separation on OpenBSD, macOS, and Linux.
 
 Multiple hosts can be supported with a single config file using either
    hosts: <hostname-list>
