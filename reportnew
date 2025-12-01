@@ -181,6 +181,8 @@
 # Modified 30 November 2025 by Jim Lippard to add privsep directive to
 #    reportnew.conf, fix bugs in privsep, add _reportnew user to process
 #    accounting sample configs.
+# Modified 1 December 2025 by Jim Lippard to support Linux process
+#    accounting's gzipped rotated logs (and better support other OSs).
 #
 #
 # To Do:
@@ -262,7 +264,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.26a of 30 November 2025';
+my $VERSION = 'reportnew 1.26b of 1 December 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -2095,15 +2097,15 @@ sub identify_rotated_logs {
 # Does not require root privileges.    
 sub openbsd_read_process_acct_log {
     my ($acct_log, $checktime, $temp_dir) = @_;
-    my ($found_first_log, $found_first_record, $idx, $start_idx,
+    my ($found_first_record,
 	$acct_file, $acct_file_size, $acct_file_mtime,
-	$prev_acct_file_size, $old_size,
-	$processing_records, $last_acct_file_found);
+	$old_size, $processing_records);
     my ($command, $utime, $stime, $etime, $io, $btime, $uid, $gid,
 	$mem, $tty, $pid, $flags);
     my ($date_time, $user, $cpu, $time, $delta, $duration);
     my ($new_checktime);
     my ($temp_fh);
+    my ($rotated_logs_flag, @rotated_acct_logs, $acct_temp_logfile);
     my %DEV_NAME = (
 	"-1", "__",
 	"256","tty",
@@ -2212,66 +2214,42 @@ sub openbsd_read_process_acct_log {
 	"1314","ttypy",
 	"1315","ttypz"
 	);
-	
-    $found_first_log = 0;
-    $found_first_record = 0;
-    $processing_records = 0;
-    $last_acct_file_found = -1;
 
-    # If $log_mtime{$acct_log} < $checktime, there's nothing to do, but
-    # this should never happen. Let's work backwards checking the older
-    # logs to find a start point, then work forward from there.
-    # Skip this if checktime = 0;
-    if ($checktime) {
-	$old_size = $log_size{$acct_log};
-	($prev_acct_file_size, $acct_file_mtime) = &get_size ($acct_log);
-	for ($idx = 0; $idx <= $MAX_PROCESS_ACCOUNTING_FILE; $idx++) {
-	    $acct_file = $acct_log . '.' . $idx;
-	    if (-e $acct_file) {
-		$last_acct_file_found = $idx;
-	    }
-	    else {
-		last;
-	    }
-	    ($acct_file_size, $acct_file_mtime) = &get_size ($acct_file);
+    # Returns @rotated_acct_logs with changes since $checktime, sorted
+    # oldest to newest, which is what we want.
+    ($rotated_logs_flag, @rotated_acct_logs) = &identify_rotated_logs ($acct_log, $checktime);
+    # Unlike using lastcomm, which presents the records from newest to
+    # oldest, we're going to start with the oldest file and read its
+    # records ourselves from oldest to newest.
+    push (@rotated_acct_logs, $acct_log);
 
-	    if ($acct_file_mtime < $checktime) {
-		$start_idx = $idx - 1;
-		$found_first_log = 1;
-		last;
-	    }
-	    $prev_acct_file_size = $acct_file_size;
-	}
-    }
-    # If we didn't find one (or if $checktime=0), then everything is new
-    # and we start with the oldest. If the system is new, the oldest
-    # process accounting file could be < $MAX_PROCESS_ACCOUNTING_FILE.
-    if (!$found_first_log) {
-	$start_idx = $last_acct_file_found;
-	$found_first_record = 1;
-    }
+    # Start where we left off if the oldest file that changed since we
+    # last checked is the same one we're starting with.
+    $old_size = 0;
+    $old_size = $log_size{$acct_log} if ($checktime);
 
-    # So now we start from the oldest with changes, and look for a first
-    # record unless we're processing everything.
-    for ($idx = $start_idx; $idx >= -1; $idx--) {
-	if ($idx == -1) {
-	    $acct_file = $acct_log;
+    # Start looking at accounting files, and allow for .gz rotated
+    # logs. (Don't sort here because &identify_rotated_logs already
+    # did it the way we want, oldest first.)
+    foreach $acct_file (@rotated_acct_logs) {
+	if (&is_gzip ($acct_file)) {
+	    # gunzip into a temp file and look at that (doesn't currently
+	    # happen on OpenBSD).
+	    $acct_temp_logfile = &gunzip_logfile ($acct_file);
+	    $acct_file = $acct_temp_logfile;
 	}
-	else {
-	    $acct_file = $acct_log . '.' . $idx;
-	}
+
+	$found_first_record = 0;
+	$processing_records = 0;
 
 	# Open file and look for first record if we need it. Once
 	# we have a first record, open temp file and start writing out
 	# to it.
 	if (open (ACCTLOG, '<', $acct_file)) {
 	    $/ = \64; # read 64-byte records
-	    # If this is the old file, let's seek to
-	    # one record before where we left off.
-	    if ($found_first_log && !$found_first_record &&
-		$prev_acct_file_size > 640 &&
-		$old_size < $prev_acct_file_size &&
-		$old_size % 64 == 0) {
+	    # Starting with the oldest file with an mtime > checktime.
+	    # Skip past any records with time < checktime.
+	    if (!$found_first_record) {
 		seek (ACCTLOG, $old_size - 64, 0);
 		# would like to test if this record is older than
 		# checktime, if not, should do binary search or start
@@ -2335,6 +2313,7 @@ sub openbsd_read_process_acct_log {
 	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
 	    exit;
 	}
+	# set checktime at the end
 	$new_checktime = gettimeofday();
 	close (ACCTLOG);
 	$/ = $NL;
@@ -2401,6 +2380,7 @@ sub flagbits {
 sub read_process_acct_log {
     my ($acct_log, $checktime, $temp_dir) = @_;
     my ($idx, $acct_file, @lastcomm_logs, $log_line, $temp_logfile);
+    my ($rotated_logs_flag, @rotated_acct_logs, $acct_temp_logfile);
     my ($command, $flags, $user, $tty, $time_info,
 	$cpu, $secs, $day_name, $month, $day, $time, $duration,
 	$time_dec);
@@ -2436,16 +2416,31 @@ sub read_process_acct_log {
     # This could be fixed by checking that the time of the new log
     # is earlier, even if the duration is added to it (or if the
     # time is earlier by more than the duration).
-    for ($idx = -1; $idx <= $MAX_PROCESS_ACCOUNTING_FILE; $idx++) {
-	if ($idx >= 0) {
-	    $acct_file = $acct_log . '.' . $idx;
-	    # OK if these don't exist yet, only abort if the main one doesn't.
-	    # Assumes no skipped numbers--we stop at the first nonexistent one.
-	    last if (!-e $acct_file);
-	}
-	else {
-	    $acct_file = $acct_log;
-	    $new_checktime = gettimeofday();
+
+    # Only looks at acct.N[.gz] where N is a single digit, Linux will go to
+    # double digits. Also returns oldest first.
+    # $rotated_logs_flag ignored, we're always going to do something
+    # unless there's no log at all, which should already have been
+    # determined (unless it just got deleted).
+    ($rotated_logs_flag, @rotated_acct_logs) = &identify_rotated_logs ($acct_log, $checktime);
+    # Insert current log at the front. It will be sorted anyway, but
+    # this puts it where it belongs.
+    unshift (@rotated_acct_logs, $acct_log);
+
+    # Set new checktime to roughly correspond with the last log entry
+    # (first one in the newest file, which we process first).
+    $new_checktime = gettimeofday();
+    # Sorting from oldest first to newest first. Maybe make an option
+    # to &identify_rotated_logs to avoid unnecessary sort.
+    # Note that sort here and in &identify_rotated_logs won't work
+    # right if support is added for more than one digit in the filename,
+    # unless we sort numerically on the number and keep the one without
+    # a number at the front.
+    foreach $acct_file (sort @rotated_acct_logs) {
+	if (&is_gzip ($acct_file)) {
+	    # gunzip into a temp file and run lastcomm on that.
+	    $acct_temp_logfile = &gunzip_logfile ($acct_file);
+	    $acct_file = $acct_temp_logfile;
 	}
 
 	if (!open (LASTCOMM, '-|', $LASTCOMM, '-f', $acct_file)) {
@@ -2454,7 +2449,7 @@ sub read_process_acct_log {
 	}
 	while (<LASTCOMM>) {
 	    # Parse line, check time.  If lastcomm time <= $check_time,
-	    # then set $idx to $MAX_PROCESS_ACCOUNTING_FILE+1 and exit with next.
+	    # then exit with "last."
 	    chomp;
 
 	    # Linux has older format with no duration.
@@ -2488,7 +2483,8 @@ sub read_process_acct_log {
 		if ($checktime - $time_dec > ($dur_hours * SECSPERHOUR +
 					      $dur_mins * SECSPERMIN +
 					      $dur_secs)) {
-		    $idx = $MAX_PROCESS_ACCOUNTING_FILE + 1;
+		    unlink ($acct_temp_logfile) if (defined ($acct_temp_logfile) &&
+						    $acct_file eq $acct_temp_logfile);
 		    last;
 		}
 	    }
@@ -2499,9 +2495,11 @@ sub read_process_acct_log {
 	    push (@lastcomm_logs, $log_line);
 	}
 	close (LASTCOMM);
+	unlink ($acct_temp_logfile) if (defined ($acct_temp_logfile) &&
+					$acct_file eq $acct_temp_logfile);
     }
 
-    # Now write out @lastcomm_logs to a temp file in reverse order.
+    # Now write out @lastcomm_logs to a new temp file in reverse order.
 
     # Create temp file.
     if ($^O eq 'openbsd') {

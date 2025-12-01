@@ -78,7 +78,10 @@ and the check_logfile done in a child process.
 
 FEATURES:
 
-* (Done 1.26a) Add privsep directive to config file (overrideable
+* (DONE 1.26b) Add support for gzipped process accounting files for all
+platforms (needed for Linux).
+
+* (DONE 1.26a) Add privsep directive to config file (overrideable
 by command line option to enable but not to disable).
 
 * (DONE 1.26) Add privilege separation when run as root
