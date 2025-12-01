@@ -1,5 +1,7 @@
 BUGS
 
+(Fixed 1.26a) Bugs in fd handling of privsep.
+
 (Fixed 1.26) &first_log_line_sha256_digest needs to look at the uncompressed
 line if it's a gzip (especially since before log rotation it likely wasn't
 gzipped).
@@ -75,6 +77,9 @@ file handle could be passed in, and the open placed in the parent process
 and the check_logfile done in a child process.
 
 FEATURES:
+
+* (Done 1.26a) Add privsep directive to config file (overrideable
+by command line option to enable but not to disable).
 
 * (DONE 1.26) Add privilege separation when run as root
   (use _reportnew:_reportnew user and group if present). root

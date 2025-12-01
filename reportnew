@@ -178,6 +178,9 @@
 #    and runs as _reportnew:_reportnew, sending requests to the parent
 #    when root access is required to open files, get first line file hashes,
 #    or perform Linux journalctl commands.
+# Modified 30 November 2025 by Jim Lippard to add privsep directive to
+#    reportnew.conf, fix bugs in privsep, add _reportnew user to process
+#    accounting sample configs.
 #
 #
 # To Do:
@@ -214,10 +217,14 @@ use Getopt::Std;
 use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
 use POSIX qw( strftime );
 use Signify;
-use Socket;
 use Sys::Hostname;
 use Time::HiRes qw( gettimeofday );
 use Time::ParseDate;
+# required for privilege separation
+use base; # required for Privileges::Drop
+use English; # required for Privileges::Drop
+use IO::Socket::UNIX; # required for socketpair call
+#use Socket; # required for socketpair call
 # required for multilog format
 #use Time::TAI64 qw( :tai64n );
 #my $TimeTAI64_module = 1;
@@ -255,7 +262,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.26 of 30 November 2025';
+my $VERSION = 'reportnew 1.26a of 30 November 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -288,6 +295,12 @@ my $GLOBAL_CONTEXT = 1;
 my $HOST_CONTEXT = 2;
 my $SKIPPING = 3;
 my $LOG_CONTEXT = 3; # not used, uses !defined($current_logfile)
+
+my @INITIAL_PROMISES = ('unveil');
+my @NONPRIVSEP_PROMISES = ('rpath', 'wpath', 'cpath', 'tmppath', 'flock', 'exec', 'proc');
+my @PRIVSEP_INITIAL_CHILD_PROMISES = ('id', 'prot_exec');
+my @PRIVSEP_CHILD_PROMISES = ('recvfd');
+my @PRIVSEP_PARENT_PROMISES = ('chown', 'sendfd');
 
 ### Variables.
 
@@ -356,7 +369,7 @@ getopts ('cdpV', \%opts) || die "Usage: reportnew [-c (check)|-d (debug)|-V (ver
 
 $config_check = $opts{'c'};
 $debug_mode = $opts{'d'} || $config_check; # config_check implies debug_mode;
-$use_privsep = $opts{'p'};
+$use_privsep = $opts{'p'}; # can override default or "no" in config.
 if ($opts{'V'}) {
     die "-V (version) cannot be used with other options.\n" if ($config_check || $debug_mode);
     print "$VERSION\n";
@@ -381,9 +394,20 @@ if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
 # parsing the config, then finish unveiling after the config is parsed.
 if ($^O eq 'openbsd') {
     # Pledge. stdio is already included.
-    # proc required for pid testing and any exec requirements.
-    # exec required for sendmail.
-    pledge ('exec', 'proc', 'rpath', 'wpath', 'cpath', 'tmppath', 'unveil', 'flock', 'unix') || die "Cannot pledge promises. $!\n";
+    # @INITIAL_PROMISES: unveil
+    # @NONPRIVSEP_PROMISES: rpath, wpath, cpath, tmppath, flock, proc, exec
+    #     flock for locking size file
+    #     proc for pid testing and exec
+    #     exec for sendmail
+    # @PRIVSEP_INITIAL_CHILD_PROMISES: id, prot_exec - for dropping privs
+    # @PRIVSEP_CHILD_PROMISES: recvfd - for receiving file descriptors
+    # @PRIVSEP_PARENT_PROMISES: sendfd - for sending file descriptors
+    # @PRIVSEP_PROMISES: unix (apparently not needed)
+    #     unix for socket communication
+    pledge (@INITIAL_PROMISES, @NONPRIVSEP_PROMISES,
+	    @PRIVSEP_PARENT_PROMISES,
+	    @PRIVSEP_INITIAL_CHILD_PROMISES,
+	    @PRIVSEP_CHILD_PROMISES) || die "Cannot pledge promises. $!\n";
     
     # Needed to parse dates on process accounting logs.
     unveil ($ZONEINFO_DIR, 'r');
@@ -417,11 +441,12 @@ if ($config_check) {
 }
 
 # Determine if we're going to use privilege separation.
-# Conditions: If running as root and _reporter user and group exist.
+# Conditions: If running as root and _reportnew user and group exist.
 $user = $ENV{'LOGNAME'} || $ENV{'USER'} || $ENV{'USERNAME'} || 'unknown';
-$reporter_uid = getpwnam ('_reporter');
-$reporter_gid = getgrnam ('_reporter');
+$reporter_uid = getpwnam ('_reportnew');
+$reporter_gid = getgrnam ('_reportnew');
 
+# Will quietly not use privsep if not run as root or _reportnew account doesn't exist.
 if ($use_privsep && $user eq 'root' &&
     defined ($reporter_uid) &&
     defined ($reporter_gid)) {
@@ -429,6 +454,9 @@ if ($use_privsep && $user eq 'root' &&
     $priv_flag = 0;
     $nonpriv_flag = 0;
 
+    # Unveil /usr/local/libdata/perl5 if on OpenBSD to allow
+    # loading these modules at runtime.
+    unveil ('/usr/local/libdata/perl5', 'r') if ($^O eq 'openbsd');
     # Modules required for privilege separation.
     if (!eval { require IO::FDPass; 1 }) {
 	die "Could not require IO::FDPass. $@\n";
@@ -436,6 +464,9 @@ if ($use_privsep && $user eq 'root' &&
     if (!eval { require Privileges::Drop; 1 }) {
 	die "Could not require Privileges::Drop. $@\n";
     }
+}
+elsif ($^O eq 'openbsd') { # not using privsep
+        pledge (@INITIAL_PROMISES, @NONPRIVSEP_PROMISES) || die "Cannot pledge promises, non-privsep. $!\n";
 }
 
 # Unveil log dirs from config and lock.
@@ -476,14 +507,15 @@ if (!-e $size_file) {
     else {
 	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot create size file. $!");
     }
-    # If using privilege separation, give _reporter:_reporter ownership.
+    # If using privilege separation, give _reportnew:_reportnew ownership.
     chown ($reporter_uid, $reporter_gid, $size_file) if ($privsep_flag);
 
     # Remove unneeded access from dir.
     unveil ($size_file_dir, 'r') if ($^O eq 'openbsd');
 }
 
-# Lock down unveiling.
+# Lock down unveiling. Equivalent to removing pledge for @INITIAL_PROMISES
+# (which so far only contains 'unveil').
 unveil() if ($^O eq 'openbsd');
     
 # Any files we create are rw for root (or running user, non-priv works
@@ -497,7 +529,7 @@ chomp ($temp_dir);
 
 # Privilege separation, if running as root:
 # Parent will set up listener to access files requiring root access,
-# child will drop privileges and run as _reporter:_reporter.
+# child will drop privileges and run as _reportnew:_reportnew.
 if ($privsep_flag) {
     
     # Create socket for interprocess communications.
@@ -511,6 +543,12 @@ if ($privsep_flag) {
     # Parent, privileged listener.
     if ($pid != 0) {
 	close $child_sock;
+
+	print "DEBUG: child proc=$pid, parent proc=$$\n" if ($debug_mode);
+	# Don't need @PRIVSEP_CHILD_PROMISES or @PRIVSEP_INITIAL_CHILD_PROMISES.
+	if ($^O eq 'openbsd') {
+	    pledge (@NONPRIVSEP_PROMISES, @PRIVSEP_PARENT_PROMISES) || die "Cannot pledge promises. $!\n"
+	}
 
 	# This is the privileged process.
 	$priv_flag = 1;
@@ -527,10 +565,12 @@ if ($privsep_flag) {
 
     # Child.
     close $parent_sock;
-#    setgid ($reporter_gid);
-#    setuid ($reporter_uid);
-    drop_uidgid ($reporter_uid, $reporter_gid);
+    Privileges::Drop::drop_uidgid ($reporter_uid, $reporter_gid);
     $nonpriv_flag = 1;
+    # No longer need @PRIVSEP_INITIAL_CHILD_PROMISES.
+    if ($^O eq 'openbsd') {
+	pledge (@NONPRIVSEP_PROMISES, @PRIVSEP_CHILD_PROMISES) || die "Cannot pledge promises. $!\n";
+    }
 }
 
 # Modified to read and write size file after each log processed, so that
@@ -861,6 +901,20 @@ sub parse_config {
 			    exit;
 			}
 			$email_sender = $value;
+		    }
+		    elsif ($directive eq 'privsep') {
+			# not checking for multiple of these, first yes
+			# overrides any subsequent no.
+			if ($value eq 'yes') {
+			    $use_privsep = 1;
+			}
+			elsif ($value eq 'no') {
+			    $use_privsep = 0 unless $use_privsep == 1;
+			}
+			else {
+			    &send_error ($config_file, "Invalid value for privsep directive on line $line_num, must be \"yes\" or \"no\". $value");
+			    exit;
+			}
 		    }
 		    elsif ($directive eq 'signify_pubkey') {
 			if (defined ($signify_pubkey)) {
@@ -1442,8 +1496,10 @@ sub priv_listener {
 	$req_canon_logfile, $req_checktime);
     my ($first_line_hash);
 
+    print "DEBUG: starting &priv_listener\n" if ($debug_mode);
     while ($req = <$parent_sock>) {
-	chomp;
+	chomp ($req);
+	print "DEBUG: parent received $req\n" if ($debug_mode);
 	if ($req =~ /(^[\w-]+):(.*)$/) {
 	    $req_type = $1;
 	    $req_rest = $2;
@@ -1457,7 +1513,7 @@ sub priv_listener {
 		}
 	    }
 	    elsif ($req_type eq 'get-journal') {
-		if ($req_rest =~ /^(.*):(\d+)$/) {
+		if ($req_rest =~ /^(.*):([\d\.]+)$/) {
 		    $req_canon_logfile = $1;
 		    $req_logfile = $1;
 		    $req_checktime = $2;
@@ -1502,13 +1558,15 @@ sub priv_listener {
 	    $req_type eq 'get-mclog-fd') {
 	    my $open_mode = '<';
 	    $open_mode = '<:raw' if ($req_type eq 'get-fd-raw');
-	    if (open (my $fh, $open_mode, $req_logfile)) {
+	    if (open (my $log_fh, $open_mode, $req_logfile)) {
 		print $parent_sock "success\n";
-		IO::FDPass::send ($parent_sock, fileno ($fh))
-		    or warn "IO::FDPass::send failed: $!\n";
+		print "DEBUG: parent sending fd for $req_logfile\n" if ($debug_mode);
+		IO::FDPass::send (fileno ($parent_sock), fileno ($log_fh))
+		    or warn "IO::FDPass::send failed ($req): $!\n";
+		print "DEBUG: parent sent fd for $req_logfile\n" if ($debug_mode);
 	    }
 	    else {
-		print $parent_sock "$!\n";
+		printf $parent_sock "%d\n", "$!"; # want numeric
 		warn "Failed to open $req_logfile: $!\n";
 	    }
 	}
@@ -1564,9 +1622,11 @@ sub send_priv_req {
 	die "Call to &send_priv_req from privileged parent process.\n";
     }
 
+    print "DEBUG: child sending $req\n" if ($debug_mode);
     print $child_sock "$req\n";
     $return_result = <$child_sock>;
     chomp ($return_result) if (defined ($return_result));
+    print "DEBUG: child received $return_result\n" if ($debug_mode && defined ($return_result));
     return ($return_result);
 }
 
@@ -1576,35 +1636,42 @@ sub send_priv_req {
 # an appropriate error message.
 sub nonpriv_open_fh {
     my ($logfile, $cyclog_file_flag, $raw_mode_flag) = @_;
-    my ($log_fh, $open_mode, $mclog_dir, $mclogfile, $success_or_failure);
+    my ($log_fd, $log_fh, $open_mode, $mclog_dir, $mclogfile, $success_or_failure);
 
     $open_mode = '<';
     $open_mode = '<:raw' if ($raw_mode_flag);
+
+    print "DEBUG: &nonpriv_open_fh on $logfile\n" if ($debug_mode);
 
     if (open ($log_fh, $open_mode, $logfile)) {
 	return $log_fh;
     }
     elsif ($privsep_flag && $nonpriv_flag) {
+	print "DEBUG: child sending priv req for fd for $logfile\n" if ($debug_mode);
 	if ($cyclog_file_flag) {
 	    $mclog_dir = dirname ($logfile);
 	    $mclogfile = basename ($logfile);
 	    # raw_mode_flag ignored
-	    &send_priv_req ("get-mclog-fd:$mclog_dir:$mclogfile");
+	    $success_or_failure = &send_priv_req ("get-mclog-fd:$mclog_dir:$mclogfile");
 	}
 	elsif ($raw_mode_flag) {
-	    &send_priv_req ("get-fd-raw:$logfile");
+	    $success_or_failure = &send_priv_req ("get-fd-raw:$logfile");
 	}
 	else {
-	    &send_priv_req ("get-fd:$logfile");
+	    $success_or_failure = &send_priv_req ("get-fd:$logfile");
 	}
-	$success_or_failure = <$child_sock>;
 	chomp ($success_or_failure);
 	if ($success_or_failure eq 'success') {
-	    $log_fh = IO::FDPass::recv ($child_sock);
+	    print "DEBUG: child received success, now receiving fd for $logfile\n" if ($debug_mode);
+	    $log_fd = IO::FDPass::recv (fileno ($child_sock));
+	    print "DEBUG: child received fd for $logfile\n" if ($debug_mode);
+	    print "DEBUG: child opening fh for $logfile\n" if ($debug_mode);
+	    open ($log_fh, "+<&=$log_fd"); # if fails, will return undef and $!
 	    return $log_fh;
 	}
-	
-	$! = $success_or_failure;
+	else {
+	    $! = $success_or_failure;
+	}
     }
 
     return 0;
@@ -1911,19 +1978,21 @@ sub gunzip_logfile {
 }
 
 # Subroutine to return a SHA256 hash of the first log line (or 0).
-# This subroutine may be touching files only accessible by root.
+# This subroutine may be touching files only accessible by root,
+# and &is_gzip will work on such files.
 sub first_log_line_sha256_digest {
     my ($logfile) = @_;
-    my ($first_line, $sha256_digest, $gzip);
+    my ($first_line, $sha256_digest, $gzip_fh);
 
     if (!-r $logfile && $privsep_flag && $nonpriv_flag) {
 	$sha256_digest = &send_priv_req ("get-hash:$logfile");
 	return ($sha256_digest);
     }
     elsif (&is_gzip ($logfile)) {
-	$gzip = IO::Uncompress::Gunzip->new ($logfile)
+	$gzip_fh = IO::Uncompress::Gunzip->new ($logfile)
 	    or die "gunzip failed: $GunzipError\n";
-	$first_line = <$gzip>;
+	$first_line = <$gzip_fh>;
+	close ($gzip_fh);
 	if (defined ($first_line)) {
 	    chomp ($first_line);
 	    $sha256_digest = sha256_hex ($first_line);
