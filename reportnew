@@ -183,6 +183,9 @@
 #    accounting sample configs.
 # Modified 1 December 2025 by Jim Lippard to support Linux process
 #    accounting's gzipped rotated logs (and better support other OSs).
+# Modified 2 December 2025 by Jim Lippard to add some minor security improvements:
+#    die if child dropping privs fails, limit priv request length, explicitly block
+#    directory traversal attempts, etc.
 #
 #
 # To Do:
@@ -264,7 +267,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.26b of 1 December 2025';
+my $VERSION = 'reportnew 1.26c of 2 December 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -391,6 +394,12 @@ else {
 
 if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
     $config_file .= $CONFIG_SUFFIX;
+}
+
+# Sanitize environment
+BEGIN {
+    $ENV{PATH} = '/usr/bin:/bin';
+    delete @ENV{qw(IFS CDPATH ENV BASH_ENV PERL5LIB LD_PRELOAD LD_LIBRARY_PATH)};
 }
 
 # If on OpenBSD, use pledge and unveil. Do as much as possible before
@@ -522,8 +531,7 @@ if (!-e $size_file) {
 unveil() if ($^O eq 'openbsd');
     
 # Any files we create are rw for root (or running user, non-priv works
-# fine for process accounting) only.
-my $old_umask = umask;
+# fine for process accounting on non-Linux) only.
 umask 0077;
 
 # Create a temp_dir.
@@ -568,8 +576,12 @@ if ($privsep_flag) {
 
     # Child.
     close $parent_sock;
+    # This call will die if it fails.
     Privileges::Drop::drop_uidgid ($reporter_uid, $reporter_gid);
+    print "DEBUG: real uid: $<, eff uid: $>, real gid: $(, eff gid: $)\n" if ($debug_mode);
+
     $nonpriv_flag = 1;
+
     # No longer need @PRIVSEP_INITIAL_CHILD_PROMISES.
     if ($^O eq 'openbsd') {
 	pledge (@NONPRIVSEP_PROMISES, @PRIVSEP_CHILD_PROMISES) || die "Cannot pledge promises. $!\n";
@@ -763,7 +775,6 @@ foreach $logfile (@logfiles) {
 
 # Remove temp dir.
 rmdir ($temp_dir);
-umask $old_umask;
 
 ### Subroutines.
 
@@ -1478,8 +1489,8 @@ sub my_host {
 	}
     }
 
-    return 1 if (grep (/^$SHORT_HOSTNAME$/, @hosts));
-    return 1 if (grep (/^$HOSTNAME$/, @hosts));
+    return 1 if (grep { $_ eq $SHORT_HOSTNAME } @hosts);
+    return 1 if (grep { $_ eq $HOSTNAME } @hosts);
     return 0;
 }
 
@@ -1499,14 +1510,27 @@ sub priv_listener {
     my ($req, $req_type, $req_rest, $req_logfile,
 	$req_canon_logfile, $req_checktime);
     my ($first_line_hash);
+    my $RESTRICTED_REQ_LENGTH = 1024;
 
     print "DEBUG: starting &priv_listener\n" if ($debug_mode);
     while ($req = <$parent_sock>) {
 	chomp ($req);
 	print "DEBUG: parent received $req\n" if ($debug_mode);
+	# Limit request length.
+	if (length ($req) > $RESTRICTED_REQ_LENGTH) {
+	    warn "Priv request too long.\n";
+	    next;
+	}
+	
 	if ($req =~ /(^[\w-]+):(.*)$/) {
 	    $req_type = $1;
 	    $req_rest = $2;
+
+	    # before using $req_rest
+	    if ($req_rest =~ /\.\./ || $req_rest =~ m{/\z/} ) {
+		warn "Privileged parent received suspicious request: $req\n"; next;
+	    }
+	    
 	    if ($req_type eq 'get-fd' ||
 		$req_type eq 'get-fd-raw' ||
 		$req_type eq 'get-hash') {
@@ -1554,7 +1578,7 @@ sub priv_listener {
 		next;
 	    }
 	}
-	unless (grep (/^$req_canon_logfile$/, @logfiles)) {
+	unless (grep { $_ eq $req_canon_logfile } @logfiles) {
 	    warn "Privileged parent process received invalid logfile name: $req\n";
 	    next;
 	}
@@ -1570,6 +1594,7 @@ sub priv_listener {
 		IO::FDPass::send (fileno ($parent_sock), fileno ($log_fh))
 		    or warn "IO::FDPass::send failed ($req): $!\n";
 		print "DEBUG: parent sent fd for $req_logfile\n" if ($debug_mode);
+		close $log_fh; # does this break it?
 	    }
 	    else {
 		printf $parent_sock "%d\n", "$!"; # want numeric
