@@ -17,7 +17,8 @@ works properly with perl 5.40.2 which is the current stable Homebrew release. Wo
 on the lines beginning with my %GIDHash and my %EGIDHash to insert "grep { $_ != 4294967295 }" immediately before "split(\s/," in each line, as the
 problem is that setgid in perl 5.34.1 ends up putting a -1 into $GID and $EGID (which is 4294967295 as an unsigned 32-bit integer).
 
-A sample macOS PLIST for /Library/LaunchDaemons is supplied for running as root with privilege separation; it can also run as an unprivileged user if
+A sample macOS PLIST for /Library/LaunchDaemons is supplied for running as root with privilege separation (be sure to specify "privsep: yes" in
+the config file, or alternatively add a -p option in the arguments list in the PLIST file); it can also run as an unprivileged user if
 the only intent is to use it for process accounting log monitoring. (Use "launchctl load -w /Library/LaunchDaemons/org.discord.reportnew.plist" and it
 will run every 30 minutes.)
 
