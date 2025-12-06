@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.discord.reportnew.plist</string>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>StartInterval</key>
+	<integer>1800</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/reportnewlog.stdout</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/reportnewlog.stderr</string>
+	
+	<key>UserName</key>
+	<string>root</string>
+	
+	<key>Program</key>
+	<string>/usr/local/bin/reportnew</string>
+	<key>ProgramArguments</key>
+	<array>
+	  <string>/usr/local/bin/reportnew</string>
+	  <string>/etc/reportnew/reportnew.conf</string>
+	</array>
+</dict>
+</plist>
