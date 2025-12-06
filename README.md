@@ -11,7 +11,11 @@ reportnew-1.26c.tgz is a Legion of Dynamic Discord signify-signed OpenBSD packag
 
 Current version is reportnew-1.26c of 2 December 2025.
 
-This version supports privilege separation on OpenBSD, macOS, and Linux.
+This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux) and
+Privileges::Drop (libprivileges-drop-perl on Linux), both in CPAN. Privileges::Drop fails with perl 5.34.1 which is the release on Tahoe 26.1, but
+works properly with perl 5.40.2 which is the current stable Homebrew release. Workarounds are either use the Homebrew perl or patch Privileges::Drop
+on the lines beginning with my %GIDHash and my %EGIDHash to insert "grep { $_ != 4294967295 }" immediately before "split(\s/,", as the problem is
+that setgid in perl 5.40.2 ends up putting a -1 into $GID and $EGID (which is 4294967295 as an unsigned 32-bit integer).
 
 Multiple hosts can be supported with a single config file using either
    hosts: <hostname-list>
