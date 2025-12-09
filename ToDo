@@ -1,5 +1,7 @@
 BUGS
 
+(Warn 1.26d) Warn of bug in macOS perl affecting Privileges::Drop if present.
+
 (Fixed 1.26a) Bugs in fd handling of privsep.
 
 (Fixed 1.26) &first_log_line_sha256_digest needs to look at the uncompressed
@@ -38,11 +40,11 @@ either needs to run through the config separately for each defined
 host or it needs to specifically check to make sure there are no
 conflicts within a single host's context.
 
-Apparently it is possible to set up session-with/session-without rules
+(Not fixed--likely config error.) Apparently it is possible to set up session-with/session-without rules
 that result in a blank notification message. (Likely due to excess
 capture group in match rules.)
 
-Could use general cleanup, more sensible config file parsing (e.g.,
+(DONE) Could use general cleanup, more sensible config file parsing (e.g.,
 make use of global/host/log context and restrict directives appropriately,
 build some useful subroutines to eliminate duplication, have some errors
 displayed instead of everything emailed.
@@ -57,24 +59,6 @@ Easier quick fix is to special-case IP address macros, and when searching
 for them, anchor each end against likely separators (beginning of line,
 :, whitespace for the left hand side, end of line, :, ., whitespace for
 the right hand side). (DONE, also uses right bracket for right hand side)
-
-Set up a separate user, use privilege separation and pledge (pledge and
-unveil DONE, not privsep and separate user). Fork child and drop privs
-for each check_logfile call? Or pull out the root functionality
-into a small component that opens the log file handles and passes
-them to the child processes using IO::FDPass (in CPAN but not standard)?
-Former seems simpler and could allow a bit of parallelization; there's
-no central coordination required since each log generates a separate
-action. (Child would need to return new sizes etc. so parent can write
-it to the size file at the end of the loop. Could have a new option to
-read and write size file that is for the child process to write it out
-and the parent to read it in, no lock required.  Open it for writing
-before dropping privs, in the temp dir.  Would need to drop privs in
-check_logfile, but this won't work for cyclog/multilog, not sure about
-where there are rotated logs, either.) If gunzip check/temp gunzip is moved
-out of check_logfile--like process accounting, make it a log type--then
-file handle could be passed in, and the open placed in the parent process
-and the check_logfile done in a child process.
 
 FEATURES:
 
@@ -92,6 +76,24 @@ by command line option to enable but not to disable).
   New requirements when priv sep is used:
   IO::FDPass (Linux: libio-fdpass-perl),
   Privileges::Drop (Linux: libprivileges-drop-perl)
+
+(DONE 1.26) Set up a separate user, use privilege separation and pledge (pledge and
+unveil DONE, not privsep and separate user). Fork child and drop privs
+for each check_logfile call? Or pull out the root functionality
+into a small component that opens the log file handles and passes
+them to the child processes using IO::FDPass (in CPAN but not standard)?
+Former seems simpler and could allow a bit of parallelization; there's
+no central coordination required since each log generates a separate
+action. (Child would need to return new sizes etc. so parent can write
+it to the size file at the end of the loop. Could have a new option to
+read and write size file that is for the child process to write it out
+and the parent to read it in, no lock required.  Open it for writing
+before dropping privs, in the temp dir.  Would need to drop privs in
+check_logfile, but this won't work for cyclog/multilog, not sure about
+where there are rotated logs, either.) If gunzip check/temp gunzip is moved
+out of check_logfile--like process accounting, make it a log type--then
+file handle could be passed in, and the open placed in the parent process
+and the check_logfile done in a child process.
 
 * (DONE 1.25b) Added more commands to macOS process accounting sample.
 
@@ -170,7 +172,7 @@ sigtree.
   table. Table contents should also be able to be regexps. (Would this
   be any more efficient? If not, no value.)
 
-* The cyclog/multilog logic for looking at prior log files should
+* (DONE)  The cyclog/multilog logic for looking at prior log files should
   also be implemented for standard logfiles that have been rotated.
 * Add action to re-log specific indicators from a log entry into
   an indicator log in something like Fortinet's log format, which
@@ -186,7 +188,7 @@ sigtree.
     time, number of times seen.  Generate alerts for novelty,
     i.e., newly appearing, newly appearing after an absence, and
     appearing in multiple places/contexts for the first time (pf).
-* Set up a _reportnew user?  Drop privs more generally?
+* (DONE) Set up a _reportnew user?  Drop privs more generally?
 
 * Process accounting time granularity is only to the nearest minute(?),
 and so any new commands which immediately followed the last seen, within

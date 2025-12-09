@@ -189,7 +189,6 @@
 #
 #
 # To Do:
-#    - validate email addresses that can be passed to &send_notify.
 #    - Find way to not miss additional process execution within the same
 #      minute of the last check?
 #    - Add time range checking option for match and exclude (new directive?)
@@ -267,7 +266,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.26c of 2 December 2025';
+my $VERSION = 'reportnew 1.26d of 9 December 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -414,8 +413,6 @@ if ($^O eq 'openbsd') {
     # @PRIVSEP_INITIAL_CHILD_PROMISES: id, prot_exec - for dropping privs
     # @PRIVSEP_CHILD_PROMISES: recvfd - for receiving file descriptors
     # @PRIVSEP_PARENT_PROMISES: sendfd - for sending file descriptors
-    # @PRIVSEP_PROMISES: unix (apparently not needed)
-    #     unix for socket communication
     pledge (@INITIAL_PROMISES, @NONPRIVSEP_PROMISES,
 	    @PRIVSEP_PARENT_PROMISES,
 	    @PRIVSEP_INITIAL_CHILD_PROMISES,
@@ -577,6 +574,7 @@ if ($privsep_flag) {
     # Child.
     close $parent_sock;
     # This call will die if it fails.
+    print "DEBUG: Privileges::Drop will always fail on macOS with perl 5.34.1 unless patched.\n" if ($debug_mode && $^O eq 'darwin' && $^V eq 'v5.34.1');
     Privileges::Drop::drop_uidgid ($reporter_uid, $reporter_gid);
     print "DEBUG: real uid: $<, eff uid: $>, real gid: $(, eff gid: $)\n" if ($debug_mode);
 
