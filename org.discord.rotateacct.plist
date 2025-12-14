@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.discord.rotateacct.plist</string>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>StartCalendarInterval</key>
+	<dict>
+	  <key>Hour</key>
+	  <integer>0</integer>
+	  <key>Minute</key>
+	  <integer>0</integer>
+	</dict>
+	
+	<key>UserName</key>
+	<string>root</string>
+
+	<key>RunAtLoad</key>
+	<false/>
+
+	<key>Program</key>
+	<string>/usr/local/bin/rotateacct.sh</string>
+	<key>ProgramArguments</key>
+	<array>
+	  <string>/usr/local/bin/rotateacct.sh</string>
+	</array>
+
+	<key>StandardOutPath</key>
+	<string>/var/log/rotateacct.stdout</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/rotateacct.stderr</string>
+</dict>
+</plist>
