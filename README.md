@@ -22,6 +22,8 @@ the config file, or alternatively add a -p option in the arguments list in the P
 the only intent is to use it for process accounting log monitoring. (Use "launchctl load -w /Library/LaunchDaemons/org.discord.reportnew.plist" and it
 will run every 30 minutes.)
 
+Another sample macOS PLIST for /Library/LaunchDaemons is supplied for rotating process accounting logs using the rotateacct.sh shell script.
+
 Multiple hosts can be supported with a single config file using either
    hosts: <hostname-list>
 to identify sections applicable to a set of space-separated hosts, or alternatively,
