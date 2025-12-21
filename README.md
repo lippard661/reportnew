@@ -24,6 +24,8 @@ will run every 30 minutes.)
 
 Another sample macOS PLIST for /Library/LaunchDaemons (org.discord.rotateacct.plist) is supplied for rotating process accounting logs using the rotateacct.sh shell script.
 
+Also included is a perl implementation of lastcomm.pl that works on OpenBSD, Linux, and macOS, but displays output chronologically (the order in the process accounting files) instead of in reverse chronological order.
+
 Multiple hosts can be supported with a single config file using either
    hosts: <hostname-list>
 to identify sections applicable to a set of space-separated hosts, or alternatively,
