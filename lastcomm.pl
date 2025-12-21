@@ -19,14 +19,14 @@ use File::Find;
 use Fcntl ':mode';
 use File::Basename;
 use Getopt::Std;
-use POSIX qw( ctime fmod );
+use POSIX qw( ctime fmod sysconf _SC_CLK_TCK );
 use if $^O eq 'openbsd', 'OpenBSD::Pledge';
 use if $^O eq 'openbsd', 'OpenBSD::Unveil';
 
 my $DEFAULT_LOG = '/var/account/acct'; # BSD
 $DEFAULT_LOG = '/var/log/account/pacct' if ($^O eq 'linux');
 
-my $AHZ = 64;
+my $AHZ = &accounting_hz;
 # from utmp.h UT_
 my $UT_NAMESIZE = 32;
 my $LINUX_UT_NAMESIZE = 8;
@@ -140,12 +140,22 @@ while ($acctline = <ACCTLOG>) {
 
 ### Subroutines
 
+# Subroutine to return accounting clock tick rate.
+sub accounting_hz {
+    if ($^O eq 'linux') {
+	return sysconf (_SC_CLK_TCK);
+    }
+    else {
+	return 64; # BSD/macOS accounting clock tick rate.
+    }
+}
+
 # Subroutine to expand int16 time values.
 sub expand {
     my ($time) = @_;
     my $newtime;
 
-    $newtime = $time & 017777;
+    $newtime = $time & 017777; # 0x1fff hex, 017777 octal
     $time >>= 13;
     while ($time) {
         $time--;
@@ -265,6 +275,7 @@ sub flagbits {
     for my $bitmap_ent (@flagbitmap) {
 	my ($idx, $ch) = @$bitmap_ent;
 	$output .= $ch if (substr ($flag, $idx, 1) eq '1');
+	$output .= ' ' if ($linux_format && substr ($flag, $idx, 1) eq '0');
     }
 
     return $output;
