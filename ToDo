@@ -62,6 +62,18 @@ the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
 
+* (Done 1.27) Add direct process accounting for Linux and macOS; using
+lastcomm is still default for any OS other than OpenBSD, Linux, or
+macOS and available by changing $USE_LASTCOMM = 1. (Direct use of
+process accounting files could fail if formats change in future OS
+releases; it will fail on Linux distros that use process accounting
+record formats after acct_v3, but it works on Proxmox/Debian which
+is my main use case.) Could make it a config file option if needed.
+Direct processing is done non-privileged; on Linux that's with a
+privileged open file descriptor passed for the first file, and
+a temp file copy of the gunzipped files for the later files (privileged
+process does the gunzipping).
+
 * (DONE 1.26b) Add support for gzipped process accounting files for all
 platforms (needed for Linux).
 

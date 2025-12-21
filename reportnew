@@ -183,9 +183,13 @@
 #    accounting sample configs.
 # Modified 1 December 2025 by Jim Lippard to support Linux process
 #    accounting's gzipped rotated logs (and better support other OSs).
-# Modified 2 December 2025 by Jim Lippard to add some minor security improvements:
-#    die if child dropping privs fails, limit priv request length, explicitly block
-#    directory traversal attempts, etc.
+# Modified 2 December 2025 by Jim Lippard to add some minor security
+#    improvements:
+#    die if child dropping privs fails, limit priv request length,
+#    explicitly block directory traversal attempts, etc.
+# Modified 20-21 December 2025 by Jim Lippard to build device name cache
+#    for OpenBSD and macOS and make direct process accounting file parsing
+#    work on Linux and macOS. Linux was easy, macOS less so.
 #
 #
 # To Do:
@@ -216,10 +220,11 @@ use Digest::SHA qw( sha256_hex );
 use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Copy;
-use if $^O ne "openbsd", "File::Temp", qw( :mktemp tempfile );
+use File::Find;
+use if $^O ne 'openbsd', 'File::Temp', qw( :mktemp tempfile );
 use Getopt::Std;
 use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
-use POSIX qw( strftime );
+use POSIX qw( ctime fmod strftime sysconf _SC_CLK_TCK );
 use Signify;
 use Sys::Hostname;
 use Time::HiRes qw( gettimeofday );
@@ -234,12 +239,11 @@ use IO::Socket::UNIX; # required for socketpair call
 #my $TimeTAI64_module = 1;
 my $TimeTAI64_module = 0;
 
-use if $^O eq "openbsd", "OpenBSD::MkTemp", qw( mkdtemp mkstemp );
-use if $^O eq "openbsd", "OpenBSD::Unveil";
-use if $^O eq "openbsd", "OpenBSD::Pledge";
+use if $^O eq 'openbsd', 'OpenBSD::MkTemp', qw( mkdtemp mkstemp );
+use if $^O eq 'openbsd', 'OpenBSD::Unveil';
+use if $^O eq 'openbsd', 'OpenBSD::Pledge';
 
-use POSIX qw( ctime fmod );
-use constant AHZ => 64;
+my $AHZ = &accounting_hz;
 use constant SECSPERHOUR => 60 * 60;
 use constant SECSPERMIN => 60;
 
@@ -266,7 +270,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.26d of 9 December 2025';
+my $VERSION = 'reportnew 1.27 of 21 December 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -283,6 +287,11 @@ my $PROCESS_ACCOUNTING_LOG = '/var/account/acct'; # BSD and macOS location.
 $PROCESS_ACCOUNTING_LOG = '/var/log/account/pacct' if ($^O eq 'linux');
 my $MAX_PROCESS_ACCOUNTING_FILE = 3;
 $MAX_PROCESS_ACCOUNTING_FILE = 9 if ($^O eq 'linux'); # not really a max
+
+# set to 1 if you need to use lastcomm instead of processing accounting
+# files directly.
+my $USE_LASTCOMM = 0;
+$USE_LASTCOMM = 1 if ($^O ne 'openbsd' && $^O ne 'linux' && $^O ne 'macos');
 
 my $NL = '
 ';
@@ -356,6 +365,7 @@ use vars qw(
     %opts
     %defined_hosts
     %defined_hostlog
+    %devname_cache
     );
 
 # Local variables in main program.
@@ -403,6 +413,7 @@ BEGIN {
 
 # If on OpenBSD, use pledge and unveil. Do as much as possible before
 # parsing the config, then finish unveiling after the config is parsed.
+# We also build %devname_cache for OpenBSD before unveiling.
 if ($^O eq 'openbsd') {
     # Pledge. stdio is already included.
     # @INITIAL_PROMISES: unveil
@@ -417,6 +428,9 @@ if ($^O eq 'openbsd') {
 	    @PRIVSEP_PARENT_PROMISES,
 	    @PRIVSEP_INITIAL_CHILD_PROMISES,
 	    @PRIVSEP_CHILD_PROMISES) || die "Cannot pledge promises. $!\n";
+
+    # Build %devname_cache on OpenBSD.
+    &build_devname_cache if ($^O eq 'openbsd');
     
     # Needed to parse dates on process accounting logs.
     unveil ($ZONEINFO_DIR, 'r');
@@ -448,6 +462,9 @@ if ($config_check) {
     print "No issues identified in config file.\n";
     exit;
 }
+
+# Build %devname_cache on macOS.
+&build_devname_cache if ($^O eq 'darwin');
 
 # Determine if we're going to use privilege separation.
 # Conditions: If running as root and _reportnew user and group exist.
@@ -601,16 +618,17 @@ foreach $logfile (@logfiles) {
 	# For process accounting logs, we get the log checktime from this
 	# read and not at the end of processing the log.
 	
-	# On OpenBSD, we still create a temp logfile from process
-	# accounting logs, but do so directly instead of by calling
-	# lastcomm, and we find the starting point more efficiently.
-	if ($^O eq 'openbsd') {
-	    ($temp_logfile, $log_checktime{$logfile}) = &openbsd_read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
+	# Still create a temp logfile from process accounting logs,
+	# but process them directly instead of by calling lastcomm.
+	# Formerly OpenBSD only, now also works for Linux and macOS.
+	if (!$USE_LASTCOMM) {
+	    ($temp_logfile, $log_checktime{$logfile}) = &direct_read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
 	}
 	# Otherwise:
 	# Read process accounting logs out to the last time seen, or
 	# for all of it, and write it out to a tmp file, $temp_logfile,
 	# putting it into chronological order instead of reverse.
+	# Runs on the privileged side with privsep on Linux.
 	else {
 	    ($temp_logfile, $log_checktime{$logfile}) = &read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
 	}
@@ -1492,6 +1510,38 @@ sub my_host {
     return 0;
 }
 
+# Subroutine to return accounting clock tick rate.
+sub accounting_hz {
+    if ($^O eq 'linux') {
+        return sysconf (_SC_CLK_TCK);
+    }
+    else {
+        return 64; # BSD/macOS accounting clock tick rate.                                                                                              
+    }
+}
+
+# Build %devname_cache on OpenBSD and macOS. This is done before
+# unveiling for convenience (File::Find uses cd in a way that
+# would require unveiling both /dev and the directory from which
+# reportnew is being run). It doesn't require any privileges other
+# than what is in the initial promises--but on macOS, root will
+# build a more complete cache; it will return the same results
+# as lastcomm (which on macOS has different tty output when run
+# as a nonprivileged user vs. root--more ?? results).
+sub build_devname_cache {
+    my $DEVDIR = '/dev';
+
+    find (sub {
+        return unless -c $_; # only character devices
+        my $fullpath = $File::Find::name;
+        my @st = lstat ($fullpath);
+        my $rdev = $st[6]; # st_rdev
+	$devname_cache{$rdev} ||= basename ($fullpath);
+          }, $DEVDIR);
+
+    $devname_cache{-1} = '__';
+}
+
 ## Subroutines for privilege separation.
 
 # Subroutine for privileged process to listen for and process requests.
@@ -2117,8 +2167,11 @@ sub identify_rotated_logs {
 }
 
 # Subroutine to read process accounting log files directly.
-# Does not require root privileges.    
-sub openbsd_read_process_acct_log {
+# Does not require root privileges on OpenBSD. Supports OpenBSD, Linux, and macOS.
+# Linux support works with privsep, so the priv process doesn't need to run
+# lastcomm. On Linux will call to priv process to open the first file, and
+# to make readable copies of the gzipped rotated ones.
+sub direct_read_process_acct_log {
     my ($acct_log, $checktime, $temp_dir) = @_;
     my ($found_first_record,
 	$acct_file, $acct_file_size, $acct_file_mtime,
@@ -2127,116 +2180,15 @@ sub openbsd_read_process_acct_log {
 	$mem, $tty, $pid, $flags);
     my ($date_time, $user, $cpu, $time, $delta, $duration);
     my ($new_checktime);
-    my ($temp_fh);
+    my ($temp_fh, $acct_fh);
     my ($rotated_logs_flag, @rotated_acct_logs, $acct_temp_logfile);
-    my %DEV_NAME = (
-	"-1", "__",
-	"256","tty",
-	"2048","tty00",
-	"2049","tty01",
-	"2050","tty02",
-	"2051","tty03",
-	"2052","tty04",
-	"2053","tty05",
-	"2054","tty06",
-	"2055","tty07",
-	"2056","tty08",
-	"2057","tty09",
-	"2058","tty0a",
-	"2059","tty0b",
-	"3072","ttyC0",
-	"3073","ttyC1",
-	"3074","ttyC2",
-	"3075","ttyC3",
-	"3076","ttyC4",
-	"3077","ttyC5",
-	"3078","ttyC6",
-	"3079","ttyC7",
-	"3080","ttyC8",
-	"3081","ttyC9",
-	"3082","ttyCa",
-	"3083","ttyCb",
-	"3327","ttyCcfg",
-	"16896","ttyU0",
-	"16897","ttyU1",
-	"16898","ttyU2",
-	"16899","ttyU3",
-	"24064","ttyVI00",
-	"24074","ttyVI10",
-	"24084","ttyVI20",
-	"24094","ttyVI30",
-	"24104","ttyVI40",
-	"9728","ttyc0",
-	"9729","ttyc1",
-	"9730","ttyc2",
-	"9731","ttyc3",
-	"9732","ttyc4",
-	"9733","ttyc5",
-	"9734","ttyc6",
-	"9735","ttyc7",
-	"1280","ttyp0",
-	"1281","ttyp1",
-	"1282","ttyp2",
-	"1283","ttyp3",
-	"1284","ttyp4",
-	"1285","ttyp5",
-	"1286","ttyp6",
-	"1287","ttyp7",
-	"1288","ttyp8",
-	"1289","ttyp9",
-	"1316","ttypA",
-	"1317","ttypB",
-	"1318","ttypC",
-	"1319","ttypD",
-	"1320","ttypE",
-	"1321","ttypF",
-	"1322","ttypG",
-	"1323","ttypH",
-	"1324","ttypI",
-	"1325","ttypJ",
-	"1326","ttypK",
-	"1327","ttypL",
-	"1328","ttypM",
-	"1329","ttypN",
-	"1330","ttypO",
-	"1331","ttypP",
-	"1332","ttypQ",
-	"1333","ttypR",
-	"1334","ttypS",
-	"1335","ttypT",
-	"1336","ttypU",
-	"1337","ttypV",
-	"1338","ttypW",
-	"1339","ttypX",
-	"1340","ttypY",
-	"1341","ttypZ",
-	"1290","ttypa",
-	"1291","ttypb",
-	"1292","ttypc",
-	"1293","ttypd",
-	"1294","ttype",
-	"1295","ttypf",
-	"1296","ttypg",
-	"1297","ttyph",
-	"1298","ttypi",
-	"1299","ttypj",
-	"1300","ttypk",
-	"1301","ttypl",
-	"1302","ttypm",
-	"1303","ttypn",
-	"1304","ttypo",
-	"1305","ttypp",
-	"1306","ttypq",
-	"1307","ttypr",
-	"1308","ttyps",
-	"1309","ttypt",
-	"1310","ttypu",
-	"1311","ttypv",
-	"1312","ttypw",
-	"1313","ttypx",
-	"1314","ttypy",
-	"1315","ttypz"
-	);
+
+    my $OPENBSD_RECORD_FORMAT = "A24 S< S< S< S< q< L< L< L< l< L< b32";
+    my $LINUX_RECORD_FORMAT = "b8 C S< L< L< L< L< L< L< f< S< S< S< S< S< S< S< S< Z16";
+    my $MACOS_RECORD_FORMAT = "Z10 S< S< S< l< L< L< S< S< l< b8";
+
+    my $RECORD_SIZE = 64; # 64-byte records on OpenBSD and Linux.
+    $RECORD_SIZE = 40 if ($^O eq 'darwin'); # 40-byte records on macOS.
 
     # Returns @rotated_acct_logs with changes since $checktime, sorted
     # oldest to newest, which is what we want.
@@ -2268,22 +2220,38 @@ sub openbsd_read_process_acct_log {
 	# Open file and look for first record if we need it. Once
 	# we have a first record, open temp file and start writing out
 	# to it.
-	if (open (ACCTLOG, '<', $acct_file)) {
-	    $/ = \64; # read 64-byte records
+	# Need to convert this to the open wrapper to make this work for Linux.
+	if ($acct_fh = &nonpriv_open_fh ($acct_file)) {
+	    $/ = \$RECORD_SIZE;
 	    # Starting with the oldest file with an mtime > checktime.
 	    # Skip past any records with time < checktime.
 	    if (!$found_first_record) {
-		seek (ACCTLOG, $old_size - 64, 0);
+		seek ($acct_fh, $old_size - $RECORD_SIZE, 0);
 		# would like to test if this record is older than
 		# checktime, if not, should do binary search or start
 		# at beginning (watching for out-of-sequence records by
 		# accounting for duration).
 	    }
 
-	    while (<ACCTLOG>) {
-		($command, $utime, $stime, $etime, $io, $btime, $uid, $gid, $mem, $tty, $pid, $flags) = unpack ("A24 S< S< S< S< Q< L< L< L< l< L< b32", $_);
+	    while (<$acct_fh>) {
+		if ($^O eq 'openbsd') {
+		    ($command, $utime, $stime, $etime,
+		     $io, $btime, $uid, $gid, $mem, $tty,
+		     $pid, $flags) = unpack ($OPENBSD_RECORD_FORMAT, $_);
+		}
+		elsif ($^O eq 'linux') {
+		    my ($version, $exitcode, $ppid, $rw, $minflt, $majflt, $swaps); # unused
+		    ($flags, $version, $tty, $exitcode, $uid, $gid, $pid,
+		     $ppid, $btime, $etime, $utime, $stime, $mem, $io,
+		     $rw, $minflt, $majflt, $swaps, $command) = unpack ($LINUX_RECORD_FORMAT, $_);
+		}
+		elsif ($^O eq 'darwin') {
+		    ($command, $utime, $stime, $etime, $btime,
+		     $uid, $gid, $mem, $io, $tty, $flags) = unpack ($MACOS_RECORD_FORMAT, $_);
+		    $pid = 0;
+		}
 		if (!$processing_records &&
-		    ($btime > $checktime || $btime + (&expand ($etime) / AHZ) > $checktime)) {
+		    ($btime > $checktime || $btime + (&expand ($etime) / $AHZ) > $checktime)) {
 		    $found_first_record = 1;
 		    $processing_records = 1;
 
@@ -2309,22 +2277,28 @@ sub openbsd_read_process_acct_log {
 		    # Remove year.
 		    $date_time = substr ($date_time, 0, length ($date_time) - 6);
 		    # Go from raw device number to name.
-		    if (defined ($DEV_NAME{$tty})) {
-			$tty = $DEV_NAME{$tty};
+		    if (defined ($devname_cache{$tty})) {
+			$tty = $devname_cache{$tty};
+		    }
+		    elsif ($^O eq 'linux') {
+			$tty = &linux_device ($tty);
 		    }
 		    else {
 			$tty = '??';
 		    }
 		    # Convert uid to user (or use uid if no user in passwd file).
 		    $user = getpwuid($uid) || $uid;
-		    # Command + pid.
-		    $command = "$command\[$pid\]";
+		    # Command + pid. No pid on macOS.
+		    # This introduces a difference from lastcomm on Linux that must
+		    # be accounted for in match/exclude rules (commands aren't followed
+		    # by spaces). Duration is also now available without fakery.
+		    $command = "$command\[$pid\]" unless ($^O eq 'darwin');
 		    # Process flags.
 		    $flags = &flagbits ($flags);
 		    # User time plus system time.
-		    $cpu = (&expand ($utime) + &expand ($stime)) / AHZ;
+		    $cpu = (&expand ($utime) + &expand ($stime)) / $AHZ;
 		    $cpu = sprintf "%.2f", $cpu; # was %6.2f for formatted cols
-		    $delta = &expand ($etime) / AHZ;
+		    $delta = &expand ($etime) / $AHZ;
 		    $duration = sprintf "%1.0f:%02.0f:%05.2f", $delta / SECSPERHOUR,
 			fmod ($delta, SECSPERHOUR) / SECSPERMIN,
 			fmod ($delta, SECSPERMIN);
@@ -2338,7 +2312,7 @@ sub openbsd_read_process_acct_log {
 	}
 	# set checktime at the end
 	$new_checktime = gettimeofday();
-	close (ACCTLOG);
+	close ($acct_fh);
 	$/ = $NL;
     }
 
@@ -2383,16 +2357,60 @@ sub expand {
 sub flagbits {
     my ($flag) = @_;
     my ($output, $idx);
-    my $flagcodes = 'F-MDXPTU-SB';
+    my @flagbitmap = (
+	[ 0, 'F' ], # fork'd but not exec'd
+	[ 2, 'M' ], # killed by syscall or stack mapping violation
+	[ 3, 'D' ], # dumped core
+	[ 4, 'X' ], # killed by a signal
+	[ 5, 'P' ], # killed due to pledge violation
+	[ 6, 'T' ], # memory access violation
+	[ 7, 'U' ], # unveil access violation
+	[ 9, 'S' ], # killed by syscall pin violation
+	[ 10, 'B' ] # BT CFI violation
+	);
+    @flagbitmap = (
+	[ 0, 'F' ], # fork'd but not exec'd
+	[ 1, 'S' ], # process executed with superuser privs
+	[ 3, 'C' ], # dumped core
+	[ 4, 'X' ]  # killed by a signal
+	) if ($^O eq 'linux' || $^O eq 'darwin');
 
-    $output = '-';
-    for ($idx = 0; $idx <= 32; $idx++) {
-	if (substr ($flag, $idx, 1) eq '1') {
-	    $output .= substr ($flagcodes, $idx, 1);
-	}
+    $output = '-'; # this is OpenBSD-style, Linux style would omit dash if any other flags are present
+    for my $bitmap_ent (@flagbitmap) {
+	my ($idx, $ch) = @$bitmap_ent;
+	$output .= $ch if (substr ($flag, $idx, 1) eq '1');
     }
 
     return ($output);
+}
+
+# Subroutine to return device names for Linux (and cache them).
+sub linux_device {
+    my ($dev) = @_;
+    my ($devname, $major, $minor);
+
+    $major = ($dev >> 8) & 0xff;
+    $minor = $dev & 0xff;
+
+    if ($major == 4) {
+	$devname = "tty$minor"; # virtual console
+    }
+    elsif ($major >= 136 && $minor <= 143) {
+	my $pts = ($major - 136) * 256 + $minor;
+	$devname = "pts/$pts"; # UNIX98 pts
+    }
+    elsif ($major == 5 && $minor == 1) {
+	$devname = 'console'; # system console
+    }
+    elsif ($dev == 0) {
+	$devname = '__';
+    }
+    else {
+	$devname = "tty($major, $minor)"; # fallback
+    }
+
+    $devname_cache{$dev} = $devname; # cache it
+    return $devname;
 }
 
 # Subroutine to read process accounting log files using lastcomm.
