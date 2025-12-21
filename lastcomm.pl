@@ -154,7 +154,14 @@ sub expand {
     return ($newtime);
 }
 
-# Build devname cache (OpenBSD, macOS).
+# Build %devname_cache on OpenBSD and macOS. This is done before
+# unveiling for convenience (File::Find uses cd in a way that
+# would require unveiling both /dev and the directory from which
+# reportnew is being run). It doesn't require any privileges other
+# than what is in the initial promises--but on macOS, root will
+# build a more complete cache; it will return the same results
+# as lastcomm (which on macOS has different tty output when run
+# as a nonprivileged user vs. root--more ?? results).
 sub build_devname_cache {
     my $DEVDIR = '/dev';
     
