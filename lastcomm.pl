@@ -337,13 +337,41 @@ sub flagbits_hex {
 # L<: int32 pid (process ID)
 # b32: 32-bit bit string of process flags
 
-# macOS
+# Linux: "b8 C S< L< L< L< L< L< L< f< S< S< S< S< S< S< S< S< Z16"
+# 64-byte records
+# struct acct_v3
+# b8     char        ac_flag;        /* Flags */
+# C      char        ac_version;     /* Always set to ACCT_VERSION */
+# S<     __u16       ac_tty;         /* Control Terminal */
+# L<     __u32       ac_exitcode;        /* Exitcode */
+# L<     __u32       ac_uid;         /* Real User ID */
+# L<     __u32       ac_gid;         /* Real Group ID */
+# L<     __u32       ac_pid;         /* Process ID */
+# L<     __u32       ac_ppid;        /* Parent Process ID */
+# L<     __u32       ac_btime;       /* Process Creation Time */
+#   #ifdef __KERNEL__
+#        __u32       ac_etime;       /* Elapsed Time */
+#   #else
+# f<     float       ac_etime;       /* Elapsed Time */
+#   #endif
+# S<     comp_t      ac_utime;       /* User Time */
+# S<     comp_t      ac_stime;       /* System Time */
+# S<     comp_t      ac_mem;         /* Average Memory Usage */
+# S<     comp_t      ac_io;          /* Chars Transferred */
+# S<     comp_t      ac_rw;          /* Blocks Read or Written */
+# S<     comp_t      ac_minflt;      /* Minor Pagefaults */
+# S<     comp_t      ac_majflt;      /* Major Pagefaults */
+# S<     comp_t      ac_swaps;       /* Number of Swaps */
+# Z16    char        ac_comm[ACCT_COMM]; /* Command Name */
+
+# macOS (40-byte records)
+# "Z10 S< S< S< l< L< L< S< S< l< b8"
 #typedef u_short comp_t; /* 3 bits base 8 exponent, 13 bit fraction */
 # Z10    char    ac_comm[10];    /* name of command (truncated to 9 chars + NULL) */
 # S<    comp_t  ac_utime;     /* user time (units of 1/AHZ seconds) */
 # S<    comp_t  ac_stime;     /* system time (units of 1/AHZ seconds) */
 # S<    comp_t  ac_etime;     /* elapsed time (units of 1/AHZ seconds) */
-# 32 bits l<    time_t  ac_btime;     /* starting time (seconds since epoch) */
+# signed 32 bits l<    time_t  ac_btime;     /* starting time (seconds since epoch) */
 # L<    uid_t   ac_uid;       /* user id */
 # L<    gid_t   ac_gid;       /* group id */
 # S<    short   ac_mem;       /* memory usage average (not well-supported) */
