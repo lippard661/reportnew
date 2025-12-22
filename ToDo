@@ -64,6 +64,9 @@ the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
 
+* (Done 1.27b) Read up to 64-record blocks at a time from process
+accounting logs for greater efficiency.
+
 * (Done 1.27) Add direct process accounting for Linux and macOS; using
 lastcomm is still default for any OS other than OpenBSD, Linux, or
 macOS and available by changing $USE_LASTCOMM = 1. (Direct use of

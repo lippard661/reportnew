@@ -192,6 +192,8 @@
 #    work on Linux and macOS. Linux was easy, macOS less so.
 # Modified 21 December 2025 by Jim Lippard to fix bugs in Linux handling of
 #    checktime in process accounting.
+# Modified 22 December 2025 by Jim Lippard to read larger block of records
+#    in process accounting (all platforms) to improve efficiency.
 #
 #
 # To Do:
@@ -272,7 +274,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.27a of 21 December 2025';
+my $VERSION = 'reportnew 1.27b of 22 December 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -2196,6 +2198,8 @@ sub direct_read_process_acct_log {
     my $RECORD_SIZE = 64; # 64-byte records on OpenBSD and Linux.
     $RECORD_SIZE = 40 if ($^O eq 'darwin'); # 40-byte records on macOS.
 
+    my $BLOCK_SIZE = $RECORD_SIZE * 64; # read up to 64 records at a time
+
     # Returns @rotated_acct_logs with changes since $checktime, sorted
     # oldest to newest, which is what we want.
     ($rotated_logs_flag, @rotated_acct_logs) = &identify_rotated_logs ($acct_log, $checktime);
@@ -2240,88 +2244,107 @@ sub direct_read_process_acct_log {
 	    # Starting with the oldest file with an mtime > checktime.
 	    # Skip past any records with time < checktime.
 	    if (!$found_first_record) {
-		seek ($acct_fh, $old_size - $RECORD_SIZE, 0) if ($^O ne 'linux' && $old_size % $RECORD_SIZE == 0); # don't bother trying to skip ahead for Linux or if $old_size isn't a multiple of record size.
+		seek ($acct_fh, $old_size - $RECORD_SIZE, 0) if (defined ($old_size) && $old_size > 0 && $old_size % $RECORD_SIZE == 0); # don't bother trying to skip ahead if $old_size isn't a multiple of record size.
 	    }
+
+	    my $position = tell ($acct_fh);
 
 	    while (1) {
-		last if ($is_live_file && tell ($acct_fh) + $RECORD_SIZE > $new_size); # end if we've processed everything
-		my $n_bytes = sysread ($acct_fh, my $record, $RECORD_SIZE);
-		last unless defined ($n_bytes) && $n_bytes == $RECORD_SIZE;
-		
-		if ($^O eq 'openbsd') {
-		    ($command, $utime, $stime, $etime,
-		     $io, $btime, $uid, $gid, $mem, $tty,
-		     $pid, $flags) = unpack ($OPENBSD_RECORD_FORMAT, $record);
-		}
-		elsif ($^O eq 'linux') {
-		    my ($version, $exitcode, $ppid, $rw, $minflt, $majflt, $swaps); # unused
-		    ($flags, $version, $tty, $exitcode, $uid, $gid, $pid,
-		     $ppid, $btime, $etime, $utime, $stime, $mem, $io,
-		     $rw, $minflt, $majflt, $swaps, $command) = unpack ($LINUX_RECORD_FORMAT, $record);
-		}
-		elsif ($^O eq 'darwin') {
-		    ($command, $utime, $stime, $etime, $btime,
-		     $uid, $gid, $mem, $io, $tty, $flags) = unpack ($MACOS_RECORD_FORMAT, $record);
-		    $pid = 0;
-		}
-		if (!$processing_records &&
-		    ($^O eq 'linux' ? ($btime > $checktime) :
-		     ($btime > $checktime ||
-		      $btime + (&expand ($etime) / $AHZ) > $checktime))) {
-		    $found_first_record = 1;
-		    $processing_records = 1;
+		last if ($is_live_file && $position >= $new_size); # end if we've processed everything we had at start
 
-		    # Create temp file (OpenBSD only).
-		    if ($^O eq 'openbsd') {
-			($temp_fh, $temp_logfile) = mkstemp ("$temp_dir/reportnew.XXXXXXX");
-			if (!defined ($temp_logfile)) {
-			    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
-			    exit; # or just return?
-			}
-		    }
-		    else { # this shouldn't be reached
-			# create and open
-			($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
-			if (!defined ($temp_logfile)) {
-			    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
-			    exit; # or just return?
-			}
-		    }
+		# How much to read?
+		my $want = $BLOCK_SIZE;
+		if ($is_live_file && $position + $want > $new_size) { # limit to size at start
+		    $want = $new_size - $position;
+		    # Always stay record-aligned for the live file.
+		    $want -= $want % $RECORD_SIZE; # end at record boundary
+		    last if $want <= 0;
 		}
-		if ($processing_records) {
-		    $date_time = ctime ($btime);
-		    # Remove year.
-		    $date_time = substr ($date_time, 0, length ($date_time) - 6);
-		    # Go from raw device number to name.
-		    if (defined ($devname_cache{$tty})) {
-			$tty = $devname_cache{$tty};
+		
+		my $n_bytes = sysread ($acct_fh, my $block, $want);
+		last unless defined ($n_bytes) && $n_bytes > 0;
+		# Could do this at the end inside the while (1) loop
+		$position += $n_bytes;
+
+		# Process read records in block.
+		for (my $offset = 0; $offset + $RECORD_SIZE <= $n_bytes; $offset += $RECORD_SIZE) {
+		    my $record = substr ($block, $offset, $RECORD_SIZE);
+		
+		    if ($^O eq 'openbsd') {
+			($command, $utime, $stime, $etime,
+			 $io, $btime, $uid, $gid, $mem, $tty,
+			 $pid, $flags) = unpack ($OPENBSD_RECORD_FORMAT, $record);
 		    }
 		    elsif ($^O eq 'linux') {
-			$tty = &linux_device ($tty);
+			my ($version, $exitcode, $ppid, $rw, $minflt, $majflt, $swaps); # unused
+			($flags, $version, $tty, $exitcode, $uid, $gid, $pid,
+			 $ppid, $btime, $etime, $utime, $stime, $mem, $io,
+			 $rw, $minflt, $majflt, $swaps, $command) = unpack ($LINUX_RECORD_FORMAT, $record);
 		    }
-		    else {
-			$tty = '??';
+		    elsif ($^O eq 'darwin') {
+			($command, $utime, $stime, $etime, $btime,
+			 $uid, $gid, $mem, $io, $tty, $flags) = unpack ($MACOS_RECORD_FORMAT, $record);
+			$pid = 0;
 		    }
-		    # Convert uid to user (or use uid if no user in passwd file).
-		    $user = getpwuid($uid) || $uid;
-		    # Command + pid. No pid on macOS.
-		    # This introduces a difference from lastcomm on Linux that must
-		    # be accounted for in match/exclude rules (commands aren't followed
-		    # by spaces). Duration is also now available without fakery.
-		    $command = "$command\[$pid\]" unless ($^O eq 'darwin');
-		    # Process flags.
-		    $flags = &flagbits ($flags);
-		    # User time plus system time.
-		    $cpu = (&expand ($utime) + &expand ($stime)) / $AHZ;
-		    $cpu = sprintf "%.2f", $cpu; # was %6.2f for formatted cols
-		    $delta = &expand ($etime) / $AHZ;
-		    $duration = sprintf "%1.0f:%02.0f:%05.2f", $delta / SECSPERHOUR,
-			fmod ($delta, SECSPERHOUR) / SECSPERMIN,
-			fmod ($delta, SECSPERMIN);
-		    print $temp_fh "$date_time $tty $user $command $flags $cpu secs $duration\n";
-		}
-	    }
-	}
+		    if (!$processing_records &&
+			($^O eq 'linux' ? ($btime > $checktime) :
+			 ($btime > $checktime ||
+			  $btime + (&expand ($etime) / $AHZ) > $checktime))) {
+			$found_first_record = 1;
+			$processing_records = 1;
+
+			# Create temp file (OpenBSD only).
+			if ($^O eq 'openbsd') {
+			    ($temp_fh, $temp_logfile) = mkstemp ("$temp_dir/reportnew.XXXXXXX");
+			    if (!defined ($temp_logfile)) {
+				&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+				exit; # or just return?
+			    }
+			}
+			else { # Create temp file (Linux, macOS).
+			    # create and open
+			    ($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
+			    if (!defined ($temp_logfile)) {
+				&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+				exit; # or just return?
+			    }
+			}
+		    }
+		    if ($processing_records) {
+			$date_time = ctime ($btime);
+			# Remove year.
+			$date_time = substr ($date_time, 0, length ($date_time) - 6);
+			# Go from raw device number to name.
+			if (defined ($devname_cache{$tty})) {
+			    $tty = $devname_cache{$tty};
+			}
+			elsif ($^O eq 'linux') {
+			    $tty = &linux_device ($tty);
+			}
+			else {
+			    $tty = '??';
+			}
+			# Convert uid to user (or use uid if no user in passwd file).
+			$user = getpwuid($uid) || $uid;
+			# Command + pid. No pid on macOS.
+			# This introduces a difference from lastcomm on Linux that must
+			# be accounted for in match/exclude rules (commands aren't followed
+			# by spaces). Duration is also now available without fakery.
+			$command = "$command\[$pid\]" unless ($^O eq 'darwin');
+			# Process flags.
+			$flags = &flagbits ($flags);
+			# User time plus system time.
+			$cpu = (&expand ($utime) + &expand ($stime)) / $AHZ;
+			$cpu = sprintf "%.2f", $cpu; # was %6.2f for formatted cols
+			$delta = &expand ($etime) / $AHZ;
+			$duration = sprintf "%1.0f:%02.0f:%05.2f", $delta / SECSPERHOUR,
+			    fmod ($delta, SECSPERHOUR) / SECSPERMIN,
+			    fmod ($delta, SECSPERMIN);
+			print $temp_fh "$date_time $tty $user $command $flags $cpu secs $duration\n";
+		    }
+		} # for loop for records in block
+	    } # while (1)
+	} # open
 	else {
 	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
 	    exit;
