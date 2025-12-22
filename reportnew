@@ -2187,6 +2187,7 @@ sub direct_read_process_acct_log {
     my ($new_size, $new_mtime, $new_checktime);
     my ($temp_fh, $acct_fh);
     my ($rotated_logs_flag, @rotated_acct_logs, $acct_temp_logfile);
+    my ($is_live_file);
 
     my $OPENBSD_RECORD_FORMAT = "A24 S< S< S< S< q< L< L< L< l< L< b32";
     my $LINUX_RECORD_FORMAT = "b8 C S< L< L< L< L< L< L< f< S< S< S< S< S< S< S< S< Z16";
@@ -2208,6 +2209,10 @@ sub direct_read_process_acct_log {
     $old_size = 0;
     $old_size = $log_size{$acct_log} if ($checktime);
 
+    $found_first_record = 0;
+    $processing_records = 0;
+    $is_live_file = 0;
+
     # Start looking at accounting files, and allow for .gz rotated
     # logs. (Don't sort here because &identify_rotated_logs already
     # did it the way we want, oldest first.)
@@ -2219,8 +2224,13 @@ sub direct_read_process_acct_log {
 	    $acct_file = $acct_temp_logfile;
 	}
 
-	$found_first_record = 0;
-	$processing_records = 0;
+	# If we're on the main file, set new size/mtime/checktime and only read to
+	# that point.
+	if ($acct_file eq $acct_log) {
+	    $is_live_file = 1;
+	    ($new_size, $new_mtime) = &get_size ($acct_log);
+	    $new_checktime = gettimeofday();
+	}
 
 	# Open file and look for first record if we need it. Once
 	# we have a first record, open temp file and start writing out
@@ -2230,24 +2240,28 @@ sub direct_read_process_acct_log {
 	    # Starting with the oldest file with an mtime > checktime.
 	    # Skip past any records with time < checktime.
 	    if (!$found_first_record) {
-		seek ($acct_fh, $old_size - $RECORD_SIZE, 0) if ($^O ne 'linux'); # don't bother trying to skip ahead for Linux.
+		seek ($acct_fh, $old_size - $RECORD_SIZE, 0) if ($^O ne 'linux' && $old_size % $RECORD_SIZE == 0); # don't bother trying to skip ahead for Linux or if $old_size isn't a multiple of record size.
 	    }
 
-	    while (<$acct_fh>) {
+	    while (1) {
+		last if ($is_live_file && tell ($acct_fh) + $RECORD_SIZE > $new_size); # end if we've processed everything
+		my $n_bytes = sysread ($acct_fh, my $record, $RECORD_SIZE);
+		last unless defined ($n_bytes) && $n_bytes == $RECORD_SIZE;
+		
 		if ($^O eq 'openbsd') {
 		    ($command, $utime, $stime, $etime,
 		     $io, $btime, $uid, $gid, $mem, $tty,
-		     $pid, $flags) = unpack ($OPENBSD_RECORD_FORMAT, $_);
+		     $pid, $flags) = unpack ($OPENBSD_RECORD_FORMAT, $record);
 		}
 		elsif ($^O eq 'linux') {
 		    my ($version, $exitcode, $ppid, $rw, $minflt, $majflt, $swaps); # unused
 		    ($flags, $version, $tty, $exitcode, $uid, $gid, $pid,
 		     $ppid, $btime, $etime, $utime, $stime, $mem, $io,
-		     $rw, $minflt, $majflt, $swaps, $command) = unpack ($LINUX_RECORD_FORMAT, $_);
+		     $rw, $minflt, $majflt, $swaps, $command) = unpack ($LINUX_RECORD_FORMAT, $record);
 		}
 		elsif ($^O eq 'darwin') {
 		    ($command, $utime, $stime, $etime, $btime,
-		     $uid, $gid, $mem, $io, $tty, $flags) = unpack ($MACOS_RECORD_FORMAT, $_);
+		     $uid, $gid, $mem, $io, $tty, $flags) = unpack ($MACOS_RECORD_FORMAT, $record);
 		    $pid = 0;
 		}
 		if (!$processing_records &&
@@ -2325,10 +2339,6 @@ sub direct_read_process_acct_log {
     # Otherwise, close the temp file and return log path.
     close ($temp_fh);
 
-    # set new size and checktime
-    ($new_size, $new_mtime) = &get_size ($acct_log);
-    $new_checktime = gettimeofday();
-	
     return ($temp_logfile, $new_size, $new_mtime, $new_checktime);
 }
 
