@@ -190,6 +190,8 @@
 # Modified 20-21 December 2025 by Jim Lippard to build device name cache
 #    for OpenBSD and macOS and make direct process accounting file parsing
 #    work on Linux and macOS. Linux was easy, macOS less so.
+# Modified 21 December 2025 by Jim Lippard to fix bugs in Linux handling of
+#    checktime in process accounting.
 #
 #
 # To Do:
@@ -270,7 +272,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.27 of 21 December 2025';
+my $VERSION = 'reportnew 1.27a of 21 December 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -622,7 +624,7 @@ foreach $logfile (@logfiles) {
 	# but process them directly instead of by calling lastcomm.
 	# Formerly OpenBSD only, now also works for Linux and macOS.
 	if (!$USE_LASTCOMM) {
-	    ($temp_logfile, $log_checktime{$logfile}) = &direct_read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
+	    ($temp_logfile, $log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}) = &direct_read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
 	}
 	# Otherwise:
 	# Read process accounting logs out to the last time seen, or
@@ -634,8 +636,10 @@ foreach $logfile (@logfiles) {
 	}
 	# Then use check_logfile on the temp file, disregarding the size,
 	# which is set to 0, just as for files in cyclogs.
-	my $ignore_checktime;
-	($log_size{$logfile}, $log_mtime{$logfile}, $ignore_checktime, $log_sha256_digest{$logfile}) =
+	my $ignore_checktime; # using the checktime from the read, not the check
+	my $ignore_mtime; # using the mtime from the read, not the check.
+	my $ignore_size; # using the log size from the read, not the check
+	($ignore_size, $ignore_mtime, $ignore_checktime, $log_sha256_digest{$logfile}) =
 	    &check_logfile ($temp_logfile, 0, $log_mtime{$logfile},
 			    $log_checktime{$logfile}, $log_sha256_digest{$logfile},
 			    $match_hash_ref{$logfile},
@@ -1550,6 +1554,7 @@ sub build_devname_cache {
 #  get-fd-raw:logname[.N[.gz]] - open in raw mode
 #  get-hash:logname[.N[.gz] - get SHA256 of first line and return it
 #  get-journal:logname:checktime - get Linux journal info and return temp file location and checktime.
+#  get-linux-pacct:logname:checktime - get Linux process accounting via lastcomm (now deprecated)
 #  get-mclog-fd:logname:file - get file descriptor of specific file
 #  get-mclog-files:logname - get multilog/cyclog file list
 #  gunzip:logname[.N].gz - gunzip file and return temp file location
@@ -2179,7 +2184,7 @@ sub direct_read_process_acct_log {
     my ($command, $utime, $stime, $etime, $io, $btime, $uid, $gid,
 	$mem, $tty, $pid, $flags);
     my ($date_time, $user, $cpu, $time, $delta, $duration);
-    my ($new_checktime);
+    my ($new_size, $new_mtime, $new_checktime);
     my ($temp_fh, $acct_fh);
     my ($rotated_logs_flag, @rotated_acct_logs, $acct_temp_logfile);
 
@@ -2220,17 +2225,12 @@ sub direct_read_process_acct_log {
 	# Open file and look for first record if we need it. Once
 	# we have a first record, open temp file and start writing out
 	# to it.
-	# Need to convert this to the open wrapper to make this work for Linux.
 	if ($acct_fh = &nonpriv_open_fh ($acct_file)) {
 	    $/ = \$RECORD_SIZE;
 	    # Starting with the oldest file with an mtime > checktime.
 	    # Skip past any records with time < checktime.
 	    if (!$found_first_record) {
-		seek ($acct_fh, $old_size - $RECORD_SIZE, 0);
-		# would like to test if this record is older than
-		# checktime, if not, should do binary search or start
-		# at beginning (watching for out-of-sequence records by
-		# accounting for duration).
+		seek ($acct_fh, $old_size - $RECORD_SIZE, 0) if ($^O ne 'linux'); # don't bother trying to skip ahead for Linux.
 	    }
 
 	    while (<$acct_fh>) {
@@ -2251,7 +2251,9 @@ sub direct_read_process_acct_log {
 		    $pid = 0;
 		}
 		if (!$processing_records &&
-		    ($btime > $checktime || $btime + (&expand ($etime) / $AHZ) > $checktime)) {
+		    ($^O eq 'linux' ? ($btime > $checktime) :
+		     ($btime > $checktime ||
+		      $btime + (&expand ($etime) / $AHZ) > $checktime))) {
 		    $found_first_record = 1;
 		    $processing_records = 1;
 
@@ -2310,8 +2312,6 @@ sub direct_read_process_acct_log {
 	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
 	    exit;
 	}
-	# set checktime at the end
-	$new_checktime = gettimeofday();
 	close ($acct_fh);
 	$/ = $NL;
     }
@@ -2319,13 +2319,17 @@ sub direct_read_process_acct_log {
     if (!$found_first_record || !$processing_records) {
 	# This should provoke an error and exit, we never wrote anything
 	# out. This can happen if process accounting is turned off.
-	&send_error ($acct_file, "Could not find any new records in acct file $acct_file (OpenBSD method). This shouldn't happen--is process accounting on?");
+	&send_error ($acct_file, "Could not find any new records in acct file $acct_file (direct method). This shouldn't happen--is process accounting on?");
 	exit;
     }
     # Otherwise, close the temp file and return log path.
     close ($temp_fh);
+
+    # set new size and checktime
+    ($new_size, $new_mtime) = &get_size ($acct_log);
+    $new_checktime = gettimeofday();
 	
-    return ($temp_logfile, $new_checktime);
+    return ($temp_logfile, $new_size, $new_mtime, $new_checktime);
 }
 
 # Subroutine to expand accounting time.
@@ -2749,6 +2753,7 @@ sub read_size_file {
 }
 
 # Get current log file size and mtime.
+# Doesn't use privs, could conceivably require them for some logs.
 sub get_size {
     my ($logfile) = @_;
     my ($dev, $ino, $mode, $nlink, $uid, $gid, $rdev, $size, $atime,

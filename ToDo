@@ -1,5 +1,7 @@
 BUGS
 
+(Fixed 1.27a) Fix bugs in Linux handling of checktime on process accounting logs.
+
 (Warn 1.26d) Warn of bug in macOS perl affecting Privileges::Drop if present.
 
 (Fixed 1.26a) Bugs in fd handling of privsep.
