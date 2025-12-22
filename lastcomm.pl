@@ -9,6 +9,8 @@
 # Modified 20 December 2025 by Jim Lippard to work on Linux (acct v3)
 #   to build devname_cache on OpenBSD instead of having it hardcoded,
 #   and to use pledge and unveil on OpenBSD.
+# Modified 22 December 2025 by Jim Lippard to try to keep alignment
+#   on OpenBSD for Linux format, despite the extra flags.
 
 # Optional arguments to match user, device/tty, or command, multiple
 # args treated as OR, not AND.
@@ -278,6 +280,16 @@ sub flagbits {
 	$output .= ' ' if ($linux_format && substr ($flag, $idx, 1) eq '0');
     }
 
+    # Linux format + OpenBSD will return a string of flags with more
+    # than the alotted five characters in it for flags PTUSB -- could
+    # pull out some spaces in that case (removing flag alignment but
+    # keeping all the other alignment). This attempts to do that.
+    if ($linux_format && length ($output) > 5) {
+	for (my $idx = 0; $idx <= length ($output) - 4; $idx++) {
+	    $output =~ s/ (?=\S*$)//;
+	}
+    }
+    
     return $output;
 }
 
