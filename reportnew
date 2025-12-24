@@ -194,6 +194,8 @@
 #    checktime in process accounting.
 # Modified 22 December 2025 by Jim Lippard to read larger block of records
 #    in process accounting (all platforms) to improve efficiency.
+# Modified 24 December 2025 by Jim Lippard to use SHA256 hash of first
+#    record to verify that the same file is being processed across runs.
 #
 #
 # To Do:
@@ -274,7 +276,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.27b of 22 December 2025';
+my $VERSION = 'reportnew 1.27c of 24 December 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -626,7 +628,13 @@ foreach $logfile (@logfiles) {
 	# but process them directly instead of by calling lastcomm.
 	# Formerly OpenBSD only, now also works for Linux and macOS.
 	if (!$USE_LASTCOMM) {
-	    ($temp_logfile, $log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}) = &direct_read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
+	    ($temp_logfile, $log_size{$logfile}, $log_mtime{$logfile},
+	     $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
+		&direct_read_process_acct_log ($PROCESS_ACCOUNTING_LOG,
+					       $log_size{$logfile},
+					       $log_checktime{$logfile},
+					       $log_sha256_digest{$logfile},
+					       $temp_dir);
 	}
 	# Otherwise:
 	# Read process accounting logs out to the last time seen, or
@@ -643,9 +651,12 @@ foreach $logfile (@logfiles) {
 	my $ignore_size; # using the log size from the read, not the check
 	($ignore_size, $ignore_mtime, $ignore_checktime, $log_sha256_digest{$logfile}) =
 	    &check_logfile ($temp_logfile, 0, $log_mtime{$logfile},
-			    $log_checktime{$logfile}, $log_sha256_digest{$logfile},
+			    $log_checktime{$logfile},
+			    $log_sha256_digest{$logfile},
 			    $match_hash_ref{$logfile},
-			    $exclude_hash_ref{$logfile}, $action_hash_ref{$logfile}, $LOG_TYPE_PROCESS_ACCOUNTING);
+			    $exclude_hash_ref{$logfile},
+			    $action_hash_ref{$logfile},
+			    $LOG_TYPE_PROCESS_ACCOUNTING);
 
 	# Unlink $temp_logfile.
 	unlink ($temp_logfile);
@@ -734,12 +745,16 @@ foreach $logfile (@logfiles) {
 	    } # End processing of rotated logs.
 	} # Standard logfile check.
 	
-	($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
-	    &check_logfile ($logfile, $log_size{$logfile}, $log_mtime{$logfile},
+	($log_size{$logfile}, $log_mtime{$logfile},
+	 $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
+	    &check_logfile ($logfile, $log_size{$logfile},
+			    $log_mtime{$logfile},
 			    $log_checktime{$logfile},
 			    $log_sha256_digest{$logfile},
 			    $match_hash_ref{$logfile},
-			    $exclude_hash_ref{$logfile}, $action_hash_ref{$logfile}, $LOG_TYPE_STANDARD_LOG);
+			    $exclude_hash_ref{$logfile},
+			    $action_hash_ref{$logfile},
+			    $LOG_TYPE_STANDARD_LOG);
     }
     else { # cyclog or multilog
 	@cyclog_files = &get_cyclog_files ($logfile);
@@ -761,8 +776,10 @@ foreach $logfile (@logfiles) {
 	    # (since we last checked).
 	    $got_first_cyclog_file++;
 	    if ($got_first_cyclog_file == 1) {
-		($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
-		    &check_logfile ($cyclog_file, $log_size{$logfile}, $log_mtime{$logfile},
+		($log_size{$logfile}, $log_mtime{$logfile},
+		 $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
+		    &check_logfile ($cyclog_file, $log_size{$logfile},
+				    $log_mtime{$logfile},
 				    $old_log_checktime,
 				    $log_sha256_digest{$logfile},
 				    $match_hash_ref{$logfile},
@@ -772,7 +789,8 @@ foreach $logfile (@logfiles) {
 	    }
 	    # For all the new files, we don't care about size or mtime.
 	    else {
-		($log_size{$logfile}, $log_mtime{$logfile}, $log_checktime{$logfile}) =
+		($log_size{$logfile}, $log_mtime{$logfile},
+		 $log_checktime{$logfile}) =
 		    &check_logfile ($cyclog_file, 0, 0, 0,
 				    $log_sha256_digest{$logfile},
 				    $match_hash_ref{$logfile},
@@ -2068,10 +2086,19 @@ sub gunzip_logfile {
 # Subroutine to return a SHA256 hash of the first log line (or 0).
 # This subroutine may be touching files only accessible by root,
 # and &is_gzip will work on such files.
+# First line can be passed in if already available.
 sub first_log_line_sha256_digest {
-    my ($logfile) = @_;
-    my ($first_line, $sha256_digest, $gzip_fh);
+    my ($logfile, $first_line) = @_;
+    my ($sha256_digest, $gzip_fh);
 
+    # Process if supplied.
+    if (defined ($first_line)) {
+	chomp ($first_line);
+	$sha256_digest = sha256_hex ($first_line);
+	return ($sha256_digest);
+    }
+
+    # Otherwise, go get it: priv case, gzip case, unpriv case.
     if (!-r $logfile && $privsep_flag && $nonpriv_flag) {
 	$sha256_digest = &send_priv_req ("get-hash:$logfile");
 	return ($sha256_digest);
@@ -2179,14 +2206,14 @@ sub identify_rotated_logs {
 # lastcomm. On Linux will call to priv process to open the first file, and
 # to make readable copies of the gzipped rotated ones.
 sub direct_read_process_acct_log {
-    my ($acct_log, $checktime, $temp_dir) = @_;
+    my ($acct_log, $old_size, $checktime, $old_first_line_hash, $temp_dir) = @_;
     my ($found_first_record,
 	$acct_file, $acct_file_size, $acct_file_mtime,
-	$old_size, $processing_records);
+	$processing_records);
     my ($command, $utime, $stime, $etime, $io, $btime, $uid, $gid,
 	$mem, $tty, $pid, $flags);
     my ($date_time, $user, $cpu, $time, $delta, $duration);
-    my ($new_size, $new_mtime, $new_checktime);
+    my ($new_size, $new_mtime, $new_checktime, $new_first_line_hash);
     my ($temp_fh, $acct_fh);
     my ($rotated_logs_flag, @rotated_acct_logs, $acct_temp_logfile);
     my ($is_live_file);
@@ -2208,10 +2235,8 @@ sub direct_read_process_acct_log {
     # records ourselves from oldest to newest.
     push (@rotated_acct_logs, $acct_log);
 
-    # Start where we left off if the oldest file that changed since we
-    # last checked is the same one we're starting with.
-    $old_size = 0;
-    $old_size = $log_size{$acct_log} if ($checktime);
+    # Reset old size to zero if we don't have a checktime.
+    $old_size = 0 if (!$checktime);
 
     $found_first_record = 0;
     $processing_records = 0;
@@ -2244,7 +2269,33 @@ sub direct_read_process_acct_log {
 	    # Starting with the oldest file with an mtime > checktime.
 	    # Skip past any records with time < checktime.
 	    if (!$found_first_record) {
-		seek ($acct_fh, $old_size - $RECORD_SIZE, 0) if (defined ($old_size) && $old_size > 0 && $old_size % $RECORD_SIZE == 0); # don't bother trying to skip ahead if $old_size isn't a multiple of record size.
+		# don't other trying to skip ahead if $old_size isn't a multiple of record size.
+		if ($old_size > 0 && $old_size % $RECORD_SIZE == 0) {
+		    # Read the first record and compare hash if we have an
+		    # old hash. If it's "null," we use the old behavior.
+		    if (defined ($old_first_line_hash)) {
+			my $n_bytes = sysread ($acct_fh, my $record, $RECORD_SIZE);
+			if ($n_bytes == $RECORD_SIZE &&
+			    $old_first_line_hash ne 'null') {
+			    $new_first_line_hash =
+				&first_log_line_sha256_digest ($logfile,
+							       $record);
+			    seek ($acct_fh, $old_size, 0) if ($old_first_line_hash eq $new_first_line_hash);
+			    # if not the live file we'll need to get a new one
+			    $new_first_line_hash = undef if (!$is_live_file);
+			}
+			# if old hash eq 'null', use old behavior and go to
+			# next-to-last record, this should only happen once
+			# when switching from reportnew-1.27b or earlier.
+			# Later can delete the 'null' references.
+			elsif ($n_bytes == $RECORD_SIZE) {
+			    seek ($acct_fh, $old_size - $RECORD_SIZE, 0);
+			}
+			else { # didn't get full record
+			    seek ($acct_fh, 0, 0); # go back to beginning
+			} # didn't get full record
+		    } # have an old first-line hash
+		} # $old_size > 0
 	    }
 
 	    my $position = tell ($acct_fh);
@@ -2269,6 +2320,16 @@ sub direct_read_process_acct_log {
 		# Process read records in block.
 		for (my $offset = 0; $offset + $RECORD_SIZE <= $n_bytes; $offset += $RECORD_SIZE) {
 		    my $record = substr ($block, $offset, $RECORD_SIZE);
+
+		    # Save SHA256 hash if this is the first record of the
+		    # live file and we didn't already get it above.
+		    # ($position has already been incremented from 0)
+		    if ($is_live_file &&
+			$offset == 0 &&
+			$position == $n_bytes &&
+			!defined ($new_first_line_hash)) {
+			$new_first_line_hash = &first_log_line_sha256_digest ($logfile, $record);
+		    }
 		
 		    if ($^O eq 'openbsd') {
 			($command, $utime, $stime, $etime,
@@ -2362,7 +2423,10 @@ sub direct_read_process_acct_log {
     # Otherwise, close the temp file and return log path.
     close ($temp_fh);
 
-    return ($temp_logfile, $new_size, $new_mtime, $new_checktime);
+    # if we didn't get a new one, return the old one
+    $new_first_line_hash = $old_first_line_hash if (!defined ($new_first_line_hash));
+
+    return ($temp_logfile, $new_size, $new_mtime, $new_checktime, $new_first_line_hash);
 }
 
 # Subroutine to expand accounting time.
