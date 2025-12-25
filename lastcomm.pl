@@ -11,6 +11,9 @@
 #   and to use pledge and unveil on OpenBSD.
 # Modified 22 December 2025 by Jim Lippard to try to keep alignment
 #   on OpenBSD for Linux format, despite the extra flags.
+# Modified 25 December 2025 by Jim Lippard to add Linux format options
+#   --pid (works on OpenBSD, not macOS) and --show-paging (-p) (Linux
+#   only). There are more Linux options that could be added.
 
 # Optional arguments to match user, device/tty, or command, multiple
 # args treated as OR, not AND.
@@ -20,7 +23,7 @@ use warnings;
 use File::Find;
 use Fcntl ':mode';
 use File::Basename;
-use Getopt::Std;
+use Getopt::Long;
 use POSIX qw( ctime fmod sysconf _SC_CLK_TCK );
 use if $^O eq 'openbsd', 'OpenBSD::Pledge';
 use if $^O eq 'openbsd', 'OpenBSD::Unveil';
@@ -51,35 +54,52 @@ my $MACOS_RECORD_FORMAT = "Z10 S< S< S< l< L< L< S< S< l< b8";
 
 my $BSD_OUTPUT_FORMAT = "%-*.*s %-*.*s %-*.*s %-*.*s %6.2f secs %.16s";
 my $LINUX_OUTPUT_FORMAT = "%-*.*s %*.*s %-*.*s %-*.*s %6.2f secs %.16s";
+my $LINUX_SWAPS_OUTPUT_FORMAT = "%-*.*s %*.*s %6.0fmin %6.0fmaj %4.0fswp %6.2f secs %.16s";
 
 my @PROMISES = ('unveil', 'rpath', 'getpw');
 
-my ($logfile, %opts);
+my ($logfile);
 
 my ($acctline, $command, $utime, $stime, $etime, $io, $btime, $uid, $gid,
     $mem, $tty, $pid, $flag);
 my ($user, $commpid, $time, $delta, $tty_name);
+my ($ppid, $minflt, $majflt, $swaps);
 
 my %devname_cache;
 
 my ($output_format, $bsd_format, $linux_format); # output formats
+my ($filename, $paging_flag, $pid_flag);
 
 # Get -f option if present.
 # Add -b (bsd) and -l (linux) for output format.
-getopts ('f:bl', \%opts) || die "Usage: lastcomm.pl [-f file] [command ...] [user ...] [terminal ...]\n";
+GetOptions ('file|f=s' => \$filename,
+	    'bsd|b' => \$bsd_format,
+	    'linux|l' => \$linux_format,
+	    'show-paging|p' => \$paging_flag,
+	    'pid' => \$pid_flag) || die "Usage: lastcomm.pl [-f file] [command ...] [user ...] [terminal ...]\n";
 
-$logfile = $opts{'f'} || $DEFAULT_LOG;
-
-$bsd_format = $opts{'b'};
-$linux_format = $opts{'l'};
+$logfile = $filename || $DEFAULT_LOG;
 
 die "-b and -l are mutually exclusive.\n" if ($bsd_format && $linux_format);
+
+# Can't have -b and -p.
+die "-b and -p are mutually exclusive.\n" if ($bsd_format && $paging_flag);
+# -p implies -l.
+$linux_format = 1 if ($paging_flag);
+# Can't have -p except on Linux.
+die "-p is limited to Linux systems.\n" if ($paging_flag && $^O ne 'linux');
+
+# Can't have -b and --pid.
+die "-b and --pid are mutually exclusive.\n" if ($bsd_format && $pid_flag);
+# No --pid on macOS.
+die "--pid does not work on macOS.\n" if ($pid_flag && $^O eq 'darwin');
 
 if ($linux_format) {
     $output_format = $LINUX_OUTPUT_FORMAT;
     $UT_NAMESIZE = $LINUX_UT_NAMESIZE;
     $COMMPIDSIZE = $LINUX_COMMPIDSIZE;
     $FLAGSIZE = $LINUX_FLAGSIZE; # could cause issues if > 5 flags
+    $output_format = $LINUX_SWAPS_OUTPUT_FORMAT if ($paging_flag);
 }
 else { # default
     $bsd_format = 1;
@@ -114,7 +134,7 @@ while ($acctline = <ACCTLOG>) {
 	$pid = 0;
     }
     elsif ($^O eq 'linux') {
-	my ($version, $exitcode, $ppid, $rw, $minflt, $majflt, $swaps); # unused
+	my ($version, $exitcode, $rw); # unused
 	($flag, $version, $tty, $exitcode, $uid, $gid, $pid,
 	 $ppid, $btime, $etime, $utime, $stime, $mem, $io,
 	 $rw, $minflt, $majflt, $swaps, $command) = unpack ($LINUX_RECORD_FORMAT, $acctline);
@@ -131,11 +151,26 @@ while ($acctline = <ACCTLOG>) {
 	    $FLAGSIZE, $FLAGSIZE, &flagbits ($flag),
 	    $UT_NAMESIZE, $UT_NAMESIZE, $user,
 	    $UT_LINESIZE, $UT_LINESIZE, $tty_name,
-	    $time / $AHZ, ctime ($btime);
+	    $time / $AHZ, ctime ($btime) unless ($paging_flag);
+	printf "$output_format",
+	    $COMMPIDSIZE, $COMMPIDSIZE, $commpid,
+	    $FLAGSIZE, $FLAGSIZE, &flagbits ($flag),
+	    $minflt, $majflt, $swaps,
+	    $time / $AHZ, ctime ($btime) if ($paging_flag);
 	printf " (%1.0f:%02.0f:%05.2f)",
 	    $delta / $SECSPERHOUR,
 	    fmod ($delta, $SECSPERHOUR) / $SECSPERMIN,
 	    fmod ($delta, $SECSPERMIN) unless ($linux_format);
+	if ($pid_flag) {
+	    if (defined ($ppid)) {
+		printf " %d %d",
+		    $pid, $ppid;
+	    }
+	    else {
+		printf " %d No PPID.",
+		    $pid;
+	    }
+	}
 	print "\n";
     }
 }
