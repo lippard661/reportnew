@@ -7,9 +7,9 @@ Now uses and requires Signify.pm for signed include files.
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.27c.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2025-pkg.pub
+reportnew-1.28.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2025-pkg.pub
 
-Current version is reportnew-1.27c of 24 December 2025.
+Current version is reportnew-1.28 of 31 December 2025.
 
 This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux) and
 Privileges::Drop (libprivileges-drop-perl on Linux), both in CPAN. Privileges::Drop fails with perl 5.34.1 which is the release on Tahoe 26.1, but
