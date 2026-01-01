@@ -124,7 +124,7 @@
 # Modified 28 July 2024 by Jim Lippard to use Signify.pm.
 # Modified 16 December 2024 by Jim Lippard for new config file format and
 #    to add -c config check option and -d debug option (for existing
-#    debug_flag). Remains backward compatible with the begin-host/end-host
+#    debug_mode). Remains backward compatible with the begin-host/end-host
 #    format.
 # Modified 17 December 2024 by Jim Lippard to fix up -c config check and
 #    enforce restriction on using hosts and begin-host/end-host in the same
@@ -196,6 +196,8 @@
 #    in process accounting (all platforms) to improve efficiency.
 # Modified 24 December 2025 by Jim Lippard to use SHA256 hash of first
 #    record to verify that the same file is being processed across runs.
+# Modified 31 December 2025 by Jim Lippard to precompile match/exclude
+#    regexes for efficiency.
 #
 #
 # To Do:
@@ -276,7 +278,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.27c of 24 December 2025';
+my $VERSION = 'reportnew 1.28 of 31 December 2025';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -826,9 +828,10 @@ rmdir ($temp_dir);
 # and individual host sections.
 sub parse_config {
     my ($config_file) = @_;
-    my ($current_context, $directive, $value, $line_num, $current_logfile,
-	$specified_host, $current_host, $all_host_master_notify,
-	$action, $action_value, $current_match_session_match_flag);
+    my ($current_context, $directive, $value, $rule, $rule_type, $rule_text,
+	$line_num, $current_logfile, $specified_host, $current_host,
+	$all_host_master_notify, $action, $action_value,
+	$current_match_session_match_flag);
     my ($macro_name, $macro_value, $macro_options, $macro_file, $macro_dir);
     my ($multihost_config, $oldstyle_multihost, $found_my_host);
     my ($linux_journal_unit, $linux_journal_syslogid, $linux_journal_syslogfacility);
@@ -1041,15 +1044,38 @@ sub parse_config {
 			    exit;
 			}
 			if (($value eq 'all') || &valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && &valid_regexp ($1))) {
-			    # Do preproc macro substitution.
-			    $value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w\-]+%%/);
-			    push (@{$match_hash{$current_logfile}}, $value);
-			    if ($value =~ /^session-with/) {
-				$current_match_session_match_flag = 1;
+			    $rule_text = $value;
+			    if ($value eq 'all') {
+				$rule = { type => 'all', text => 'all' };
 			    }
 			    else {
-				$current_match_session_match_flag = 0;
+				# session-with
+				if ($value =~ /^session-with (.*$)/) {
+				    $value = $1;
+				    $current_match_session_match_flag = 1;
+				    $rule_type = 'session_with';
+				}
+				else {
+				    $current_match_session_match_flag = 0;
+				    $rule_type = 're';
+				}
+				# Do preproc macro substitution.
+				$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w\-]+%%/);
+				# Negate if it begins with ! and remove it.
+				my $neg = ($value =~ s{^!}{});
+				# Remove leading and trailing slash.
+				$value =~ s/^\///;
+				$value =~ s/\/$//;
+				# Precompile regexp.
+				my $re = &compile_re ($value, "match rule on line $line_num. $_");
+				$rule = {
+				    type => $rule_type,
+				    re => $re,
+				    neg => $neg,
+				    text => $rule_text
+				}
 			    }
+			    push (@{$match_hash{$current_logfile}}, $rule);
 			}
 			else {
 			    &send_error ($config_file, "Invalid match directive on line $line_num. $_");
@@ -1062,17 +1088,43 @@ sub parse_config {
 			    exit;
 			}
 			if (($value eq 'none') || &valid_regexp ($value) || ($value =~ /^session-without (.*$)/ && &valid_regexp ($1))) {
-			    if ($value =~ /^session-without/ && !$current_match_session_match_flag) {
-				&send_error ($config_file, "Exclude directive is a session match but corresponding match directive is not on line $line_num. $_");
-				exit;
+			    $rule_text = $value;
+			    if ($value eq 'none') {
+				$rule = { type => 'none', text => 'none' };
 			    }
-			    elsif ($value !~ /^session-without/ && $current_match_session_match_flag) {
-				&send_error ($config_file, "Exclude directive is not a session match but corresponding match directive is on line $line_num. $_");
-				exit;
+			    else {
+				if ($value =~ /^session-without (.*$)/) {
+				    $value = $1;
+				    $rule_type = 'session_without';
+				    if (!$current_match_session_match_flag) {
+					&send_error ($config_file, "Exclude directive is a session match but corresponding match directive is not on line $line_num. $_");
+					exit;
+				    }
+				}
+				else {
+				    $rule_type = 're';
+				    if ($current_match_session_match_flag) {
+					&send_error ($config_file, "Exclude directive is not a session match but corresponding match directive is on line $line_num. $_");
+					exit;
+				    }
+				}
+				# Do preproc macro substitution.
+				$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w\-]+%%/);
+				# Negate if it begins with ! and remove it.
+				my $neg = ($value =~ s{^!}{});
+				# Remove leading and trailing slash.
+				$value =~ s/^\///;
+				$value =~ s/\/$//;
+				# Precompile regexp.
+				my $re = &compile_re ($value, "exclude rule on line $line_num. $_");
+				$rule = {
+				    type => $rule_type,
+				    re => $re,
+				    neg => $neg,
+				    text => $rule_text
+				};
 			    }
-			    # Do preproc macro substitution.
-			    $value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w\-]+%%/);
-			    push (@{$exclude_hash{$current_logfile}}, $value);
+			    push (@{$exclude_hash{$current_logfile}}, $rule);
 			}
 			else {
 			    &send_error ($config_file, "Invalid exclude directive on line $line_num. $_");
@@ -1247,11 +1299,13 @@ sub parse_config {
     foreach $current_logfile (@logfiles) {
 	# These checks need to be changed.
 	if (!defined ($match_hash{$current_logfile})) {
-	    push (@{$match_hash{$current_logfile}}, 'all');
+	    my $rule = { type => 'all', text => 'all' };
+	    push (@{$match_hash{$current_logfile}}, $rule);
 	}
 	$match_hash_ref{$current_logfile} = \@{$match_hash{$current_logfile}};
 	if (!defined ($exclude_hash{$current_logfile})) {
-	    push (@{$exclude_hash{$current_logfile}}, 'none');
+	    my $rule = { type => 'none', text => 'none' };
+	    push (@{$exclude_hash{$current_logfile}}, $rule);
 	}
 	$exclude_hash_ref{$current_logfile} = \@{$exclude_hash{$current_logfile}};
 	if (!defined ($action_hash{$current_logfile})) {
@@ -1600,7 +1654,7 @@ sub priv_listener {
 	    $req_rest = $2;
 
 	    # before using $req_rest
-	    if ($req_rest =~ /\.\./ || $req_rest =~ m{/\z/} ) {
+	    if ($req_rest =~ m{(^|/)\.\.(?:/|\z)}) {
 		warn "Privileged parent received suspicious request: $req\n"; next;
 	    }
 	    
@@ -1898,22 +1952,22 @@ sub check_logfile {
     # strings which are appended to the session_match_array used for that final filtering.
     for ($idx = 0; $idx <= $#match_hashes; $idx++ ) {
 	$session_match_flag[$idx] = 0;
-	if ($match_hashes[$idx] =~ /^session-with (.*$)/) {
-	    $match_hashes[$idx] = $1;
+	if ($match_hashes[$idx]{type} eq 'session_with') {
 	    $session_match_array[$idx] = ''; # start empty
 	    $session_match_flag[$idx] = 1;
-	    if ($exclude_hashes[$idx] =~ /^session-without (.*$)/) {
-		$session_exclude_array[$idx] = $1;
-		$exclude_hashes[$idx] = 'none';
+	    if ($exclude_hashes[$idx]{type} eq 'session_without') {
+		$session_exclude_array[$idx] = $exclude_hashes[$idx];
+		# change to exclude none for the initial collection
+		$exclude_hashes[$idx]{type} = 'none';
 	    }
 	    else {
 		# This shouldn't happen.
-		&send_error ($ref_logfile, "Internal error - found session match hash without corresponding session exclude hash for logfile $ref_logfile. $match_hashes[$idx] / $exclude_hashes[$idx]");
+		&send_error ($ref_logfile, "Internal error - found session match hash without corresponding session exclude hash for logfile $ref_logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
 	    }
 	}
-	elsif ($exclude_hashes[$idx] =~ /^session-without/) {
+	elsif ($exclude_hashes[$idx]{type} eq 'session_without') {
 	    # This also shouldn't happen.
-	    &send_error ($ref_logfile, "Internal error - found session exclude hash without corresponding session match hash for logfile $ref_logfile. $match_hashes[$idx] / $exclude_hashes[$idx]");
+	    &send_error ($ref_logfile, "Internal error - found session exclude hash without corresponding session match hash for logfile $ref_logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
 	}
     }
 
@@ -1945,8 +1999,8 @@ sub check_logfile {
 			}
 		    }
 
-		    if ((($match eq 'all') || (&match_line ($match, $_))) &&
-			(($exclude eq 'none') || (!&match_line ($exclude, $_)))) {
+		    if (&match_line ($match, $_) && !&match_line ($exclude, $_)) {
+			print "DEBUG: match $match->{re} and not match $exclude->{re}\nLINE: $_" if ($debug_mode && $match->{type} eq 're' && $exclude->{type} eq 're');
 			if ($log_type == $LOG_TYPE_CYCLOG_OR_MULTILOG) { # cyclog or multilog
 			    ($date, $line) = split (/\s+/, $_, 2);
 			    if ((substr ($date, 0, 1) eq '@') && (length ($date) == 15)) { # cyclog
@@ -2865,33 +2919,41 @@ sub get_size {
     return ($size, $mtime);
 }
 
+# Subroutine to precompile regexps for matching.
+sub compile_re {
+    my ($pattern, $context) = @_;
+    my $re = eval { qr/$pattern/ };
+    die "Invalid regex in $context: $@" if $@;
+    return $re;
+}
+
 # Return 1 if line matches regexp, 0 if not.
 # If $return_group is specified, on match the first capture group is returned.
 sub match_line {
-    my ($regexp, $line, $return_group) = @_;
-    my ($negative);
+    my ($rule, $line, $return_group) = @_;
 
     if (!defined ($return_group)) {
 	$return_group = 0;
     }
 
-    if (substr ($regexp, 0, 1) eq '!') {
-	$negative = 1;
-	$regexp =~ s/^!//;
-    }
-    else {
-	$negative = 0;
-    }
+    # rule types 'all' or 'none'
+    return 1 if ($rule->{type} eq 'all');
+    return 0 if ($rule->{type} eq 'none');
 
-    $regexp =~ s/^\///;
-    $regexp =~ s/\/$//;
-
-    if (($negative && ($line =~ !/$regexp/)) ||
-	(!$negative && ($line =~ /$regexp/))) {
-	return $1 if $return_group;
+    # rule types 're', 'session_with', 'session_without';
+    # all are compiled regexps.
+    if ($line =~ $rule->{re}) {
+	# negative rule: match only if it does not match
+	if ($rule->{neg}) {
+	    return 0;
+	}
+	# positive rule, return $1 if required and present
+	return $1 if (defined ($1) && $return_group);
 	return 1;
     }
+    # regex didn't match
     else {
+	return 1 if ($rule->{neg});
 	return 0;
     }
 }
