@@ -1963,10 +1963,9 @@ sub check_logfile {
 	    $session_match_flag[$idx] = 1;
 	    if ($exclude_hashes[$idx]{type} eq 'session_without') {
 		$session_exclude_array[$idx] = $exclude_hashes[$idx];
-		# change type on the exclude array as it will only be used for finding match groups (positive matches)
-		$session_exclude_array[$idx]->{type} = 're';
-		# used to change type on original group to 'none', now just treat 'session_without' as an exclude of 'none'
-		# due to edge case when processing rotated log files.
+		# used to change exclude_hashes to 'none' or type to 'none' which impacts the next pass with rotated logs.
+		# now just special-case handling of 'session_without' in &match_line depending on whether returned capture
+		# groups are requested.
 	    }
 	    else {
 		# This shouldn't happen. (It would happen when type on $exclude_hashes[$idx] was changed, when processing rotated log files.)
@@ -1996,6 +1995,8 @@ sub check_logfile {
 
 		    # Process session matches. If we find a match to the exclude array, the relevant match group is returned so that
 		    # it can be added to the $session_match_array which will be used to identify the matches to keep.
+		    # The name $session_exclude_array is misleading here, it's looking for positive matches and returning
+		    # capture groups for later use.
 		    if ($session_match_flag[$idx]) {
 			if ($session_append_string = &match_line ($session_exclude_array[$idx], $_, 1)) {
 			    if ($session_match_array[$idx] eq '') {
@@ -2045,7 +2046,8 @@ sub check_logfile {
 		$action = $action_hashes[$idx];
 		($action, $action_value) = split (/,/, $action, 2);
 		if (exists ($notify_arrays[$idx])) {
-		    # Process session matches. Just return the notify_array lines which match the collected session match strings.
+		    # Process session matches. Just return the notify_array lines which match the collected session match strings (from
+		    # the "$session_exclude_array").
 		    if ($session_match_flag[$idx]) {
 			# Don't grep for a null string and match everything.
 			if ($session_match_array[$idx] ne '') {
@@ -2948,10 +2950,11 @@ sub match_line {
     return 1 if ($rule->{type} eq 'all');
     return 0 if ($rule->{type} eq 'none');
     # rule type 'session_without' treated same as 'none'
-    return 0 if ($rule->{type} eq 'session_without');
+    # if no return_group is requested
+    return 0 if ($rule->{type} eq 'session_without' && !$return_group);
 
     # rule types 're', 'session_with'; when 'session_without' is used
-    # for positive matches its type is changed to 're';
+    # to collect capture groups for positive matches it comes here;
     # all are compiled regexps.
     if ($line =~ $rule->{re}) {
 	# negative rule: match only if it does not match
