@@ -1045,6 +1045,7 @@ sub parse_config {
 			}
 			if (($value eq 'all') || &valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && &valid_regexp ($1))) {
 			    $rule_text = $value;
+			    $current_match_session_match_flag = 0;
 			    if ($value eq 'all') {
 				$rule = { type => 'all', text => 'all' };
 			    }
@@ -1056,7 +1057,6 @@ sub parse_config {
 				    $rule_type = 'session_with';
 				}
 				else {
-				    $current_match_session_match_flag = 0;
 				    $rule_type = 're';
 				}
 				# Do preproc macro substitution.
