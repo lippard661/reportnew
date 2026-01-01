@@ -198,6 +198,8 @@
 #    record to verify that the same file is being processed across runs.
 # Modified 31 December 2025 by Jim Lippard to precompile match/exclude
 #    regexes for efficiency.
+# Modified 1 January 2026 by Jim Lippard to fix an edge case in session
+#    handling with rotated logs.
 #
 #
 # To Do:
@@ -278,7 +280,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.28 of 31 December 2025';
+my $VERSION = 'reportnew 1.28a of 1 January 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1950,6 +1952,10 @@ sub check_logfile {
     # Session rules collect matches as normal with the normal processing but most will be discarded.
     # The session_exclude_array is used to find the subset of matches that are kept (so it's somewhat misnamed), and by finding
     # strings which are appended to the session_match_array used for that final filtering.
+    # exclude: session-without really means: find positive matches for the "excludes," grab the capture groups from those,
+    # and then use a disjunction of those to search against the results from the match: session-with regexp and report
+    # all that remains. So it's really an AND of two positive matches, what's in the match and the disjunction of subparts
+    # from the matching excludes.
     for ($idx = 0; $idx <= $#match_hashes; $idx++ ) {
 	$session_match_flag[$idx] = 0;
 	if ($match_hashes[$idx]{type} eq 'session_with') {
@@ -1957,17 +1963,19 @@ sub check_logfile {
 	    $session_match_flag[$idx] = 1;
 	    if ($exclude_hashes[$idx]{type} eq 'session_without') {
 		$session_exclude_array[$idx] = $exclude_hashes[$idx];
-		# change to exclude none for the initial collection
-		$exclude_hashes[$idx]{type} = 'none';
+		# change type on the exclude array as it will only be used for finding match groups (positive matches)
+		$session_exclude_array[$idx]->{type} = 're';
+		# used to change type on original group to 'none', now just treat 'session_without' as an exclude of 'none'
+		# due to edge case when processing rotated log files.
 	    }
 	    else {
-		# This shouldn't happen.
-		&send_error ($ref_logfile, "Internal error - found session match hash without corresponding session exclude hash for logfile $ref_logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
+		# This shouldn't happen. (It would happen when type on $exclude_hashes[$idx] was changed, when processing rotated log files.)
+		&send_error ($ref_logfile, "Internal error - found session match hash without corresponding session exclude hash for logfile $ref_logfile/$logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
 	    }
 	}
 	elsif ($exclude_hashes[$idx]{type} eq 'session_without') {
 	    # This also shouldn't happen.
-	    &send_error ($ref_logfile, "Internal error - found session exclude hash without corresponding session match hash for logfile $ref_logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
+	    &send_error ($ref_logfile, "Internal error - found session exclude hash without corresponding session match hash for logfile $ref_logfile/$logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
 	}
     }
 
@@ -2939,8 +2947,11 @@ sub match_line {
     # rule types 'all' or 'none'
     return 1 if ($rule->{type} eq 'all');
     return 0 if ($rule->{type} eq 'none');
+    # rule type 'session_without' treated same as 'none'
+    return 0 if ($rule->{type} eq 'session_without');
 
-    # rule types 're', 'session_with', 'session_without';
+    # rule types 're', 'session_with'; when 'session_without' is used
+    # for positive matches its type is changed to 're';
     # all are compiled regexps.
     if ($line =~ $rule->{re}) {
 	# negative rule: match only if it does not match

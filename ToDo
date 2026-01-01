@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.28a) Edge case in session match handling causes failure after
+handling a rotated log file.
+
 (Fixed 1.27c) Use SHA256 hashes for process accounting records to mitigate
 the edge case of either rapid log rotation/culling or long delays between
 runs where the first available modified file is longer than the last size
