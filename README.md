@@ -15,7 +15,7 @@ This version supports privilege separation on OpenBSD, macOS, and Linux, which r
 Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
 JSON::PP. The non-standard moduels are also on CPAN.
 
-Privileges::Drop fails with perl 5.34.1 which is the release on Tahoe 26.1, but works properly with perl 5.40.2 which is the current stable Homebrew
+Privileges::Drop fails with perl 5.34.1 which is the release on macOS Tahoe 26.1, but works properly with perl 5.40.2 which is the current stable Homebrew
 release. Workarounds are either use the Homebrew perl or patch Privileges::Drop on the lines beginning with my %GIDHash and my %EGIDHash to insert
 "grep { $_ != 4294967295 }" immediately before "split(\s/," in each line, as the problem is that setgid in perl 5.34.1 ends up putting a -1 into $GID
 and $EGID (which is 4294967295 as an unsigned 32-bit integer).
