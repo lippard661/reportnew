@@ -72,6 +72,9 @@ the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
 
+* (Done 1.29) Formalize and secure interprocess communications for
+privilege separation.
+
 * (Done 1.28) Precompile match/exclude regular expressions for
 efficiency, simplify &match_line logic.
 

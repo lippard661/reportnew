@@ -200,6 +200,8 @@
 #    regexes for efficiency.
 # Modified 1 January 2026 by Jim Lippard to fix an edge case in session
 #    handling with rotated logs.
+# Modified 2 January 2026 by Jim Lippard to formalize interprocess comms
+#    using JSON and HMACs. Add &require_module.
 #
 #
 # To Do:
@@ -226,7 +228,8 @@
 
 use strict;
 use warnings;
-use Digest::SHA qw( sha256_hex );
+use feature 'state';
+use Digest::SHA qw( hmac_sha256_hex sha256_hex );
 use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Copy;
@@ -239,11 +242,13 @@ use Signify;
 use Sys::Hostname;
 use Time::HiRes qw( gettimeofday );
 use Time::ParseDate;
-# required for privilege separation
+# Required for privilege separation:
+# IO::FDPass
+# Privileges::Drop
+# JSON::MaybeXS (or JSON::PP as a fallback, slower but standard)
 use base; # required for Privileges::Drop
 use English; # required for Privileges::Drop
 use IO::Socket::UNIX; # required for socketpair call
-#use Socket; # required for socketpair call
 # required for multilog format
 #use Time::TAI64 qw( :tai64n );
 #my $TimeTAI64_module = 1;
@@ -253,11 +258,19 @@ use if $^O eq 'openbsd', 'OpenBSD::MkTemp', qw( mkdtemp mkstemp );
 use if $^O eq 'openbsd', 'OpenBSD::Unveil';
 use if $^O eq 'openbsd', 'OpenBSD::Pledge';
 
+### Constants.
+
+# for process accounting
 my $AHZ = &accounting_hz;
 use constant SECSPERHOUR => 60 * 60;
 use constant SECSPERMIN => 60;
 
-### Constants.
+# for privsep/interprocess
+use constant {
+    RESP_SUCCESS => 'success',
+    RESP_ERROR => 'error',
+    RESP_FD_FOLLOWS => 'fd_follows' # file descriptor will be sent next
+};
 
 my $HOSTNAME = hostname();
 my ($SHORT_HOSTNAME, $DOMAINNAME) = split (/\./, $HOSTNAME, 2);
@@ -266,9 +279,6 @@ my ($SHORT_HOSTNAME, $DOMAINNAME) = split (/\./, $HOSTNAME, 2);
 my $SECURITY_ADMIN = 'lippard@discord.org';
 
 my $EMAIL_SENDER = 'nobody@' . $DOMAINNAME;
-
-### Set to your log time zone (used only in one subroutine below).
-my $TIME_ZONE = 'MST';
 
 # for Linux journal logs.
 my $JOURNALCTL = '/usr/bin/journalctl';
@@ -280,7 +290,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.28a of 1 January 2026';
+my $VERSION = 'reportnew 1.29 of 3 January 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -386,7 +396,7 @@ my ($rotated_logs_flag, $processed_rotated_log_flag, @rotated_logs, $rotated_log
 # For privilege separation.
 my ($user, $reporter_uid, $reporter_gid, $use_privsep,
     $privsep_flag, $priv_flag, $nonpriv_flag,
-    $parent_sock, $child_sock);
+    $parent_sock, $child_sock, $HMAC_SECRET);
 
 ### Main program.
 
@@ -490,16 +500,32 @@ if ($use_privsep && $user eq 'root' &&
     $priv_flag = 0;
     $nonpriv_flag = 0;
 
+    # Needed for privsep HMAC.
+    unveil ('/dev/urandom', 'rw') if ($^O eq 'openbsd');
+
     # Unveil /usr/local/libdata/perl5 if on OpenBSD to allow
     # loading these modules at runtime.
     unveil ('/usr/local/libdata/perl5', 'r') if ($^O eq 'openbsd');
-    # Modules required for privilege separation.
-    if (!eval { require IO::FDPass; 1 }) {
-	die "Could not require IO::FDPass. $@\n";
+    unveil ('/usr/libdata/perl5', 'r') if ($^O eq 'openbsd'); # for JSON::PP
+
+    # Load required modules.
+    &require_module ('IO::FDPass')
+	or die "Could not require IO::FDPass. $@\n";
+    &require_module ('Privileges::Drop')
+	or die "Could not require Privileges::Drop. $@\n";
+
+    # Try to load JSON (with fallback).
+    my $json_loaded = 0;
+    if (&require_module ('JSON::MaybeXS', qw(encode_json decode_json))) {
+	$json_loaded = 1;
+	print "DEBUG: Using JSON::MaybeXS\n" if ($debug_mode);
     }
-    if (!eval { require Privileges::Drop; 1 }) {
-	die "Could not require Privileges::Drop. $@\n";
+    elsif (&require_module ('JSON::PP', qw(encode_json decode_json))) {
+	$json_loaded = 1;
+	print "DEBUG: Using JSON::PP\n" if ($debug_mode);
     }
+
+    die "No JSON module available for privilege separation.\n" unless $json_loaded;
 }
 elsif ($^O eq 'openbsd') { # not using privsep
         pledge (@INITIAL_PROMISES, @NONPRIVSEP_PROMISES) || die "Cannot pledge promises, non-privsep. $!\n";
@@ -570,6 +596,9 @@ if ($privsep_flag) {
     # Create socket for interprocess communications.
     ($parent_sock, $child_sock) = IO::Socket::UNIX->socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC)
 	or die "socketpair: $!";
+
+    # Create shared secret.
+    $HMAC_SECRET = generate_random_secret();
 
     # Fork.
     my $pid = fork();
@@ -821,6 +850,21 @@ foreach $logfile (@logfiles) {
 rmdir ($temp_dir);
 
 ### Subroutines.
+
+## Subroutine to assist in optional module importing.
+sub require_module {
+    my ($module, @imports) = @_;
+
+    if (!eval "require $module; 1") {
+	return 0;
+    }
+
+    if (@imports) {
+	$module->import (@imports);
+    }
+
+    return 1;
+}
 
 ## Config parsing and related subroutines to validate config elements.
 
@@ -1625,157 +1669,395 @@ sub build_devname_cache {
 ## Subroutines for privilege separation.
 
 # Subroutine for privileged process to listen for and process requests.
-# Request format:
-#  get-fd:logname[.N[.gz]] - get file descriptor and return it
-#  get-fd-raw:logname[.N[.gz]] - open in raw mode
-#  get-hash:logname[.N[.gz] - get SHA256 of first line and return it
-#  get-journal:logname:checktime - get Linux journal info and return temp file location and checktime.
-#  get-linux-pacct:logname:checktime - get Linux process accounting via lastcomm (now deprecated)
-#  get-mclog-fd:logname:file - get file descriptor of specific file
-#  get-mclog-files:logname - get multilog/cyclog file list
-#  gunzip:logname[.N].gz - gunzip file and return temp file location
-# Exit when the socket is closed on the other side.
+# Requests are submitted as signed JSON using a shared secret generated
+# before the unprivileged process is forked off. The content of a request
+# is a request name and a hash of parameters, plus a request_id and
+# timestamp. The response is a hash of # status (success, failure, or fd_follows),
+# request_id, timestamp, and data (and possibly metadata). Wrappers are provided
+# for requests for file descriptor or other privileged data, and for responses,
+# error responses, and pre-validation/no HMAC responess.
+# Request types and their required parameters:
+# get-fd, get-fd-raw, get-mclog-fd: logname (which can for all requests include [.N[.gz]]
+# at the end if not cyclog/multilog); get-mclog-fd requires a separate filename parameter
+# for the specific file in the multilog/cyclog directory to be opened. These return a file
+# descriptor immediately after a non-failure (sending back fd_follows status).
+# get-hash: logname. Returns hash of first line of logfile (uncompressed if it's a gzip).
+# get-journal: logname, checktime. Returns hash of temp_logfile and new checktime.
+# get-linux-pacct (deprecated): logname, checktime. Returns hash of temp_logfile and new checktime.
+# get-mclog-files: logname. Returns array reference of multilog/cyclog file list.
+# gunzip: lofname. Gunzips the file and returns temp_logfile name.
 sub priv_listener {
-    my ($req, $req_type, $req_rest, $req_logfile,
-	$req_canon_logfile, $req_checktime);
-    my ($first_line_hash);
-    my $RESTRICTED_REQ_LENGTH = 1024;
+    my ($req, $req_type);
+    my $MAX_REQUEST_LENGTH = 1024 * 1024;;
 
     print "DEBUG: starting &priv_listener\n" if ($debug_mode);
-    while ($req = <$parent_sock>) {
-	chomp ($req);
-	print "DEBUG: parent received $req\n" if ($debug_mode);
-	# Limit request length.
-	if (length ($req) > $RESTRICTED_REQ_LENGTH) {
-	    warn "Priv request too long.\n";
+    while (1) {
+	read ($parent_sock, my $len_bytes, 4) or last;
+	my $msg_len = unpack ('N', $len_bytes);
+	if ($msg_len > $MAX_REQUEST_LENGTH || $msg_len < 1) {
+	    warn "Invalid message length: $msg_len\n";
+	    &send_error_response ("Invalid message length.");
 	    next;
 	}
-	
-	if ($req =~ /(^[\w-]+):(.*)$/) {
-	    $req_type = $1;
-	    $req_rest = $2;
 
-	    # before using $req_rest
-	    if ($req_rest =~ m{(^|/)\.\.(?:/|\z)}) {
-		warn "Privileged parent received suspicious request: $req\n"; next;
-	    }
-	    
-	    if ($req_type eq 'get-fd' ||
-		$req_type eq 'get-fd-raw' ||
-		$req_type eq 'get-hash') {
-		$req_logfile = $req_rest;
-		$req_canon_logfile = $req_rest;
-		if ($req_rest =~ /^(.*)(\.\d)(\.gz){0,1}$/) {
-		    $req_canon_logfile = $1;
-		}
-	    }
-	    # These both have canonical logfile name:checktime.
-	    elsif ($req_type eq 'get-journal' ||
-		$req_type eq 'get-linux-pacct') {
-		if ($req_rest =~ /^(.*):([\d\.]+)$/) {
-		    $req_canon_logfile = $1;
-		    $req_logfile = $1;
-		    $req_checktime = $2;
-		}
-	    }
-	    elsif ($req_type eq 'get-mclog-files') {
-		$req_logfile = $req_rest;
-		$req_canon_logfile = $req_rest;
-	    }
-	    elsif ($req_type eq 'get-mclog-fd') {
-		if ($req_rest =~ /^(.*):(.*)$/) {
-		    $req_canon_logfile = $1;
-		    $req_logfile = $1 . '/' . $2;
-		}
-		else {
-		    warn "Privileged parent process received invalid get-mclog-fd request: $req\n";
-		    exit;
-		}
-	    }
-	    elsif ($req_type eq 'gunzip') {
-		$req_logfile = $req_rest;
-		if ($req_rest =~ /^(.*)(\.\d\.gz)$/) {
-		    $req_canon_logfile = $1;
-		}
-		else {
-		    warn "Privileged parent process received invalid gunzip request: $req\n";
-		    next;
-		}
-	    }
-	    else {
-		warn "Privileged parent process received invalid logfile request: $req\n";
-		next;
-	    }
-	}
-	unless (grep { $_ eq $req_canon_logfile } @logfiles) {
-	    warn "Privileged parent process received invalid logfile name: $req\n";
+	# Read full message.
+	read ($parent_sock, my $buffer, $msg_len);
+
+	my $envelope = eval {decode_json ($buffer) };
+
+	if ($@) {
+	    warn "Faild to parse envelope JSON: $@\n";
+	    &send_error_response_nohmac ("Invalid JSON.");
 	    next;
 	}
-	# Open logfile and return file descriptor.
-	if ($req_type eq 'get-fd' ||
-	    $req_type eq 'get-fd-raw' ||
-	    $req_type eq 'get-mclog-fd') {
-	    my $open_mode = '<';
-	    $open_mode = '<:raw' if ($req_type eq 'get-fd-raw');
-	    if (open (my $log_fh, $open_mode, $req_logfile)) {
-		print $parent_sock "success\n";
-		print "DEBUG: parent sending fd for $req_logfile\n" if ($debug_mode);
-		IO::FDPass::send (fileno ($parent_sock), fileno ($log_fh))
-		    or warn "IO::FDPass::send failed ($req): $!\n";
-		print "DEBUG: parent sent fd for $req_logfile\n" if ($debug_mode);
-		close $log_fh; # does this break it?
-	    }
-	    else {
-		printf $parent_sock "%d\n", "$!"; # want numeric
-		warn "Failed to open $req_logfile: $!\n";
-	    }
-	}
-	# Get hash of first line and return it.
-	elsif ($req_type eq 'get-hash') {
-	    $first_line_hash = &first_log_line_sha256_digest ($req_logfile);
-	    print $parent_sock "$first_line_hash\n";
+
+	# Verify HMAC.
+	my $request_json = $envelope->{data};
+	my $received_hmac = $envelope->{hmac};
+	my $expected_hmac = hmac_sha256_hex ($request_json, $HMAC_SECRET);
+
+	unless ($received_hmac eq $expected_hmac) {
+	    warn "HMAC verification failed.\n";
+	    &send_error_response_nohmac ("HMAC verification failed.");
 	    next;
 	}
-	# Linux journal file and Linux process accounting.
-	# Save to temp file for child process,
-	# return filename and checktime.
-	elsif ($req_type eq 'get-journal' || $req_type eq 'get-linux-pacct') {
-	    my ($temp_logfile, $checktime);
-	    ($temp_logfile, $checktime) = &read_linux_journal ($req_logfile, $req_checktime, $temp_dir) if ($req_type eq 'get-journal');
-	    ($temp_logfile, $checktime) = &read_process_acct_log ($req_logfile, $req_checktime, $temp_dir) if ($req_type eq 'get-linux-pacct');
-	    chown ($reporter_uid, $reporter_gid, $temp_logfile);
-	    print $parent_sock "$temp_logfile,$checktime\n";
+
+	# Parse request.
+	my $request = eval { decode_json ($request_json) };
+	
+	if ($@ || !validate_request ($request)) {
+	    warn "Invalid request format.\n";
+	    &send_error_response ("Invalid request.", $request->{request_id});
 	    next;
 	}
-	# Get cyclog/multilog files and return, comma-separated.
-	elsif ($req_type eq 'get-mclog-files') {
-	    my @cyclog_files = &get_cyclog_files ($req_logfile);
-	    if (@cyclog_files) {
-		my $first_file = 1;
-		foreach my $cyclog_file (@cyclog_files) {
-		    print $parent_sock ',' if (!$first_file);
-		    $first_file = 0;
-		    print $parent_sock "$cyclog_file";
-		}
-	    }
-	    print $parent_sock "\n"; # just a blank line if can't get any
+
+	print "DEBUG: parent received $request->{type} (id: $request->{request_id})\n" if ($debug_mode);
+
+	# Check timestamp to prevent replay attacks.
+	my $age = time() - $request->{timestamp};
+	if ($age > 60 || $age < -5) { # allow 60 second old, 5 seconds future
+	    warn "Request timestamp out of acceptable range: $age seconds\n";
+	    &send_error_response ("Request too old or timestamp invalid", $request->{request_id});
 	    next;
 	}
-	# Gzip. Copy to temp file for child process, return filename.
-	elsif ($req_type eq 'gunzip') {
-	    (my $temp_logfile) = &gunzip_logfile ($req_logfile, $temp_dir);
-	    chown ($reporter_uid, $reporter_gid, $temp_logfile);
-	    print $parent_sock "$temp_logfile\n";
-	    next;
+
+	# Process based on request type.
+	if ($request->{type} eq 'get-fd' ||
+	    $request->{type} eq 'get-fd-raw' ||
+	    $request->{type} eq 'get-mclog-fd') {
+
+	    &handle_fd_request ($request);
+	}
+	elsif ($request->{type} eq 'get-hash') {
+	    &handle_hash_request ($request);
+	}
+	elsif ($request->{type} eq 'get-journal') {
+	    &handle_journal_request ($request);
+	}
+	elsif ($request->{type} eq 'get-linux-pacct') {
+	    &handle_linux_pacct_request ($request);
+	}
+	elsif ($request->{type} eq 'get-mclog-files') {
+	    &handle_mclog_files_request ($request);
+	}
+	elsif ($request->{type} eq 'gunzip') {
+	    &handle_gunzip_request ($request);
+	}
+	else {
+	    &send_error_response ("Unknown request type", $request->{request_id});
 	}
     }
 }
 
+# Subroutine to handle file descriptor requests (privileged side).
+sub handle_fd_request {
+    my ($request) = @_;
+
+    my $logfile = $request->{params}{logfile};
+    my $open_mode = $request->{params}{raw_mode} ? '<:raw' : '<';
+
+    # Validate that logfile is in allowed list.
+    unless (&is_allowed_logfile ($logfile)) {
+	&send_error_response ("Logfile not in allowed list.");
+	return;
+    }
+
+    # Special case for cyclog.
+    if ($request->{type} eq 'get-mclog-fd') {
+	$logfile = $logfile . '/' . $request->{params}{filename};
+    }
+
+    # Path traversal check.
+    if ($logfile =~ /\.\./) {
+	&send_error_response ("Path traversal attempt", $request->{request_id});
+	return;
+    }
+
+    # Try to open the file.
+    if (open (my $log_fh, $open_mode, $logfile)) {
+	# Send response indicating that file descriptor will follow.
+	my $response = {
+	    status => RESP_FD_FOLLOWS,
+	    request_id => $request->{request_id},
+	    metadata => {
+		logfile => $logfile,
+		mode => $open_mode,
+	    }
+	};
+
+	&send_response ($response);
+
+	# Now send the file descriptor.
+	IO::FDPass::send (fileno ($parent_sock), fileno ($log_fh))
+	    or warn "Failed to send file descriptor for $logfile: $!\n";
+
+	close ($log_fh); # safe to close after send
+    }
+    else {
+	&send_error_response ("Cannot open $logfile: $!", $request->{request_id}, int ($!));
+    }
+}
+
+# Subroutine to handle hash requests (privileged side).
+# Not used for (and doesn't check allowed list properly) for cyclog/multilog.
+# If it becomes necessary, add get-mclog-hash and pass $cyclog_flag to
+# is_allowed_logfile.
+sub handle_hash_request {
+    my ($request) = @_;
+
+    my $logfile = $request->{params}{logfile};
+
+    unless (&is_allowed_logfile ($logfile)) {
+	&send_error_response ("Logfile not in allowed list.");
+	return;
+    }
+
+    my $hash = &first_log_line_sha256_digest ($logfile);
+
+    my $response = {
+	status => RESP_SUCCESS,
+	request_id => $request->{request_id},
+	data => $hash,
+    };
+
+    &send_response ($response);
+}
+
+# Subroutine to get Linux journal data (privileged side).
+sub handle_journal_request {
+    my ($request) = @_;
+
+    my $logfile = $request->{params}{logfile};
+    my $checktime = $request->{params}{checktime};
+
+    unless (&is_allowed_logfile ($logfile)) {
+	&send_error_response ("Logfile not allowed.", $request->{request_id});
+	return;
+    }
+
+    my ($temp_logfile, $new_checktime) = &read_linux_journal ($logfile, $checktime, $temp_dir);
+    chown ($reporter_uid, $reporter_gid, $temp_logfile);
+
+    my $response = {
+	status => RESP_SUCCESS,
+	request_id => $request->{request_id},
+	data => {
+	    temp_logfile => $temp_logfile,
+	    checktime => $new_checktime,
+	}
+    };
+
+    &send_response ($response);
+}
+
+# Get Linux process accounting logs (using lastcomm, deprecated; privileged side).
+sub handle_linux_pacct_request {
+    my ($request) = @_;
+
+    my $logfile = $request->{params}{logfile};
+    my $checktime = $request->{params}{checktime};
+    
+    unless (&is_allowed_logfile ($logfile)) {
+	&send_error_response ("Logfile not allowed.", $request->{request_id});
+	return;
+    }
+
+    my ($temp_logfile, $new_checktime) = &read_process_acct_log ($logfile, $checktime, $temp_dir);
+    chown ($reporter_uid, $reporter_gid, $temp_logfile);
+
+    my $response = {
+	status => RESP_SUCCESS,
+	request_id => $request->{request_id},
+	data => {
+	    temp_logfile => $temp_logfile,
+	    checktime => $new_checktime,
+	}
+    };
+
+    &send_response ($response);
+}
+
+# Get files in a multilog/cyclog directory (privileged side).
+sub handle_mclog_files_request {
+    my ($request) = @_;
+
+    my $logfile = $request->{params}{logfile};
+
+    unless (&is_allowed_logfile ($logfile)) {
+	&send_error_response ("Logfile not allowed.", $request->{request_id});
+	return;
+    }
+
+    my @cyclog_files = &get_cyclog_files ($logfile);
+
+    my $response = {
+	status => RESP_SUCCESS,
+	request_id => $request->{request_id},
+	data => \@cyclog_files,
+    };
+
+    &send_response ($response);
+}
+
+# Subroutine to handle gunzip (privileged side).
+sub handle_gunzip_request {
+    my ($request) = @_;
+
+    my $logfile = $request->{params}{logfile};
+
+    unless (&is_allowed_logfile ($logfile)) {
+	&send_error_response ("Logfile not allowed.", $request->{request_id});
+	return;
+    }
+
+    my $temp_logfile = &gunzip_logfile ($logfile, $temp_dir);
+    chown ($reporter_uid, $reporter_gid, $temp_logfile);
+
+    my $response = {
+	status => RESP_SUCCESS,
+	request_id => $request->{request_id},
+	data => $temp_logfile,
+    };
+
+    &send_response ($response);
+}
+
+# Subroutine to send response from priv to nonpriv.
+sub send_response {
+    my ($response) = @_;
+
+    my $response_json = encode_json ($response);
+    my $hmac = hmac_sha256_hex ($response_json, $HMAC_SECRET);
+
+    my $envelope = {
+	data => $response_json,
+	hmac => $hmac,
+    };
+
+    my $envelope_json = encode_json ($envelope);
+    my $len = pack ('N', length ($envelope_json));
+    print $parent_sock $len . $envelope_json;
+}
+
+# Subroutine to send an error response from priv to nonpriv.
+sub send_error_response {
+    my ($error_msg, $request_id, $errno) = @_;
+
+    my $response = {
+	status => RESP_ERROR,
+	request_id => $request_id,
+	error => $error_msg,
+    };
+
+    $response->{errno} = $errno if (defined ($errno));
+
+    &send_response ($response);
+}
+
+# For errors before we parse request_id (like HMAC failure), from priv to nonpriv.
+sub send_error_response_nohmac {
+    my ($error_msg) = @_;
+
+    my $response = {
+	status => RESP_ERROR,
+	error => $error_msg,
+    };
+
+    # Still send with HMAC even if we couldn't verify incoming HMAC,
+    # this allows legitimate clients to verify our response.
+    &send_response ($response);
+}
+
+# Subroutine to validate request format (privileged side).
+sub validate_request {
+    my ($request) = @_;
+
+    return 0 unless ref ($request) eq 'HASH';
+    return 0 unless $request->{version} == 1;
+    return 0 unless exists $request->{type};
+    return 0 unless exists $request->{params};
+    return 0 unless exists $request->{request_id};
+    return 0 unless exists $request->{timestamp};
+
+    # Validate request_id format.
+    return 0 unless $request->{request_id} =~ /^\d+\.\d+\.\d+$/;
+
+    # Validate timestamp is a number.
+    return 0 unless $request->{timestamp} =~ /^\d+$/;
+
+    # Check for path traversal in logfile name.
+    if ($request->{params}{logfile} && $request->{params}{logfile} =~ /\.\./) {
+	return 0;
+    }
+
+    return 1;
+}
+
+# Subroutine to verify that logfile is in permitted list from config (privileged side).
+sub is_allowed_logfile {
+    my ($logfile, $cyclog_file_flag) = @_;
+
+    #   For rotated and gzipped logs, strip off those suffixes.
+    if ($logfile =~ /^(.*)(\.\d(\.gz){0,1})$/) {
+	$logfile = $1;
+    }
+
+    return grep { $_ eq $logfile } @logfiles;
+}
+
+# Subroutine to generate a request_id (nonprivileged side).
+sub generate_request_id {
+    state $counter = 0;
+    return sprintf ("%d.%d.%d", $$, time(), $counter++);
+}
+
+# Subroutine to generate shared secret for HMAC (pre-privilege separation).
+sub generate_random_secret {
+    my $entropy = join (':',
+			$$,
+			time(),
+			rand(),
+			$^T,
+			$<,
+			$>,
+			$ENV{RANDOM_SEED} || '',
+	);
+
+    if (open (my $urandom, '<:raw', '/dev/urandom')) {
+	read ($urandom, my $random_bytes, 32);
+	close ($urandom);
+	$entropy .= unpack ('H*', $random_bytes);
+    }
+
+    # Hash it all together for shared secret between priv and nonpriv process.
+    return sha256_hex ($entropy);
+}
+
 # Subroutine to send a request to the privileged parent process and
-# get a response, for all except the file descriptor requests.
+# get a response, including for file descriptor requests.
 sub send_priv_req {
-    my ($req) = @_;
-    my ($return_result);
+    my ($req_type, $req_params) = @_;
+    my $MAX_RESPONSE_LENGTH = 1024 * 1024;;
 
     if (!$privsep_flag) {
 	die "Call to &send_priv_req when not using privilege separation.\n";
@@ -1784,80 +2066,170 @@ sub send_priv_req {
 	die "Call to &send_priv_req from privileged parent process.\n";
     }
 
-    print "DEBUG: child sending $req\n" if ($debug_mode);
-    print $child_sock "$req\n";
-    $return_result = <$child_sock>;
-    chomp ($return_result) if (defined ($return_result));
-    print "DEBUG: child received $return_result\n" if ($debug_mode && defined ($return_result));
-    return ($return_result);
+    my $request = {
+	version => 1,
+	type => $req_type,
+	params => $req_params,
+	request_id => generate_request_id(),
+	timestamp => time(),
+    };
+
+    # Serialize and sign.
+    my $request_json = encode_json ($request);
+    my $hmac = hmac_sha256_hex ($request_json, $HMAC_SECRET);
+
+    my $envelope = {
+	data => $request_json,
+	hmac => $hmac,
+    };
+
+    my $envelope_json = encode_json ($envelope);
+    my $len = pack ('N', length ($envelope_json));
+
+    print "DEBUG: child sending $req_type\n" if ($debug_mode);
+    print $child_sock $len . $envelope_json;
+
+    # Read response.
+    read ($child_sock, my $resp_len_bytes, 4)
+	or die "Failed to read response length after sending priv request.\n";
+    my $resp_len = unpack ('N', $resp_len_bytes);
+
+    die "Response to priv request too large.\n" if $resp_len > $MAX_RESPONSE_LENGTH;
+
+    read ($child_sock, my $resp_json, $resp_len)
+	or die "Failed to read response after sending priv request.\n";
+
+    # Verify response HMAC.
+    my $resp_envelope = decode_json ($resp_json);
+    my $resp_data = $resp_envelope->{data};
+    my $resp_hmac = $resp_envelope->{hmac};
+    my $expected_hmac = hmac_sha256_hex ($resp_data, $HMAC_SECRET);
+
+    unless ($resp_hmac eq $expected_hmac) {
+	die "Response HMAC verification failed!|n";
+    }
+    
+    my $response = decode_json ($resp_data);
+
+    print "DEBUG: child received response: $response->{status} (id: $response->{request_id})\n" if ($debug_mode);
+
+    # Verify request_id matches.
+    if ($response->{request_id} ne $request->{request_id}) {
+	die "Response request_id mismatch! Sent: $request->{request_id}, Received: $response->{request_id}\n";
+    }
+
+    return $response;
 }
 
-# Subroutine as wrapper for file open. Open if readable, send priv request
+# Wrapper for file descriptor requests (nonprivileged side).
+sub send_priv_req_for_fd {
+    my ($req_type, $req_params) = @_;
+
+    my $logfile = $req_params->{logfile};
+
+    my $response = &send_priv_req ($req_type, $req_params);
+    
+    if ($response->{status} eq RESP_FD_FOLLOWS) {
+	print "DEBUG: receiving file descriptor\n" if ($debug_mode);
+	my $fd = IO::FDPass::recv (fileno ($child_sock));
+	print "DEBUG: child received fd for $logfile\n" if ($debug_mode);
+
+	if ($fd < 0) {
+	    die "Failed to receive file descriptor.\n";
+	}
+
+	print "DEBUG: child opening fh for $logfile\n" if ($debug_mode);
+	open (my $fh, "+<&=$fd")
+	    or die "Cannot fdopen received file descriptor: $!\n";
+	return $fh;
+    }
+    elsif ($response->{status} eq RESP_ERROR) {
+	$! = $response->{errno} if (defined ($response->{errno}));
+	return;
+    }
+    else {
+	die "Unexpected response: $response->{status}\n";
+    }
+}
+
+# Wrapper for data requests (non-file descriptors; nonprivileged side).
+sub get_priv_data {
+    my ($req_type, $req_params) = @_;
+
+    my $response = &send_priv_req ($req_type, $req_params);
+
+    if ($response->{status} eq RESP_SUCCESS) {
+	return $response->{data};
+    }
+    elsif ($response->{status} eq RESP_ERROR) {
+	die "Privileged request failed: $response->{error}\n";
+    }
+    else {
+	die "Unexpected response: $response->{status}\n";
+    }
+}
+
+# Subroutine as wrapper for file open (nonprivileged side). Open if readable, send priv request
 # if using privilege separation and running unprivileged.
 # Tries the open instead of checking -r so that $! gets returned with
 # an appropriate error message.
 sub nonpriv_open_fh {
     my ($logfile, $cyclog_file_flag, $raw_mode_flag) = @_;
-    my ($log_fd, $log_fh, $open_mode, $mclog_dir, $mclogfile, $success_or_failure);
+    my ($log_fd, $log_fh, $mclog_dir, $mclogfile, $success_or_failure);
 
-    $open_mode = '<';
-    $open_mode = '<:raw' if ($raw_mode_flag);
+    my $open_mode = $raw_mode_flag ? '<:raw' : '<';
 
     print "DEBUG: &nonpriv_open_fh on $logfile\n" if ($debug_mode);
 
-    if (open ($log_fh, $open_mode, $logfile)) {
-	return $log_fh;
-    }
-    elsif ($privsep_flag && $nonpriv_flag) {
+    return $log_fh if (open ($log_fh, $open_mode, $logfile));
+
+    if ($privsep_flag && $nonpriv_flag) {
 	print "DEBUG: child sending priv req for fd for $logfile\n" if ($debug_mode);
+
+	my ($req_type, $params);
+
 	if ($cyclog_file_flag) {
-	    $mclog_dir = dirname ($logfile);
-	    $mclogfile = basename ($logfile);
-	    # raw_mode_flag ignored
-	    $success_or_failure = &send_priv_req ("get-mclog-fd:$mclog_dir:$mclogfile");
-	}
-	elsif ($raw_mode_flag) {
-	    $success_or_failure = &send_priv_req ("get-fd-raw:$logfile");
-	}
-	else {
-	    $success_or_failure = &send_priv_req ("get-fd:$logfile");
-	}
-	chomp ($success_or_failure);
-	if ($success_or_failure eq 'success') {
-	    print "DEBUG: child received success, now receiving fd for $logfile\n" if ($debug_mode);
-	    $log_fd = IO::FDPass::recv (fileno ($child_sock));
-	    print "DEBUG: child received fd for $logfile\n" if ($debug_mode);
-	    print "DEBUG: child opening fh for $logfile\n" if ($debug_mode);
-	    open ($log_fh, "+<&=$log_fd"); # if fails, will return undef and $!
-	    return $log_fh;
+	    my $mclog_dir = dirname ($logfile);
+	    my $mclogfile = basename ($logfile);
+	    $req_type = 'get-mclog-fd';
+	    $params = {
+		logfile => $mclog_dir,
+		filename => $mclogfile,
+	    };
 	}
 	else {
-	    $! = $success_or_failure;
+	    $req_type = $raw_mode_flag ? 'get-fd-raw' : 'get-fd';
+	    $params = {
+		logfile => $logfile,
+	    };
 	}
+
+	return &send_priv_req_for_fd ($req_type, $params);
     }
 
     return 0;
 }
 
-# Subroutine to get cyclog files in dir.
+# Subroutine to get cyclog files in dir (nonprivileged).
 # Could require privileges, but we try once without even with
 # privilege separation.
 sub get_cyclog_files {
     my ($logfile) = @_;
-    my (@cyclog_files, $priv_response);
-    
+    my (@cyclog_files);
+
     if (opendir (CYCLOG, $logfile)) {
 	@cyclog_files = grep (!/^\./, readdir (CYCLOG));
 	closedir (CYCLOG);
+	return (@cyclog_files);
     }
     elsif ($privsep_flag && $nonpriv_flag) {
-	$priv_response = &send_priv_req ("get-mclogfiles:$logfile");
-	if (defined ($priv_response)) {
-	    @cyclog_files = split (/,/, $priv_response);
-	}
+	my $files_ref = &get_priv_data ('get-mclogfiles', { logfile => $logfile });
+	@cyclog_files = @$files_ref;
+	return (@cyclog_files);
     }
 
-    return (@cyclog_files);
+    # Failed.
+    return ();
 }
 
 ## Main log checker.
@@ -2129,7 +2501,7 @@ sub gunzip_logfile {
 
     if (!-r $logfile &&
 	$privsep_flag && $nonpriv_flag) {
-	$temp_logfile = &send_priv_req ("gunzip:$logfile");
+	$temp_logfile = &get_priv_data ('gunzip', { logfile => $logfile });
 	return ($temp_logfile);
     }
 
@@ -2164,7 +2536,7 @@ sub first_log_line_sha256_digest {
 
     # Otherwise, go get it: priv case, gzip case, unpriv case.
     if (!-r $logfile && $privsep_flag && $nonpriv_flag) {
-	$sha256_digest = &send_priv_req ("get-hash:$logfile");
+	$sha256_digest = &get_priv_data ('get-hash', { logfile => $logfile });
 	return ($sha256_digest);
     }
     elsif (&is_gzip ($logfile)) {
@@ -2198,6 +2570,7 @@ sub first_log_line_sha256_digest {
 # DATE_STRING = standard syslog format
 # DATE_STRING2 = process accounting log format
 # RFC3339_date_string = RFC3339, newsyslog log rotation format
+# requires setting $timezone manually below
 sub first_log_line_time {
     my ($logfile) = @_;
     my ($first_line, $log_time, $date);
@@ -2205,7 +2578,7 @@ sub first_log_line_time {
     my $DATE_STRING2 = '\w{3}\s\w{3}\s{1,2}\d{1,2}\s\d{2}:\d{2}:\d{2}';
     my $WEB_DATE_STRING = '\[\w{3}\s\w{3}\s\d{1,2}\s\d{2}:\d{2}:\d{2}\.\d{6}\s\d{4}\]';
     my $RFC3339_date_string = '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z';
-    my $timezone = $TIME_ZONE;
+    my $timezone = 'MST';
     my $rfc3339_timezone = 'UTC';
 
     if (open (LOG, '<', $logfile)) {
@@ -2599,9 +2972,10 @@ sub read_process_acct_log {
     my ($req_response); # for privsep
 
     if ($^O eq 'linux' && $privsep_flag && $nonpriv_flag) {
-	$req_response = &send_priv_req ("get-linux-pacct:$logfile:$checktime");
-	if (defined ($req_response) && $req_response =~ /,/) {
-	    ($temp_logfile, $new_checktime) = split (/,/, $req_response);
+	$req_response = &get_priv_data ('get-linux-pacct', { logfile => $logfile, checktime => $checktime });
+	if (defined ($req_response)) {
+	    $temp_logfile = $req_response->{temp_logfile};
+	    $new_checktime = $req_response->{checktime};
 	    return ($temp_logfile, $new_checktime);
 	}
 	&send_error ($logfile, "Received unexpected response from privileged parent process trying to get Linux process accounting from $logfile.");
@@ -2747,16 +3121,11 @@ sub read_linux_journal {
     my (@time_components, $time_string, $full_time);
     my @selection_args;
     my $NO_ENTRIES = '-- No entries --';
-    my $req_response; # for privilege separation
+    my $result; # for privilege separation
 
     if ($privsep_flag && $nonpriv_flag) {
-	$req_response = &send_priv_req ("get-journal:$logfile:$checktime");
-	if (defined ($req_response) && $req_response =~ /,/) {
-	    ($temp_logfile, $new_checktime) = split (/,/, $req_response);
-	    return ($temp_logfile, $new_checktime);
-	}
-	&send_error ($logfile, "Received unexpected response from privileged parent process trying to get Linux journal info from $logfile.");
-	exit; # or just return?
+	$result = &get_priv_data ('get-journal', { logfile => $logfile, checktime => $checktime });
+	return ($result->{temp_logfile}, $result->{checktime});
     }
 
     # Create temp file.
