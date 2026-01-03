@@ -12,11 +12,14 @@ Future releases in 2026 will be signed with https://www.discord.org/lippard/soft
 
 Current version is reportnew-1.28a of 1 January 2026.
 
-This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux) and
-Privileges::Drop (libprivileges-drop-perl on Linux), both in CPAN. Privileges::Drop fails with perl 5.34.1 which is the release on Tahoe 26.1, but
-works properly with perl 5.40.2 which is the current stable Homebrew release. Workarounds are either use the Homebrew perl or patch Privileges::Drop
-on the lines beginning with my %GIDHash and my %EGIDHash to insert "grep { $_ != 4294967295 }" immediately before "split(\s/," in each line, as the
-problem is that setgid in perl 5.34.1 ends up putting a -1 into $GID and $EGID (which is 4294967295 as an unsigned 32-bit integer).
+This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux),
+Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
+JSON::PP. The non-standard moduels are also on CPAN.
+
+Privileges::Drop fails with perl 5.34.1 which is the release on Tahoe 26.1, but works properly with perl 5.40.2 which is the current stable Homebrew
+release. Workarounds are either use the Homebrew perl or patch Privileges::Drop on the lines beginning with my %GIDHash and my %EGIDHash to insert
+"grep { $_ != 4294967295 }" immediately before "split(\s/," in each line, as the problem is that setgid in perl 5.34.1 ends up putting a -1 into $GID
+and $EGID (which is 4294967295 as an unsigned 32-bit integer).
 
 A sample macOS PLIST for /Library/LaunchDaemons (org.discord.reportnew.plist) is supplied for running as root with privilege separation (be sure to specify "privsep: yes" in
 the config file, or alternatively add a -p option in the arguments list in the PLIST file); it can also run as an unprivileged user if
@@ -105,4 +108,35 @@ To monitor process accounting logs to identify unusual activity from service acc
   
 and so on. The first set of directives will cause alerts for unknown users and the rest for unexpected activity by known users.
 
+Quickstart for privilege separation support:
+OpenBSD: pkg_add p5-IO-FDPass p5-Privileges-Drop p5-JSON-MaybeXS
+Debian: apt-get install libio-fdpass-perl libprivileges-drop-perl libjson-maybexs-perl
+FreeBSD: pkg install p5-IO-FDPass p5-Privileges-Drop p5-JSON-MaybeXS
+CPAN: cpanm IO::FDPass Privileges::Drop JSON::MaybeXS
 
+Create user _reportnew and group _reportnew
+
+Set privsep: yes in reportnew.conf
+
+Quickstart for process accounting support:
+OpenBSD:
+As root: touch /var/account/acct; accton
+Verify with: lastcomm
+Keeps 5 days by default, will rotate automatically
+
+Debian:
+As root: touch /var/log/account/pacct; accton
+Verify with: lastcomm
+Keeps 30 days by default, will rotate automatically.
+
+On macOS:
+As root (admin user, with sudo): sudo touch /var/account/acct; sudo accton
+Install rotateacct.sh into /usr/local/bin
+Install org.discord.reportnew.plist and org.discord.rotateacct.plist into /Library/LaunchDaemons
+sudo launchctl load -w org.discord.reportnew.plist
+sudo launchctl load -w org.discord.rotateacct.plist
+Verify with: lastcomm (may require reboot)
+Keeps forever and does not rotate by default, with org.discord.retateacct.plist, will
+keep 5 days and rotate automatically.
+(Requires postfix configuration for email delivery: minimal change is to update myhostname
+and set relayhost in /etc/postfix/main.cf to send email off-host.)
