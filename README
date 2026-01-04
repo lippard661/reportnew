@@ -9,11 +9,11 @@ Now uses and requires Signify.pm for signed include files.
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.29.tgz is a Legion of Dynamic Discord signify-signed
+reportnew-1.29a.tgz is a Legion of Dynamic Discord signify-signed
 OpenBSD package. Signify public key is
 https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-Current version is reportnew-1.29 of 3 January 2026.
+Current version is reportnew-1.29a of 4 January 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and
 Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl
@@ -21,14 +21,14 @@ on Linux), Privileges::Drop (libprivileges-drop-perl on Linux), and
 either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but
 slower module JSON::PP. The non-standard modules are also on CPAN.
 
-Privileges::Drop fails with perl 5.34.1 which is the
-release on Tahoe 26.1, but works properly with perl 5.40.2 which is
-the current stable Homebrew release. Workarounds are either use the
-Homebrew perl or patch Privileges::Drop on the lines beginning with my
-%GIDHash and my %EGIDHash to insert "grep { $_ != 4294967295 }"
-immediately before "split(\s/," in each line, as the problem is that
-setgid in perl 5.34.1 ends up putting a -1 into $GID and $EGID (which
-is 4294967295 as an unsigned 32-bit integer).
+Privileges::Drop fails with perl 5.34.1 which is the release on macOS
+Tahoe 26.1, but works properly with perl 5.40.2 which is the current
+stable Homebrew release. Workarounds are either use the Homebrew perl
+or patch Privileges::Drop on the lines beginning with my %GIDHash and
+my %EGIDHash to insert "grep { $_ != 4294967295 }" immediately before
+"split(\s/," in each line, as the problem is that setgid in perl
+5.34.1 ends up putting a -1 into $GID and $EGID (which is 4294967295
+as an unsigned 32-bit integer).
 
 A sample macOS PLIST for /Library/LaunchDaemons
 (org.discord.reportnew.plist) is supplied for running as root with

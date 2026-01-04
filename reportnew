@@ -156,6 +156,10 @@
 #    when invoking sendmail, use chomp instead of chop, create temp dir
 #    once per execution, set umask so all created files are only readable
 #    by root user, remove tai64nlocal command method for TAI64 log files.
+#    Often used ChatGPT for identifying possible vulnerability patterns
+#    and for revision assistance from here on, helpful at suggesting
+#    patterns but often flawed in implementation details (and terrible
+#    at bug finding).
 # Modified 12 November 2025 by Jim Lippard to use $macos_format instead of
 #    split for macOS process accounting logs, since command names can have
 #    spaces in them.
@@ -177,7 +181,7 @@
 #    then set up a root listener and fork a child that drops privileges
 #    and runs as _reportnew:_reportnew, sending requests to the parent
 #    when root access is required to open files, get first line file hashes,
-#    or perform Linux journalctl commands.
+#    or perform Linux journalctl commands. ChatGPT helped refactor here.
 # Modified 30 November 2025 by Jim Lippard to add privsep directive to
 #    reportnew.conf, fix bugs in privsep, add _reportnew user to process
 #    accounting sample configs.
@@ -191,17 +195,22 @@
 #    for OpenBSD and macOS and make direct process accounting file parsing
 #    work on Linux and macOS. Linux was easy, macOS less so.
 # Modified 21 December 2025 by Jim Lippard to fix bugs in Linux handling of
-#    checktime in process accounting.
+#    checktime in process accounting. ChatGPT was not helpful.
 # Modified 22 December 2025 by Jim Lippard to read larger block of records
 #    in process accounting (all platforms) to improve efficiency.
 # Modified 24 December 2025 by Jim Lippard to use SHA256 hash of first
 #    record to verify that the same file is being processed across runs.
 # Modified 31 December 2025 by Jim Lippard to precompile match/exclude
-#    regexes for efficiency.
+#    regexes for efficiency. ChatGPT provided assistance.
 # Modified 1 January 2026 by Jim Lippard to fix an edge case in session
-#    handling with rotated logs.
+#    handling with rotated logs. ChatGPT couldn't find this.
 # Modified 2 January 2026 by Jim Lippard to formalize interprocess comms
-#    using JSON and HMACs. Add &require_module.
+#    using JSON and HMACs. Add &require_module. Used Claude to assist
+#    with this refactoring. The HMACs are really unnecessary for any feasible
+#    threat model given what this script does, but was fun.
+# Modified 3 January 2026 by Jim Lippard to make replay attack mitigation
+#    stricter. Used variant of ChatGPT recommendation. Again this is likely
+#    massive overkill for this script.
 #
 #
 # To Do:
@@ -290,7 +299,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.29 of 3 January 2026';
+my $VERSION = 'reportnew 1.29a of 4 January 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1696,7 +1705,7 @@ sub priv_listener {
 	my $msg_len = unpack ('N', $len_bytes);
 	if ($msg_len > $MAX_REQUEST_LENGTH || $msg_len < 1) {
 	    warn "Invalid message length: $msg_len\n";
-	    &send_error_response ("Invalid message length.");
+	    &send_error_response_nohmac ("Invalid message length.");
 	    next;
 	}
 
@@ -1733,12 +1742,28 @@ sub priv_listener {
 
 	print "DEBUG: parent received $request->{type} (id: $request->{request_id})\n" if ($debug_mode);
 
-	# Check timestamp to prevent replay attacks.
+	# Reject stale or future requests (tight window).
 	my $age = time() - $request->{timestamp};
-	if ($age > 60 || $age < -5) { # allow 60 second old, 5 seconds future
+	if ($age > 15 || $age < -5) { # allow 15 second old, 5 seconds future
 	    warn "Request timestamp out of acceptable range: $age seconds\n";
 	    &send_error_response ("Request too old or timestamp invalid", $request->{request_id});
 	    next;
+	}
+
+	# Replay protection: reject duplicate request_id.
+	state %seen_request_ids;
+	if (exists $seen_request_ids{$request->{request_id}}) {
+	    &send_error_response ("Replay detected for request_id", $request->{request_id});
+	    next;
+	}
+
+	# Record current request_id.
+	$seen_request_ids{$request->{request_id}} = time();
+
+	# Prune old request_ids.
+	for my $rid (keys (%seen_request_ids)) {
+	    delete $seen_request_ids{$rid}
+	    if $seen_request_ids{$rid} < time() - 30;
 	}
 
 	# Process based on request type.
@@ -1764,7 +1789,7 @@ sub priv_listener {
 	    &handle_gunzip_request ($request);
 	}
 	else {
-	    &send_error_response ("Unknown request type", $request->{request_id});
+	    &send_error_response ("Unknown request type.", $request->{request_id});
 	}
     }
 }
@@ -1974,7 +1999,8 @@ sub send_error_response {
     &send_response ($response);
 }
 
-# For errors before we parse request_id (like HMAC failure), from priv to nonpriv.
+# For errors before we parse request_id (like HMAC failure),
+# from priv to nonpriv.
 sub send_error_response_nohmac {
     my ($error_msg) = @_;
 
@@ -1991,22 +2017,25 @@ sub send_error_response_nohmac {
 # Subroutine to validate request format (privileged side).
 sub validate_request {
     my ($request) = @_;
+    my $REQUEST_ID_MAX_LENGTH = 128;
 
     return 0 unless ref ($request) eq 'HASH';
     return 0 unless $request->{version} == 1;
     return 0 unless exists $request->{type};
-    return 0 unless exists $request->{params};
+    return 0 unless ref ($request->{params}) eq 'HASH';
     return 0 unless exists $request->{request_id};
     return 0 unless exists $request->{timestamp};
 
-    # Validate request_id format.
-    return 0 unless $request->{request_id} =~ /^\d+\.\d+\.\d+$/;
+    # Validate request_id but allowing for future format changes
+    return 0 unless length ($request->{request_id}) <= $REQUEST_ID_MAX_LENGTH;
+    return 0 unless $request->{request_id} =~ /^[\w\.-]+$/a;
 
     # Validate timestamp is a number.
     return 0 unless $request->{timestamp} =~ /^\d+$/;
 
-    # Check for path traversal in logfile name.
-    if ($request->{params}{logfile} && $request->{params}{logfile} =~ /\.\./) {
+    # Check for path traversal or nulls in logfile name.
+    if ($request->{params}{logfile} && $request->{params}{logfile} =~ /\.\./ ||
+	$request->{params}{logfile} =~ /\0/) {
 	return 0;
     }
 
@@ -2028,7 +2057,8 @@ sub is_allowed_logfile {
 # Subroutine to generate a request_id (nonprivileged side).
 sub generate_request_id {
     state $counter = 0;
-    return sprintf ("%d.%d.%d", $$, time(), $counter++);
+    my $rand = unpack ("H8", pack ("N", rand(0xffffffff)));
+    return sprintf ("%d.%d.%s.%d", $$, time(), $rand, $counter++);
 }
 
 # Subroutine to generate shared secret for HMAC (pre-privilege separation).
@@ -2140,7 +2170,7 @@ sub send_priv_req_for_fd {
 
 	print "DEBUG: child opening fh for $logfile\n" if ($debug_mode);
 	open (my $fh, "+<&=$fd")
-	    or die "Cannot fdopen received file descriptor: $!\n";
+	    or die "Cannot fdopen received file descriptor for $logfile: $!\n";
 	return $fh;
     }
     elsif ($response->{status} eq RESP_ERROR) {
@@ -2162,10 +2192,10 @@ sub get_priv_data {
 	return $response->{data};
     }
     elsif ($response->{status} eq RESP_ERROR) {
-	die "Privileged request failed: $response->{error}\n";
+	die "Privileged request $req_type failed for $req_params->{logfile}: $response->{error}\n";
     }
     else {
-	die "Unexpected response: $response->{status}\n";
+	die "Unexpected response to $req_type request for $req_params->{logfile}: $response->{status}\n";
     }
 }
 
