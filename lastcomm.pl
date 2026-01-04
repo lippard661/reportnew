@@ -14,6 +14,8 @@
 # Modified 25 December 2025 by Jim Lippard to add Linux format options
 #   --pid (works on OpenBSD, not macOS) and --show-paging (-p) (Linux
 #   only). There are more Linux options that could be added.
+# Modified 4 January 2026 by Jim Lippard to remove & from subroutine
+#   calls.
 
 # Optional arguments to match user, device/tty, or command, multiple
 # args treated as OR, not AND.
@@ -31,7 +33,7 @@ use if $^O eq 'openbsd', 'OpenBSD::Unveil';
 my $DEFAULT_LOG = '/var/account/acct'; # BSD
 $DEFAULT_LOG = '/var/log/account/pacct' if ($^O eq 'linux');
 
-my $AHZ = &accounting_hz;
+my $AHZ = accounting_hz();
 # from utmp.h UT_
 my $UT_NAMESIZE = 32;
 my $LINUX_UT_NAMESIZE = 8;
@@ -109,11 +111,11 @@ else { # default
 if ($^O eq 'darwin') {
     $UT_NAMESIZE = $LINUX_UT_NAMESIZE;
     $COMMPIDSIZE = $MACOS_COMMPIDSIZE;
-    &build_devname_cache;
+    build_devname_cache();
 }
 
 if ($^O eq 'openbsd') {
-    &build_devname_cache;
+    build_devname_cache();
     pledge (@PROMISES) || die "Could not pledge promises. $!\n";
     unveil ($logfile, 'r');
     unveil ();
@@ -142,19 +144,19 @@ while ($acctline = <ACCTLOG>) {
     $user = getpwuid ($uid) || $uid;
     $commpid = "$command\[$pid\]";
     $commpid = $command if ($linux_format || $^O eq 'darwin');
-    $time = &expand ($utime) + &expand ($stime);
-    $delta = &expand ($etime) / $AHZ;
-    $tty_name = &getdev ($tty);
-    if ($#ARGV == -1 || &requested (@ARGV)) {
+    $time = expand ($utime) + expand ($stime);
+    $delta = expand ($etime) / $AHZ;
+    $tty_name = getdev ($tty);
+    if ($#ARGV == -1 || requested (@ARGV)) {
 	printf "$output_format",
 	    $COMMPIDSIZE, $COMMPIDSIZE, $commpid,
-	    $FLAGSIZE, $FLAGSIZE, &flagbits ($flag),
+	    $FLAGSIZE, $FLAGSIZE, flagbits ($flag),
 	    $UT_NAMESIZE, $UT_NAMESIZE, $user,
 	    $UT_LINESIZE, $UT_LINESIZE, $tty_name,
 	    $time / $AHZ, ctime ($btime) unless ($paging_flag);
 	printf "$output_format",
 	    $COMMPIDSIZE, $COMMPIDSIZE, $commpid,
-	    $FLAGSIZE, $FLAGSIZE, &flagbits ($flag),
+	    $FLAGSIZE, $FLAGSIZE, flagbits ($flag),
 	    $minflt, $majflt, $swaps,
 	    $time / $AHZ, ctime ($btime) if ($paging_flag);
 	printf " (%1.0f:%02.0f:%05.2f)",
@@ -261,7 +263,7 @@ sub getdev {
 	$dev_name = $devname_cache{$dev};
     }
     elsif ($^O eq 'linux') {
-	$dev_name = &linux_device ($dev);
+	$dev_name = linux_device ($dev);
     }
     else {
 	$dev_name = '??';
