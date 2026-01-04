@@ -62,7 +62,7 @@
 #    configurable.
 # Modified 22 February 2020 by Jim Lippard to look at rotated logs if a
 #    log rotation has occurred since our last check of a standard logfile.
-# Modified 23 February 2020 by Jim Lippard to give &match_line the option
+# Modified 23 February 2020 by Jim Lippard to give match_line the option
 #    to return the first capture group instead of 1 for a match.
 # Modified 24 February 2020 by Jim Lippard to fix bug in checking for first
 #    line date stamps which was causing repeat log reports.
@@ -72,7 +72,7 @@
 # Modified 27 February 2020 by Jim Lippard to use SHA256 digest of first line
 #    of log instead of parsing dates.
 # Modified 28 February 2020 by Jim Lippard to assume a single digit number
-#    of rotated logs in &identify_rotated_logs.
+#    of rotated logs in identify_rotated_logs.
 # Modified 2 September 2023 by Jim Lippard to read and write size file
 #    before and after each log processed, to set email_sender properly
 #    for errors that occur before it is defined, and to track current
@@ -205,12 +205,14 @@
 # Modified 1 January 2026 by Jim Lippard to fix an edge case in session
 #    handling with rotated logs. ChatGPT couldn't find this.
 # Modified 2 January 2026 by Jim Lippard to formalize interprocess comms
-#    using JSON and HMACs. Add &require_module. Used Claude to assist
+#    using JSON and HMACs. Add require_module. Used Claude to assist
 #    with this refactoring. The HMACs are really unnecessary for any feasible
 #    threat model given what this script does, but was fun.
 # Modified 3 January 2026 by Jim Lippard to make replay attack mitigation
 #    stricter. Used variant of ChatGPT recommendation. Again this is likely
 #    massive overkill for this script.
+# Modified 4 January 2026 by Jim Lippard to not require Signify unless
+#    signed files are used. Remove & on subroutine calls.
 #
 #
 # To Do:
@@ -247,7 +249,6 @@ use if $^O ne 'openbsd', 'File::Temp', qw( :mktemp tempfile );
 use Getopt::Std;
 use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
 use POSIX qw( ctime fmod strftime sysconf _SC_CLK_TCK );
-use Signify;
 use Sys::Hostname;
 use Time::HiRes qw( gettimeofday );
 use Time::ParseDate;
@@ -270,7 +271,7 @@ use if $^O eq 'openbsd', 'OpenBSD::Pledge';
 ### Constants.
 
 # for process accounting
-my $AHZ = &accounting_hz;
+my $AHZ = accounting_hz();
 use constant SECSPERHOUR => 60 * 60;
 use constant SECSPERMIN => 60;
 
@@ -440,6 +441,10 @@ BEGIN {
     delete @ENV{qw(IFS CDPATH ENV BASH_ENV PERL5LIB LD_PRELOAD LD_LIBRARY_PATH)};
 }
 
+# See if Signify is available.
+my $have_signify = 0;
+$have_signify = 1 if (require_module ('Signify', qw( signify_error )));
+
 # If on OpenBSD, use pledge and unveil. Do as much as possible before
 # parsing the config, then finish unveiling after the config is parsed.
 # We also build %devname_cache for OpenBSD before unveiling.
@@ -459,7 +464,7 @@ if ($^O eq 'openbsd') {
 	    @PRIVSEP_CHILD_PROMISES) || die "Cannot pledge promises. $!\n";
 
     # Build %devname_cache on OpenBSD.
-    &build_devname_cache if ($^O eq 'openbsd');
+    build_devname_cache() if ($^O eq 'openbsd');
     
     # Needed to parse dates on process accounting logs.
     unveil ($ZONEINFO_DIR, 'r');
@@ -485,7 +490,7 @@ if ($^O eq 'openbsd') {
     unveil ('/dev/null', 'rw');
 }
 
-&parse_config ($config_file);
+parse_config ($config_file);
 
 if ($config_check) {
     print "No issues identified in config file.\n";
@@ -493,7 +498,7 @@ if ($config_check) {
 }
 
 # Build %devname_cache on macOS.
-&build_devname_cache if ($^O eq 'darwin');
+build_devname_cache() if ($^O eq 'darwin');
 
 # Determine if we're going to use privilege separation.
 # Conditions: If running as root and _reportnew user and group exist.
@@ -518,18 +523,18 @@ if ($use_privsep && $user eq 'root' &&
     unveil ('/usr/libdata/perl5', 'r') if ($^O eq 'openbsd'); # for JSON::PP
 
     # Load required modules.
-    &require_module ('IO::FDPass')
+    require_module ('IO::FDPass')
 	or die "Could not require IO::FDPass. $@\n";
-    &require_module ('Privileges::Drop')
+    require_module ('Privileges::Drop')
 	or die "Could not require Privileges::Drop. $@\n";
 
     # Try to load JSON (with fallback).
     my $json_loaded = 0;
-    if (&require_module ('JSON::MaybeXS', qw(encode_json decode_json))) {
+    if (require_module ('JSON::MaybeXS', qw(encode_json decode_json))) {
 	$json_loaded = 1;
 	print "DEBUG: Using JSON::MaybeXS\n" if ($debug_mode);
     }
-    elsif (&require_module ('JSON::PP', qw(encode_json decode_json))) {
+    elsif (require_module ('JSON::PP', qw(encode_json decode_json))) {
 	$json_loaded = 1;
 	print "DEBUG: Using JSON::PP\n" if ($debug_mode);
     }
@@ -576,7 +581,7 @@ if (!-e $size_file) {
 	close (SIZEFILE);
     }
     else {
-	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot create size file. $!");
+	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot create size file. $!");
     }
     # If using privilege separation, give _reportnew:_reportnew ownership.
     chown ($reporter_uid, $reporter_gid, $size_file) if ($privsep_flag);
@@ -630,7 +635,7 @@ if ($privsep_flag) {
 	chown ($reporter_uid, $reporter_gid, $temp_dir);
 
 	# Listen for requests that require privileges.
-	&priv_listener;
+	priv_listener();
 
 	# Shutdown after EOF.
 	exit;
@@ -658,9 +663,9 @@ foreach $logfile (@logfiles) {
 
     # Read all logs from size file, skip this one if it's already
     # being processed, otherwise mark this one as being processed.
-    &read_size_file ($size_file);
-    next if ($log_processing_pid{$logfile} != 0 && &pid_exists ($log_processing_pid{$logfile}));
-    &write_size_file ($size_file, $logfile, $LOG_PROCESSING_START); # save PID
+    read_size_file ($size_file);
+    next if ($log_processing_pid{$logfile} != 0 && pid_exists ($log_processing_pid{$logfile}));
+    write_size_file ($size_file, $logfile, $LOG_PROCESSING_START); # save PID
 
     if ($logfile eq $PROCESS_ACCOUNTING_LOG) {
 	# For process accounting logs, we get the log checktime from this
@@ -672,7 +677,7 @@ foreach $logfile (@logfiles) {
 	if (!$USE_LASTCOMM) {
 	    ($temp_logfile, $log_size{$logfile}, $log_mtime{$logfile},
 	     $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
-		&direct_read_process_acct_log ($PROCESS_ACCOUNTING_LOG,
+		direct_read_process_acct_log ($PROCESS_ACCOUNTING_LOG,
 					       $log_size{$logfile},
 					       $log_checktime{$logfile},
 					       $log_sha256_digest{$logfile},
@@ -684,7 +689,7 @@ foreach $logfile (@logfiles) {
 	# putting it into chronological order instead of reverse.
 	# Runs on the privileged side with privsep on Linux.
 	else {
-	    ($temp_logfile, $log_checktime{$logfile}) = &read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
+	    ($temp_logfile, $log_checktime{$logfile}) = read_process_acct_log ($PROCESS_ACCOUNTING_LOG, $log_checktime{$logfile}, $temp_dir);
 	}
 	# Then use check_logfile on the temp file, disregarding the size,
 	# which is set to 0, just as for files in cyclogs.
@@ -692,7 +697,7 @@ foreach $logfile (@logfiles) {
 	my $ignore_mtime; # using the mtime from the read, not the check.
 	my $ignore_size; # using the log size from the read, not the check
 	($ignore_size, $ignore_mtime, $ignore_checktime, $log_sha256_digest{$logfile}) =
-	    &check_logfile ($temp_logfile, 0, $log_mtime{$logfile},
+	    check_logfile ($temp_logfile, 0, $log_mtime{$logfile},
 			    $log_checktime{$logfile},
 			    $log_sha256_digest{$logfile},
 			    $match_hash_ref{$logfile},
@@ -715,12 +720,12 @@ foreach $logfile (@logfiles) {
 	#    journalctl -t <identifier> --since <last_check_time>
 	# journal syslog-facility <facility>
 	#    journalctl --facility=<facility> --since <last_check_time>
-	($temp_logfile, $log_checktime{$logfile}) = &read_linux_journal ($logfile, $log_checktime{$logfile}, $temp_dir);
+	($temp_logfile, $log_checktime{$logfile}) = read_linux_journal ($logfile, $log_checktime{$logfile}, $temp_dir);
 	# Then use check_logfile on the temp file, disregarding the size,
 	# which is set to 0, just as for files in cyclogs.
 	my $ignore_checktime;
 	($log_size{$logfile}, $log_mtime{$logfile}, $ignore_checktime, $log_sha256_digest{$logfile}) =
-	    &check_logfile ($temp_logfile, 0, $log_mtime{$logfile},
+	    check_logfile ($temp_logfile, 0, $log_mtime{$logfile},
 			    $log_checktime{$logfile}, $log_sha256_digest{$logfile},
 			    $match_hash_ref{$logfile},
 			    $exclude_hash_ref{$logfile}, $action_hash_ref{$logfile}, $LOG_TYPE_LINUX_JOURNAL, $logfile);
@@ -740,7 +745,7 @@ foreach $logfile (@logfiles) {
 	# if its first line is newer than our last check we check the entire
 	# thing, otherwise we presume it's the same logfile we last checked
 	# and we start where we left off.
-	($rotated_logs_flag, @rotated_logs) = &identify_rotated_logs ($logfile, $log_checktime{$logfile});
+	($rotated_logs_flag, @rotated_logs) = identify_rotated_logs ($logfile, $log_checktime{$logfile});
 	# We have rotated logs we need to examine.
 	if ($rotated_logs_flag) {
 	    $processed_rotated_log_flag = 0;
@@ -755,12 +760,12 @@ foreach $logfile (@logfiles) {
 		    # If first line is different from what we last saw,
 		    # then start from the beginning.
 		    if ($log_sha256_digest{$logfile} eq '' ||
-			&first_log_line_sha256_digest ($rotated_logfile) ne
+			first_log_line_sha256_digest ($rotated_logfile) ne
 			$log_sha256_digest{$logfile}) {
 			$log_size{$logfile} = 0;
 		    }
 		    # We don't look at return values here.
-			&check_logfile ($rotated_logfile, $log_size{$logfile}, $log_mtime{$logfile},
+			check_logfile ($rotated_logfile, $log_size{$logfile}, $log_mtime{$logfile},
 					$log_checktime{$logfile},
 					$log_sha256_digest{$logfile},
 					$match_hash_ref{$logfile},
@@ -772,7 +777,7 @@ foreach $logfile (@logfiles) {
 		}
 		else {
 		    # Again, not looking at return values.
-		    &check_logfile ($rotated_logfile, 0, 0, 0,
+		    check_logfile ($rotated_logfile, 0, 0, 0,
 				    $log_sha256_digest{$logfile},
 				    $match_hash_ref{$logfile},
 				    $exclude_hash_ref{$logfile},
@@ -783,13 +788,13 @@ foreach $logfile (@logfiles) {
 		# Set log_size to 0 for the regular logfile since we need to
 		# look at the whole thing, and update first line SHA256.
 		$log_size{$logfile} = 0;
-		$log_sha256_digest{$logfile} = &first_log_line_sha256_digest ($logfile);
+		$log_sha256_digest{$logfile} = first_log_line_sha256_digest ($logfile);
 	    } # End processing of rotated logs.
 	} # Standard logfile check.
 	
 	($log_size{$logfile}, $log_mtime{$logfile},
 	 $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
-	    &check_logfile ($logfile, $log_size{$logfile},
+	    check_logfile ($logfile, $log_size{$logfile},
 			    $log_mtime{$logfile},
 			    $log_checktime{$logfile},
 			    $log_sha256_digest{$logfile},
@@ -799,12 +804,12 @@ foreach $logfile (@logfiles) {
 			    $LOG_TYPE_STANDARD_LOG);
     }
     else { # cyclog or multilog
-	@cyclog_files = &get_cyclog_files ($logfile);
+	@cyclog_files = get_cyclog_files ($logfile);
 	if ($!) {
-	    &send_error ($logfile, "Could not open cyclog/multilog $logfile. $!");
+	    send_error ($logfile, "Could not open cyclog/multilog $logfile. $!");
 	}
 	elsif (!@cyclog_files) {
-	    &send_error ($logfile, "Empty cyclog/multilog $logfile. $!");
+	    send_error ($logfile, "Empty cyclog/multilog $logfile. $!");
 	}
 	$got_first_cyclog_file = 0;
 	$old_log_checktime = $log_checktime{$logfile};
@@ -812,7 +817,7 @@ foreach $logfile (@logfiles) {
 	    next if ($cyclog_file eq 'lock'); # multilog format
 	    next if ($cyclog_file eq 'state'); # multilog format
 	    $cyclog_file = $logfile . '/' . $cyclog_file;
-	    ($size, $mtime) = &get_size ($cyclog_file);
+	    ($size, $mtime) = get_size ($cyclog_file);
 	    next if ($mtime < $old_log_checktime);
 	    # If we get here, then we've found the oldest changed file
 	    # (since we last checked).
@@ -820,7 +825,7 @@ foreach $logfile (@logfiles) {
 	    if ($got_first_cyclog_file == 1) {
 		($log_size{$logfile}, $log_mtime{$logfile},
 		 $log_checktime{$logfile}, $log_sha256_digest{$logfile}) =
-		    &check_logfile ($cyclog_file, $log_size{$logfile},
+		    check_logfile ($cyclog_file, $log_size{$logfile},
 				    $log_mtime{$logfile},
 				    $old_log_checktime,
 				    $log_sha256_digest{$logfile},
@@ -833,7 +838,7 @@ foreach $logfile (@logfiles) {
 	    else {
 		($log_size{$logfile}, $log_mtime{$logfile},
 		 $log_checktime{$logfile}) =
-		    &check_logfile ($cyclog_file, 0, 0, 0,
+		    check_logfile ($cyclog_file, 0, 0, 0,
 				    $log_sha256_digest{$logfile},
 				    $match_hash_ref{$logfile},
 				    $exclude_hash_ref{$logfile},
@@ -844,15 +849,15 @@ foreach $logfile (@logfiles) {
 		# This is never reached if there is only one, but we've
 		# already set SHA256 above for the first one (zeroth) as well.
 		if ($got_first_cyclog_file > $#cyclog_files) {
-		    $log_sha256_digest{$logfile} = &first_log_line_sha256_digest ($cyclog_file);
+		    $log_sha256_digest{$logfile} = first_log_line_sha256_digest ($cyclog_file);
 		}
 	    } # foreach
 	}
     }
 
     # Read all other logs from size file, then update this one.
-    &read_size_file ($size_file, $logfile);
-    &write_size_file ($size_file, $logfile, $LOG_PROCESSING_END);
+    read_size_file ($size_file, $logfile);
+    write_size_file ($size_file, $logfile, $LOG_PROCESSING_END);
 }
 
 # Remove temp dir.
@@ -918,7 +923,7 @@ sub parse_config {
 		    $macro_name = $1;
 		    $macro_value = $2;
 		    $macro_options = $3;
-		    &parse_macro ($macro_name, $macro_value, $macro_options,
+		    parse_macro ($macro_name, $macro_value, $macro_options,
 				  $current_context, $current_host,
 				  $line_num, 0);
 		}
@@ -927,7 +932,7 @@ sub parse_config {
 
 		    if ($directive eq 'hosts') {
 			if ($multihost_config && $oldstyle_multihost) {
-			    &send_error ($config_file, "Found \"hosts:\" directive while using old style \"begin-host:\" and \"end-host:\" directives on line $line_num. $value");
+			    send_error ($config_file, "Found \"hosts:\" directive while using old style \"begin-host:\" and \"end-host:\" directives on line $line_num. $value");
 			    exit;
 			}
 			elsif (!$multihost_config) {
@@ -937,7 +942,7 @@ sub parse_config {
 			    $all_host_master_notify = $master_notify;
 			}
 			$current_host = $value if ($config_check);
-			if (&my_host ($line_num, $value)) {
+			if (my_host ($line_num, $value)) {
 			    $current_context = $HOST_CONTEXT;
 			    $current_host = $HOSTNAME if (!$config_check);
 			    $found_my_host = 1;
@@ -948,7 +953,7 @@ sub parse_config {
 		    }
 		    elsif ($directive eq 'begin-host') {
 			if ($multihost_config && !$oldstyle_multihost) {
-			    &send_error ($config_file, "Found \"begin-host:\" directive while using new style \"hosts:\" directive on line $line_num. $value");
+			    send_error ($config_file, "Found \"begin-host:\" directive while using new style \"hosts:\" directive on line $line_num. $value");
 			    exit;
 			}
 			elsif (!$multihost_config) {
@@ -967,11 +972,11 @@ sub parse_config {
 		    }
 		    elsif ($directive eq 'end-host') {
 			if ($multihost_config && !$oldstyle_multihost) {
-			    &send_error ($config_file, "Found \"end-host:\" directive while using new style \"hosts:\" directive on line $line_num. $value");
+			    send_error ($config_file, "Found \"end-host:\" directive while using new style \"hosts:\" directive on line $line_num. $value");
 			    exit;
 			}
 			if ($current_host ne $value) {
-			    &send_error ($config_file, "end-host directive does not match begin-host directive (which uses \"$current_host\") on line $line_num. $value\n");
+			    send_error ($config_file, "end-host directive does not match begin-host directive (which uses \"$current_host\") on line $line_num. $value\n");
 			    exit;
 			}
 			if ($current_host eq $HOSTNAME || $current_host eq $SHORT_HOSTNAME) {
@@ -991,25 +996,25 @@ sub parse_config {
 		    }
 		    elsif ($directive eq 'master_notify') {
 			if (defined ($master_notify)) {
-			    &send_error ($config_file, "Second master_notify directive on line $line_num. $value");
+			    send_error ($config_file, "Second master_notify directive on line $line_num. $value");
 			    exit;
 			}
-			if (!&valid_email ($value)) {
-			    &send_error ($config_file, "Invalid email address in master_notify directive on line $line_num. $value");
+			if (!valid_email ($value)) {
+			    send_error ($config_file, "Invalid email address in master_notify directive on line $line_num. $value");
 			    exit;
 			}
 			$master_notify = $value;
 		    }
 		    elsif ($directive eq 'size_file') {
 			if (defined ($size_file)) {
-			    &send_error ($config_file, "Second size_file directive on line $line_num. $value");
+			    send_error ($config_file, "Second size_file directive on line $line_num. $value");
 			    exit;
 			}
 			$size_file = $value;
 		    }
 		    elsif ($directive eq 'email_sender') {
 			if (defined ($email_sender)) {
-			    &send_error ($config_file, "Second email_sender directive on line $line_num. $value");
+			    send_error ($config_file, "Second email_sender directive on line $line_num. $value");
 			    exit;
 			}
 			$email_sender = $value;
@@ -1025,27 +1030,31 @@ sub parse_config {
 						     && $use_privsep == 1);
 			}
 			else {
-			    &send_error ($config_file, "Invalid value for privsep directive on line $line_num, must be \"yes\" or \"no\". $value");
+			    send_error ($config_file, "Invalid value for privsep directive on line $line_num, must be \"yes\" or \"no\". $value");
 			    exit;
 			}
 		    }
 		    elsif ($directive eq 'signify_pubkey') {
 			if (defined ($signify_pubkey)) {
-			    &send_error ($config_file, "Second signify_pubkey directive on line $line_num. $value");
+			    send_error ($config_file, "Second signify_pubkey directive on line $line_num. $value");
 			    exit;
 			}
 			$signify_pubkey = $value;
 			if ($signify_pubkey !~  /^[\w\-\.]+$/) {
-			    &send_error ($config_file, "Invalid signify_pubkey file name \"$signify_pubkey\" line $line_num. $_\n");
+			    send_error ($config_file, "Invalid signify_pubkey file name \"$signify_pubkey\" line $line_num. $_\n");
 			    exit;
 			}
 			$signify_pubkey .= '.pub' if (substr ($signify_pubkey, length ($signify_pubkey) - 4, 4)) ne '.pub';
 			if (!-e "$SIGNIFY_DIR/$signify_pubkey") {
-			    &send_error ($config_file, "Signify public key doesn't exist, \"$signify_pubkey\" on line $line_num. $_\n");
+			    send_error ($config_file, "Signify public key doesn't exist, \"$signify_pubkey\" on line $line_num. $_\n");
 			    exit;
 			}
 			if (!-r "$SIGNIFY_DIR/$signify_pubkey") {
-			    &send_error ($config_file, "Signify public key is not readable, \"$signify_pubkey\" on line $line_num. $_\n");
+			    send_error ($config_file, "Signify public key is not readable, \"$signify_pubkey\" on line $line_num. $_\n");
+			    exit;	
+			}
+			if (!$have_signify) {
+			    send_error ($config_file, "Signify.pm not found on system, but signify  public key is defined, \"$signify_pubkey\" on line $line_num. $_\n");
 			    exit;	
 			}
 			$signify_pubkey = $SIGNIFY_DIR . '/' . $signify_pubkey;
@@ -1060,7 +1069,7 @@ sub parse_config {
 				@hosts = split (/\s+/, $current_host);
 				foreach $host (@hosts) {
 				    if ($defined_hostlog{"$host:$value"}) {
-					&send_error ($config_file, "Previously defined logfile for host $host on line $line_num. $value");
+					send_error ($config_file, "Previously defined logfile for host $host on line $line_num. $value");
 					exit;
 				    }
 				    $defined_hostlog{"$host:$value"} = 1;
@@ -1070,13 +1079,13 @@ sub parse_config {
 				next;
 			    }
 			    else {
-				&send_error ($config_file, "Previously defined logfile on line $line_num. $value");
+				send_error ($config_file, "Previously defined logfile on line $line_num. $value");
 				exit;
 			    }
 			}
 			# Do minimal validation on log name.
-			if (!&valid_logfile_format ($value)) {
-			    &send_error ($config_file, "Invalid logfile name on line $line_num. $value");
+			if (!valid_logfile_format ($value)) {
+			    send_error ($config_file, "Invalid logfile name on line $line_num. $value");
 			    exit;
 			}
 			if ($value =~ /^journal (unit|syslog-id|syslog-facility)/) {
@@ -1095,10 +1104,10 @@ sub parse_config {
 		    }
 		    elsif ($directive eq 'match') {
 			if (!defined ($current_logfile)) {
-			    &send_error ($config_file, "No log directive corresponding to match directive on line $line_num. $_");
+			    send_error ($config_file, "No log directive corresponding to match directive on line $line_num. $_");
 			    exit;
 			}
-			if (($value eq 'all') || &valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && &valid_regexp ($1))) {
+			if (($value eq 'all') || valid_regexp ($value) || ($value =~ /^session-with (.*$)/ && valid_regexp ($1))) {
 			    $rule_text = $value;
 			    $current_match_session_match_flag = 0;
 			    if ($value eq 'all') {
@@ -1115,14 +1124,14 @@ sub parse_config {
 				    $rule_type = 're';
 				}
 				# Do preproc macro substitution.
-				$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w\-]+%%/);
+				$value = preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w\-]+%%/);
 				# Negate if it begins with ! and remove it.
 				my $neg = ($value =~ s{^!}{});
 				# Remove leading and trailing slash.
 				$value =~ s/^\///;
 				$value =~ s/\/$//;
 				# Precompile regexp.
-				my $re = &compile_re ($value, "match rule on line $line_num. $_");
+				my $re = compile_re ($value, "match rule on line $line_num. $_");
 				$rule = {
 				    type => $rule_type,
 				    re => $re,
@@ -1133,16 +1142,16 @@ sub parse_config {
 			    push (@{$match_hash{$current_logfile}}, $rule);
 			}
 			else {
-			    &send_error ($config_file, "Invalid match directive on line $line_num. $_");
+			    send_error ($config_file, "Invalid match directive on line $line_num. $_");
 			    exit;
 			}
 		    }
 		    elsif ($directive eq 'exclude') {
 			if (!defined ($current_logfile)) {
-			    &send_error ($config_file, "No log directive corresponding to exclude directive on line $line_num. $_");
+			    send_error ($config_file, "No log directive corresponding to exclude directive on line $line_num. $_");
 			    exit;
 			}
-			if (($value eq 'none') || &valid_regexp ($value) || ($value =~ /^session-without (.*$)/ && &valid_regexp ($1))) {
+			if (($value eq 'none') || valid_regexp ($value) || ($value =~ /^session-without (.*$)/ && valid_regexp ($1))) {
 			    $rule_text = $value;
 			    if ($value eq 'none') {
 				$rule = { type => 'none', text => 'none' };
@@ -1152,26 +1161,26 @@ sub parse_config {
 				    $value = $1;
 				    $rule_type = 'session_without';
 				    if (!$current_match_session_match_flag) {
-					&send_error ($config_file, "Exclude directive is a session match but corresponding match directive is not on line $line_num. $_");
+					send_error ($config_file, "Exclude directive is a session match but corresponding match directive is not on line $line_num. $_");
 					exit;
 				    }
 				}
 				else {
 				    $rule_type = 're';
 				    if ($current_match_session_match_flag) {
-					&send_error ($config_file, "Exclude directive is not a session match but corresponding match directive is on line $line_num. $_");
+					send_error ($config_file, "Exclude directive is not a session match but corresponding match directive is on line $line_num. $_");
 					exit;
 				    }
 				}
 				# Do preproc macro substitution.
-				$value = &preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w\-]+%%/);
+				$value = preproc_macro_substitution ($value, $line_num) if ($value =~ /%%[\w\-]+%%/);
 				# Negate if it begins with ! and remove it.
 				my $neg = ($value =~ s{^!}{});
 				# Remove leading and trailing slash.
 				$value =~ s/^\///;
 				$value =~ s/\/$//;
 				# Precompile regexp.
-				my $re = &compile_re ($value, "exclude rule on line $line_num. $_");
+				my $re = compile_re ($value, "exclude rule on line $line_num. $_");
 				$rule = {
 				    type => $rule_type,
 				    re => $re,
@@ -1182,12 +1191,12 @@ sub parse_config {
 			    push (@{$exclude_hash{$current_logfile}}, $rule);
 			}
 			else {
-			    &send_error ($config_file, "Invalid exclude directive on line $line_num. $_");
+			    send_error ($config_file, "Invalid exclude directive on line $line_num. $_");
 			}
 		    }
 		    elsif ($directive eq 'action') {
 			if (!defined ($current_logfile)) {
-			    &send_error ($config_file, "No log directive corresponding to action directive on line $line_num. $_");
+			    send_error ($config_file, "No log directive corresponding to action directive on line $line_num. $_");
 			    exit;
 			}
 			# Parse action (action, whitespace, value).
@@ -1204,15 +1213,15 @@ sub parse_config {
 				# Minimal email validation.
 				my @check_emails = split (/,\s*/, $action_value);
 				foreach my $check_email (@check_emails) {
-				    if (!&valid_email ($check_email)) {
-					&send_error ($config_file, "Invalid email address(es) following \"notify\" action in action directive on line $line_num. $_");
+				    if (!valid_email ($check_email)) {
+					send_error ($config_file, "Invalid email address(es) following \"notify\" action in action directive on line $line_num. $_");
 					exit;
 				    }
 				}
 				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
 			    }
 			    else {
-				&send_error ($config_file, "Missing email address(es) following \"notify\" action in action directive on line $line_num. $_");
+				send_error ($config_file, "Missing email address(es) following \"notify\" action in action directive on line $line_num. $_");
 				exit;
 			    }
 			}
@@ -1223,14 +1232,14 @@ sub parse_config {
 				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
 			    }
 			    else {
-				&send_error ($config_file, "Missing email address(es) following \"text\" action in action directive on line $line_num. $_");
+				send_error ($config_file, "Missing email address(es) following \"text\" action in action directive on line $line_num. $_");
 				exit;
 			    }
 			}
 			# action: alert
 			elsif ($action eq 'alert') {
 			    if (defined ($action_value)) {
-				&send_error ($config_file, "Extraneous data following \"alert\" action in action directive on line $line_num. $_");
+				send_error ($config_file, "Extraneous data following \"alert\" action in action directive on line $line_num. $_");
 				exit;
 			    }
 			    push (@{$action_hash{$current_logfile}}, $action);
@@ -1241,20 +1250,20 @@ sub parse_config {
 				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
 			    }
 			    else {
-				&send_error ($config_file, "Missing script name following \"execute\" action in action directive on line $line_num. $_");
+				send_error ($config_file, "Missing script name following \"execute\" action in action directive on line $line_num. $_");
 				exit;
 			    }
 			}
 			# Other actions?
 			else {
-			    &send_error ($config_file, "Unknown action specified in action directive on line $line_num. $_");
+			    send_error ($config_file, "Unknown action specified in action directive on line $line_num. $_");
 			    exit;
 			}
 		    }
 		    # For backwards compatibility.
 		    elsif ($directive eq 'notify') {
 			if (!defined ($current_logfile)) {
-			    &send_error ($config_file, "No log directive corresponding to notify directive on line $line_num. $_");
+			    send_error ($config_file, "No log directive corresponding to notify directive on line $line_num. $_");
 			    exit;
 			}
 			push (@{$action_hash{$current_logfile}}, "$directive,$value");
@@ -1267,21 +1276,25 @@ sub parse_config {
 			$macro_file = $value;
 			$macro_dir = dirname ($config_file);
 			if ($macro_file !~  /^[\w\-\.]+$/) {
-			    &send_error ($config_file, "Invalid macro include file name \"$macro_file\" in macro \"$macro_name\" on line $line_num. $_\n");
+			    send_error ($config_file, "Invalid macro include file name \"$macro_file\" in macro \"$macro_name\" on line $line_num. $_\n");
 			    exit;
 			}
 			$macro_file = $macro_dir . '/' . $macro_file;
 			if (!-r $macro_file) {
-			    &send_error ($config_file, "Cannot read macro include file $macro_file in macro \"$macro_name\" on line $line_num. $_\n");
+			    send_error ($config_file, "Cannot read macro include file $macro_file in macro \"$macro_name\" on line $line_num. $_\n");
 			    exit;
 			}
 			if ($directive =~ /signed/) {
 			    if (!defined ($signify_pubkey)) {
-				&send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of macro include file \"$macro_file\" on line $line_num. $_\n");
+				send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of macro include file \"$macro_file\" on line $line_num. $_\n");
 				exit;
 			    }
-			    if (!&verify_signify_sig ($macro_file)) {
-				&send_error ($config_file, "Cannot verify signify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
+			    if (!$have_signify) {
+				send_error ($config_file, "Signify.pm not found on system, cannot verify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
+				exit;	
+			    }
+			    if (!verify_signify_sig ($macro_file)) {
+				send_error ($config_file, "Cannot verify signify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
 				exit;
 			    }
 			}
@@ -1296,22 +1309,22 @@ sub parse_config {
 					$macro_name = $1;
 					$macro_value = $2;
 					$macro_options = $3;
-					&parse_macro ($macro_name, $macro_value, $macro_options,
+					parse_macro ($macro_name, $macro_value, $macro_options,
 						      $current_context, $current_host,
 						      $line_num, $include_file_line_num);
 				    }
 				    else {
-					&send_error ($config_file, "Invalid macro definition line in macro include file \"$macro_file\" line $include_file_line_num, config file line $line_num.\n");
+					send_error ($config_file, "Invalid macro definition line in macro include file \"$macro_file\" line $include_file_line_num, config file line $line_num.\n");
 				    }
 				}
 			    }
 			} # open
 			else {
-			    &send_error ($config_file, "Cannot open macro include file $macro_file in macro \"$macro_name\" on line $line_num. $! $_\n");
+			    send_error ($config_file, "Cannot open macro include file $macro_file in macro \"$macro_name\" on line $line_num. $! $_\n");
 			}
 		    }
 		    else {
-			&send_error ($config_file, "Unknown directive on line $line_num. $_");
+			send_error ($config_file, "Unknown directive on line $line_num. $_");
 			exit;
 		    }
 		}
@@ -1321,13 +1334,13 @@ sub parse_config {
     }
     else {
 	die "Cannot open config file $config_file. $!\n";
-	&send_error ($config_file, "Cannot open config file. $!");
+	send_error ($config_file, "Cannot open config file. $!");
 	exit;
     }
 
     # If multi-host, did we find our host in the config?
     if ($multihost_config && !$found_my_host) {
-	&send_error ($config_file, "Did not find this host ($HOSTNAME) in config file.");
+	send_error ($config_file, "Did not find this host ($HOSTNAME) in config file.");
 	exit;
     }
 
@@ -1372,10 +1385,10 @@ sub parse_config {
 
     # If there are linux journal logs, pull validation data.
     if ($linux_journal_unit) {
-	@linux_journal_units = &get_linux_journal_units;
+	@linux_journal_units = get_linux_journal_units();
     }
     if ($linux_journal_syslogfacility) {
-	@linux_journal_syslog_facilities = &get_linux_journal_syslog_facilities;
+	@linux_journal_syslog_facilities = get_linux_journal_syslog_facilities();
     }
     if ($linux_journal_syslogid) {
 	# don't currently validate.
@@ -1430,7 +1443,7 @@ sub get_linux_journal_units {
 	close (SYSTEMCTL);
     }
     else {
-	&send_error ($config_file, "Cannot pull journal units from $SYSTEMCTL. $!\n");
+	send_error ($config_file, "Cannot pull journal units from $SYSTEMCTL. $!\n");
 	exit;
     }
     return (@units);
@@ -1449,7 +1462,7 @@ sub get_linux_journal_syslog_facilities {
 	close (JOURNALCTL);
     }
     else {
-	&send_error ($config_file, "Cannot pull syslog facilities from $JOURNALCTL. $!\n");
+	send_error ($config_file, "Cannot pull syslog facilities from $JOURNALCTL. $!\n");
 	exit;
     }
     return (@facilities);
@@ -1474,11 +1487,11 @@ sub parse_macro {
     # context, otherwise we're in a specific host context.
     # need to convert all this stuff to subroutines.
     if (defined ($global_preproc_macro{$macro_name})) {
-	&send_error ($config_file, "Previously defined global preproc macro \"$macro_name\" on line $line_num. $_\n");
+	send_error ($config_file, "Previously defined global preproc macro \"$macro_name\" on line $line_num. $_\n");
 	exit;
     }
     if (defined ($preproc_macro{$macro_name})) {
-	&send_error ($config_file, "Previously defined host preproc macro \"$macro_name\" on line $line_num. $_\n");
+	send_error ($config_file, "Previously defined host preproc macro \"$macro_name\" on line $line_num. $_\n");
 	exit;
     }
     # Allow importation of macro value from a file in same
@@ -1491,21 +1504,25 @@ sub parse_macro {
 	$macro_file = $1;
 	$macro_dir = dirname ($config_file);
 	if ($macro_file !~  /^[\w\-\.]+$/) {
-	    &send_error ($config_file, "Invalid macro value file name \"$macro_file\" in macro \"$macro_name\" on line $line_num. $_\n");
+	    send_error ($config_file, "Invalid macro value file name \"$macro_file\" in macro \"$macro_name\" on line $line_num. $_\n");
 	    exit;
 	}
 	$macro_file = $macro_dir . '/' . $macro_file;
 	if (!-r $macro_file) {
-	    &send_error ($config_file, "Cannot read macro value file $macro_file in macro \"$macro_name\" on line $line_num. $_\n");
+	    send_error ($config_file, "Cannot read macro value file $macro_file in macro \"$macro_name\" on line $line_num. $_\n");
 	    exit;
 	}
 	if ($macro_value =~ /^signed/) {
 	    if (!defined ($signify_pubkey)) {
-		&send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of macro value file \"$macro_file\" on line $line_num. $_\n");
+		send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of macro value file \"$macro_file\" on line $line_num. $_\n");
 		exit;			
 	    }
-	    if (!&verify_signify_sig ($macro_file)) {
-		&send_error ($config_file, "Cannot verify signify signature on signed macro value file \"$macro_file\" on line $line_num. $_\n");
+	    if (!$have_signify) {
+		send_error ($config_file, "Signify.pm not found on system, cannt verify signature on signed macro value file \"$macro_file\" on line $line_num. $_\n");
+		exit;	
+	    }
+	    if (!verify_signify_sig ($macro_file)) {
+		send_error ($config_file, "Cannot verify signify signature on signed macro value file \"$macro_file\" on line $line_num. $_\n");
 		exit;
 	    }
 	}
@@ -1527,7 +1544,7 @@ sub parse_macro {
 	    close (VALUEFILE);
 	}
 	else {
-	    &send_error ($config_file, "Cannot open macro value file $macro_file in macro \"$macro_name\" on line $line_num. $! $_\n");
+	    send_error ($config_file, "Cannot open macro value file $macro_file in macro \"$macro_name\" on line $line_num. $! $_\n");
 	}
     }
     if ($current_context == $GLOBAL_CONTEXT) {
@@ -1539,11 +1556,11 @@ sub parse_macro {
     if ($macro_options =~ /:(append|substitute)/) {
 	if ($1 eq 'append') {
 	    if (defined ($global_append_macro{$macro_value})) {
-		&send_error ($config_file, "Previously defined append global macro value \"$macro_value\" on line $line_num. $_\n");
+		send_error ($config_file, "Previously defined append global macro value \"$macro_value\" on line $line_num. $_\n");
 		exit;				
 	    }
 	    if (defined ($append_macro{$macro_value})) {
-		&send_error ($config_file, "Previously defined append host macro value \"$macro_value\" on line $line_num. $_\n");
+		send_error ($config_file, "Previously defined append host macro value \"$macro_value\" on line $line_num. $_\n");
 		exit;
 	    }
 	    if ($current_context == $GLOBAL_CONTEXT) {
@@ -1557,11 +1574,11 @@ sub parse_macro {
 	}
 	else {
 	    if (defined ($global_substitute_macro{$macro_value})) {
-		&send_error ($config_file, "Previously defined substitute global macro value \"$macro_value\" on line $line_num. $_\n");
+		send_error ($config_file, "Previously defined substitute global macro value \"$macro_value\" on line $line_num. $_\n");
 		exit;
 	    }
 	    if (defined ($substitute_macro{$macro_value})) {
-		&send_error ($config_file, "Previously defined substitute host macro value \"$macro_value\" on line $line_num. $_\n");
+		send_error ($config_file, "Previously defined substitute host macro value \"$macro_value\" on line $line_num. $_\n");
 		exit;
 	    }
 	    if ($current_context == $GLOBAL_CONTEXT) {
@@ -1575,7 +1592,7 @@ sub parse_macro {
 	}
     }
     elsif ($macro_options ne '') {
-	&send_error ($config_file, "Invalid macro options for macro \"$macro_name\" on line $line_num. $_\n");
+	send_error ($config_file, "Invalid macro options for macro \"$macro_name\" on line $line_num. $_\n");
 	exit;
     }
 }
@@ -1594,28 +1611,28 @@ sub verify_signify_sig {
 	return 1;
     }
 
-    @errors = Signify::signify_error;
+    @errors = Signify::signify_error();
 
     # Report any errors, apart from readability of file itself.
     if ($errors[0] =~ /^no executable/) {
-	&send_error ($config_file, "No signify binary on system to verify signify signature.\n");
+	send_error ($config_file, "No signify binary on system to verify signify signature.\n");
 	return 0;
     }
     elsif ($errors[0] =~ /^no readable signature file/) {
-	&send_error ($config_file, "Cannot open signed macro file \"$file\".\n");
+	send_error ($config_file, "Cannot open signed macro file \"$file\".\n");
 	return 0;
     }
     elsif ($errors[0] =~ /^no readable public key/) {
-	&send_error ($config_file, "Cannot open signify public key \"$signify_pubkey\" to verify signify signature.\n");
+	send_error ($config_file, "Cannot open signify public key \"$signify_pubkey\" to verify signify signature.\n");
 	return 0;
     }
     # shouldn't happen without opportune deletion.
     elsif ($errors[0] =~ /^no readable file/) {
-	&send_error ($config_file, "Cannot read file $file to verify signify signature.\n");
+	send_error ($config_file, "Cannot read file $file to verify signify signature.\n");
 	return 0;
     }
     else {
-	&send_error ($config_file, "@errors");
+	send_error ($config_file, "@errors");
 	return 0;
     }
 }
@@ -1699,13 +1716,13 @@ sub priv_listener {
     my ($req, $req_type);
     my $MAX_REQUEST_LENGTH = 1024 * 1024;;
 
-    print "DEBUG: starting &priv_listener\n" if ($debug_mode);
+    print "DEBUG: starting priv_listener\n" if ($debug_mode);
     while (1) {
 	read ($parent_sock, my $len_bytes, 4) or last;
 	my $msg_len = unpack ('N', $len_bytes);
 	if ($msg_len > $MAX_REQUEST_LENGTH || $msg_len < 1) {
 	    warn "Invalid message length: $msg_len\n";
-	    &send_error_response_nohmac ("Invalid message length.");
+	    send_error_response_nohmac ("Invalid message length.");
 	    next;
 	}
 
@@ -1716,7 +1733,7 @@ sub priv_listener {
 
 	if ($@) {
 	    warn "Faild to parse envelope JSON: $@\n";
-	    &send_error_response_nohmac ("Invalid JSON.");
+	    send_error_response_nohmac ("Invalid JSON.");
 	    next;
 	}
 
@@ -1727,7 +1744,7 @@ sub priv_listener {
 
 	unless ($received_hmac eq $expected_hmac) {
 	    warn "HMAC verification failed.\n";
-	    &send_error_response_nohmac ("HMAC verification failed.");
+	    send_error_response_nohmac ("HMAC verification failed.");
 	    next;
 	}
 
@@ -1736,7 +1753,7 @@ sub priv_listener {
 	
 	if ($@ || !validate_request ($request)) {
 	    warn "Invalid request format.\n";
-	    &send_error_response ("Invalid request.", $request->{request_id});
+	    send_error_response ("Invalid request.", $request->{request_id});
 	    next;
 	}
 
@@ -1746,14 +1763,14 @@ sub priv_listener {
 	my $age = time() - $request->{timestamp};
 	if ($age > 15 || $age < -5) { # allow 15 second old, 5 seconds future
 	    warn "Request timestamp out of acceptable range: $age seconds\n";
-	    &send_error_response ("Request too old or timestamp invalid", $request->{request_id});
+	    send_error_response ("Request too old or timestamp invalid", $request->{request_id});
 	    next;
 	}
 
 	# Replay protection: reject duplicate request_id.
 	state %seen_request_ids;
 	if (exists $seen_request_ids{$request->{request_id}}) {
-	    &send_error_response ("Replay detected for request_id", $request->{request_id});
+	    send_error_response ("Replay detected for request_id", $request->{request_id});
 	    next;
 	}
 
@@ -1771,25 +1788,25 @@ sub priv_listener {
 	    $request->{type} eq 'get-fd-raw' ||
 	    $request->{type} eq 'get-mclog-fd') {
 
-	    &handle_fd_request ($request);
+	    handle_fd_request ($request);
 	}
 	elsif ($request->{type} eq 'get-hash') {
-	    &handle_hash_request ($request);
+	    handle_hash_request ($request);
 	}
 	elsif ($request->{type} eq 'get-journal') {
-	    &handle_journal_request ($request);
+	    handle_journal_request ($request);
 	}
 	elsif ($request->{type} eq 'get-linux-pacct') {
-	    &handle_linux_pacct_request ($request);
+	    handle_linux_pacct_request ($request);
 	}
 	elsif ($request->{type} eq 'get-mclog-files') {
-	    &handle_mclog_files_request ($request);
+	    handle_mclog_files_request ($request);
 	}
 	elsif ($request->{type} eq 'gunzip') {
-	    &handle_gunzip_request ($request);
+	    handle_gunzip_request ($request);
 	}
 	else {
-	    &send_error_response ("Unknown request type.", $request->{request_id});
+	    send_error_response ("Unknown request type.", $request->{request_id});
 	}
     }
 }
@@ -1802,8 +1819,8 @@ sub handle_fd_request {
     my $open_mode = $request->{params}{raw_mode} ? '<:raw' : '<';
 
     # Validate that logfile is in allowed list.
-    unless (&is_allowed_logfile ($logfile)) {
-	&send_error_response ("Logfile not in allowed list.");
+    unless (is_allowed_logfile ($logfile)) {
+	send_error_response ("Logfile not in allowed list.");
 	return;
     }
 
@@ -1814,7 +1831,7 @@ sub handle_fd_request {
 
     # Path traversal check.
     if ($logfile =~ /\.\./) {
-	&send_error_response ("Path traversal attempt", $request->{request_id});
+	send_error_response ("Path traversal attempt", $request->{request_id});
 	return;
     }
 
@@ -1830,7 +1847,7 @@ sub handle_fd_request {
 	    }
 	};
 
-	&send_response ($response);
+	send_response ($response);
 
 	# Now send the file descriptor.
 	IO::FDPass::send (fileno ($parent_sock), fileno ($log_fh))
@@ -1839,7 +1856,7 @@ sub handle_fd_request {
 	close ($log_fh); # safe to close after send
     }
     else {
-	&send_error_response ("Cannot open $logfile: $!", $request->{request_id}, int ($!));
+	send_error_response ("Cannot open $logfile: $!", $request->{request_id}, int ($!));
     }
 }
 
@@ -1852,12 +1869,12 @@ sub handle_hash_request {
 
     my $logfile = $request->{params}{logfile};
 
-    unless (&is_allowed_logfile ($logfile)) {
-	&send_error_response ("Logfile not in allowed list.");
+    unless (is_allowed_logfile ($logfile)) {
+	send_error_response ("Logfile not in allowed list.");
 	return;
     }
 
-    my $hash = &first_log_line_sha256_digest ($logfile);
+    my $hash = first_log_line_sha256_digest ($logfile);
 
     my $response = {
 	status => RESP_SUCCESS,
@@ -1865,7 +1882,7 @@ sub handle_hash_request {
 	data => $hash,
     };
 
-    &send_response ($response);
+    send_response ($response);
 }
 
 # Subroutine to get Linux journal data (privileged side).
@@ -1875,12 +1892,12 @@ sub handle_journal_request {
     my $logfile = $request->{params}{logfile};
     my $checktime = $request->{params}{checktime};
 
-    unless (&is_allowed_logfile ($logfile)) {
-	&send_error_response ("Logfile not allowed.", $request->{request_id});
+    unless (is_allowed_logfile ($logfile)) {
+	send_error_response ("Logfile not allowed.", $request->{request_id});
 	return;
     }
 
-    my ($temp_logfile, $new_checktime) = &read_linux_journal ($logfile, $checktime, $temp_dir);
+    my ($temp_logfile, $new_checktime) = read_linux_journal ($logfile, $checktime, $temp_dir);
     chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
     my $response = {
@@ -1892,7 +1909,7 @@ sub handle_journal_request {
 	}
     };
 
-    &send_response ($response);
+    send_response ($response);
 }
 
 # Get Linux process accounting logs (using lastcomm, deprecated; privileged side).
@@ -1902,12 +1919,12 @@ sub handle_linux_pacct_request {
     my $logfile = $request->{params}{logfile};
     my $checktime = $request->{params}{checktime};
     
-    unless (&is_allowed_logfile ($logfile)) {
-	&send_error_response ("Logfile not allowed.", $request->{request_id});
+    unless (is_allowed_logfile ($logfile)) {
+	send_error_response ("Logfile not allowed.", $request->{request_id});
 	return;
     }
 
-    my ($temp_logfile, $new_checktime) = &read_process_acct_log ($logfile, $checktime, $temp_dir);
+    my ($temp_logfile, $new_checktime) = read_process_acct_log ($logfile, $checktime, $temp_dir);
     chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
     my $response = {
@@ -1919,7 +1936,7 @@ sub handle_linux_pacct_request {
 	}
     };
 
-    &send_response ($response);
+    send_response ($response);
 }
 
 # Get files in a multilog/cyclog directory (privileged side).
@@ -1928,12 +1945,12 @@ sub handle_mclog_files_request {
 
     my $logfile = $request->{params}{logfile};
 
-    unless (&is_allowed_logfile ($logfile)) {
-	&send_error_response ("Logfile not allowed.", $request->{request_id});
+    unless (is_allowed_logfile ($logfile)) {
+	send_error_response ("Logfile not allowed.", $request->{request_id});
 	return;
     }
 
-    my @cyclog_files = &get_cyclog_files ($logfile);
+    my @cyclog_files = get_cyclog_files ($logfile);
 
     my $response = {
 	status => RESP_SUCCESS,
@@ -1941,7 +1958,7 @@ sub handle_mclog_files_request {
 	data => \@cyclog_files,
     };
 
-    &send_response ($response);
+    send_response ($response);
 }
 
 # Subroutine to handle gunzip (privileged side).
@@ -1950,12 +1967,12 @@ sub handle_gunzip_request {
 
     my $logfile = $request->{params}{logfile};
 
-    unless (&is_allowed_logfile ($logfile)) {
-	&send_error_response ("Logfile not allowed.", $request->{request_id});
+    unless (is_allowed_logfile ($logfile)) {
+	send_error_response ("Logfile not allowed.", $request->{request_id});
 	return;
     }
 
-    my $temp_logfile = &gunzip_logfile ($logfile, $temp_dir);
+    my $temp_logfile = gunzip_logfile ($logfile, $temp_dir);
     chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
     my $response = {
@@ -1964,7 +1981,7 @@ sub handle_gunzip_request {
 	data => $temp_logfile,
     };
 
-    &send_response ($response);
+    send_response ($response);
 }
 
 # Subroutine to send response from priv to nonpriv.
@@ -1996,7 +2013,7 @@ sub send_error_response {
 
     $response->{errno} = $errno if (defined ($errno));
 
-    &send_response ($response);
+    send_response ($response);
 }
 
 # For errors before we parse request_id (like HMAC failure),
@@ -2011,7 +2028,7 @@ sub send_error_response_nohmac {
 
     # Still send with HMAC even if we couldn't verify incoming HMAC,
     # this allows legitimate clients to verify our response.
-    &send_response ($response);
+    send_response ($response);
 }
 
 # Subroutine to validate request format (privileged side).
@@ -2090,10 +2107,10 @@ sub send_priv_req {
     my $MAX_RESPONSE_LENGTH = 1024 * 1024;;
 
     if (!$privsep_flag) {
-	die "Call to &send_priv_req when not using privilege separation.\n";
+	die "Call to send_priv_req when not using privilege separation.\n";
     }
     elsif ($priv_flag) {
-	die "Call to &send_priv_req from privileged parent process.\n";
+	die "Call to send_priv_req from privileged parent process.\n";
     }
 
     my $request = {
@@ -2157,7 +2174,7 @@ sub send_priv_req_for_fd {
 
     my $logfile = $req_params->{logfile};
 
-    my $response = &send_priv_req ($req_type, $req_params);
+    my $response = send_priv_req ($req_type, $req_params);
     
     if ($response->{status} eq RESP_FD_FOLLOWS) {
 	print "DEBUG: receiving file descriptor\n" if ($debug_mode);
@@ -2186,7 +2203,7 @@ sub send_priv_req_for_fd {
 sub get_priv_data {
     my ($req_type, $req_params) = @_;
 
-    my $response = &send_priv_req ($req_type, $req_params);
+    my $response = send_priv_req ($req_type, $req_params);
 
     if ($response->{status} eq RESP_SUCCESS) {
 	return $response->{data};
@@ -2209,7 +2226,7 @@ sub nonpriv_open_fh {
 
     my $open_mode = $raw_mode_flag ? '<:raw' : '<';
 
-    print "DEBUG: &nonpriv_open_fh on $logfile\n" if ($debug_mode);
+    print "DEBUG: nonpriv_open_fh on $logfile\n" if ($debug_mode);
 
     return $log_fh if (open ($log_fh, $open_mode, $logfile));
 
@@ -2234,7 +2251,7 @@ sub nonpriv_open_fh {
 	    };
 	}
 
-	return &send_priv_req_for_fd ($req_type, $params);
+	return send_priv_req_for_fd ($req_type, $params);
     }
 
     return 0;
@@ -2253,7 +2270,7 @@ sub get_cyclog_files {
 	return (@cyclog_files);
     }
     elsif ($privsep_flag && $nonpriv_flag) {
-	my $files_ref = &get_priv_data ('get-mclogfiles', { logfile => $logfile });
+	my $files_ref = get_priv_data ('get-mclogfiles', { logfile => $logfile });
 	@cyclog_files = @$files_ref;
 	return (@cyclog_files);
     }
@@ -2287,10 +2304,10 @@ sub check_logfile {
     elsif ($log_type == $LOG_TYPE_LINUX_JOURNAL) {
 	$ref_logfile = $logfile_name;
     }
-    elsif (&is_gzip ($logfile)) {
+    elsif (is_gzip ($logfile)) {
 	$gzip_temp_log_flag = 1;
 	$ref_logfile = $logfile;
-	$logfile = &gunzip_logfile ($ref_logfile, $temp_dir);
+	$logfile = gunzip_logfile ($ref_logfile, $temp_dir);
     }
     else {
 	$ref_logfile = $logfile;
@@ -2304,7 +2321,7 @@ sub check_logfile {
     # If an old rotated log is larger than the last log file we looked
     # at, we're still checking the first log line to see if we need
     # to look at the whole log file, but we only compute that when needed.
-    ($size, $mtime) = &get_size ($logfile);
+    ($size, $mtime) = get_size ($logfile);
 
     # Determine if we are processing a file we have already seen before,
     # or if it's a new one.
@@ -2316,7 +2333,7 @@ sub check_logfile {
 	# cyclog/multilog processing, it should be non-null unless it's
 	# a brand new log.)
 	if ($old_sha256_digest eq '') {
-	    $sha256_digest = &first_log_line_sha256_digest ($logfile);
+	    $sha256_digest = first_log_line_sha256_digest ($logfile);
 	}
 	# If it's an existing logfile -- we've received as input a
 	# size (old_size > 0), an mtime (old_mtime > 0) and a first
@@ -2331,7 +2348,7 @@ sub check_logfile {
 	     ($old_sha256_digest ne '') &&
 	     ($mtime > $old_mtime)) &&
 	    (($size < $old_size) ||
-	     (($sha256_digest = &first_log_line_sha256_digest ($logfile)) ne $old_sha256_digest))) {
+	     (($sha256_digest = first_log_line_sha256_digest ($logfile)) ne $old_sha256_digest))) {
 	    $old_size = 0;
 	}
     }
@@ -2366,23 +2383,23 @@ sub check_logfile {
 	    if ($exclude_hashes[$idx]{type} eq 'session_without') {
 		$session_exclude_array[$idx] = $exclude_hashes[$idx];
 		# used to change exclude_hashes to 'none' or type to 'none' which impacts the next pass with rotated logs.
-		# now just special-case handling of 'session_without' in &match_line depending on whether returned capture
+		# now just special-case handling of 'session_without' in match_line depending on whether returned capture
 		# groups are requested.
 	    }
 	    else {
 		# This shouldn't happen. (It would happen when type on $exclude_hashes[$idx] was changed, when processing rotated log files.)
-		&send_error ($ref_logfile, "Internal error - found session match hash without corresponding session exclude hash for logfile $ref_logfile/$logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
+		send_error ($ref_logfile, "Internal error - found session match hash without corresponding session exclude hash for logfile $ref_logfile/$logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
 	    }
 	}
 	elsif ($exclude_hashes[$idx]{type} eq 'session_without') {
 	    # This also shouldn't happen.
-	    &send_error ($ref_logfile, "Internal error - found session exclude hash without corresponding session match hash for logfile $ref_logfile/$logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
+	    send_error ($ref_logfile, "Internal error - found session exclude hash without corresponding session match hash for logfile $ref_logfile/$logfile. $match_hashes[$idx]{text} / $exclude_hashes[$idx]{text}");
 	}
     }
 
     # Logfile has grown.
     if ($size > $old_size) {
-	if (my $log_fh = &nonpriv_open_fh ($logfile, $log_type == $LOG_TYPE_CYCLOG_OR_MULTILOG)) {
+	if (my $log_fh = nonpriv_open_fh ($logfile, $log_type == $LOG_TYPE_CYCLOG_OR_MULTILOG)) {
 	    seek ($log_fh, $old_size, 0) if ($old_size > 0);
 	    while (<$log_fh>) {
 		chomp;
@@ -2400,7 +2417,7 @@ sub check_logfile {
 		    # The name $session_exclude_array is misleading here, it's looking for positive matches and returning
 		    # capture groups for later use.
 		    if ($session_match_flag[$idx]) {
-			if ($session_append_string = &match_line ($session_exclude_array[$idx], $_, 1)) {
+			if ($session_append_string = match_line ($session_exclude_array[$idx], $_, 1)) {
 			    if ($session_match_array[$idx] eq '') {
 				$session_match_array[$idx] = $session_append_string;
 			    }
@@ -2410,7 +2427,7 @@ sub check_logfile {
 			}
 		    }
 
-		    if (&match_line ($match, $_) && !&match_line ($exclude, $_)) {
+		    if (match_line ($match, $_) && !match_line ($exclude, $_)) {
 			print "DEBUG: match $match->{re} and not match $exclude->{re}\nLINE: $_" if ($debug_mode && $match->{type} eq 're' && $exclude->{type} eq 're');
 			if ($log_type == $LOG_TYPE_CYCLOG_OR_MULTILOG) { # cyclog or multilog
 			    ($date, $line) = split (/\s+/, $_, 2);
@@ -2466,10 +2483,10 @@ sub check_logfile {
 		    # Here is where to do post-processing on @notify_lines to
 		    # do substitution/appending of macro names on values.
 		    if ($have_postproc_macros || $have_global_postproc_macros) {
-			@notify_lines = &postproc_macro_substitution (@notify_lines);
+			@notify_lines = postproc_macro_substitution (@notify_lines);
 		    }
 		    if ($action eq 'notify') {
-			&send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
+			send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
 		    }
 		    elsif ($action eq 'alert') {
 			print "***$SHORT_HOSTNAME $ref_logfile\n";
@@ -2480,10 +2497,10 @@ sub check_logfile {
 		    }
 		    elsif ($action eq 'text') {
 			# Might want to do separate text per line?
-			&send_text ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
+			send_text ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
 		    }
 		    elsif ($action eq 'execute') {
-			&execute_script ($action_value, $HOSTNAME, $ref_logfile, @notify_lines);
+			execute_script ($action_value, $HOSTNAME, $ref_logfile, @notify_lines);
 		    }
 		}
 	    }
@@ -2493,7 +2510,7 @@ sub check_logfile {
 	    return ($size, $mtime, $checktime, $sha256_digest);
 	}
 	else {
-	    &send_error ($ref_logfile, "Cannot open logfile $logfile. $!");
+	    send_error ($ref_logfile, "Cannot open logfile $logfile. $!");
 	}
     }
 
@@ -2511,7 +2528,7 @@ sub is_gzip {
 
     if (substr ($logfile, length ($logfile) -3, 3) eq '.gz') {
 	return 1 if (!-r $logfile); # assume it is
-	if ($gzip_fh = &nonpriv_open_fh ($logfile, $cyclog_flag, $raw_mode_flag)) {
+	if ($gzip_fh = nonpriv_open_fh ($logfile, $cyclog_flag, $raw_mode_flag)) {
 	    read ($gzip_fh, $magic_bytes, 2);
 	    close ($gzip_fh);
 	    $magic_number = unpack ('S>', $magic_bytes); # unsigned, short, big endian
@@ -2531,7 +2548,7 @@ sub gunzip_logfile {
 
     if (!-r $logfile &&
 	$privsep_flag && $nonpriv_flag) {
-	$temp_logfile = &get_priv_data ('gunzip', { logfile => $logfile });
+	$temp_logfile = get_priv_data ('gunzip', { logfile => $logfile });
 	return ($temp_logfile);
     }
 
@@ -2541,7 +2558,7 @@ sub gunzip_logfile {
 
     copy ($logfile, "$temp_dir/$temp_in_file");
     gunzip "$temp_dir/$temp_in_file" => $temp_logfile or
-	&send_error ($logfile, "gunzip failed: $GunzipError");
+	send_error ($logfile, "gunzip failed: $GunzipError");
 
     # Remove in file.
     unlink ("$temp_dir/$temp_in_file");
@@ -2551,7 +2568,7 @@ sub gunzip_logfile {
 
 # Subroutine to return a SHA256 hash of the first log line (or 0).
 # This subroutine may be touching files only accessible by root,
-# and &is_gzip will work on such files.
+# and is_gzip will work on such files.
 # First line can be passed in if already available.
 sub first_log_line_sha256_digest {
     my ($logfile, $first_line) = @_;
@@ -2566,10 +2583,10 @@ sub first_log_line_sha256_digest {
 
     # Otherwise, go get it: priv case, gzip case, unpriv case.
     if (!-r $logfile && $privsep_flag && $nonpriv_flag) {
-	$sha256_digest = &get_priv_data ('get-hash', { logfile => $logfile });
+	$sha256_digest = get_priv_data ('get-hash', { logfile => $logfile });
 	return ($sha256_digest);
     }
-    elsif (&is_gzip ($logfile)) {
+    elsif (is_gzip ($logfile)) {
 	$gzip_fh = IO::Uncompress::Gunzip->new ($logfile)
 	    or die "gunzip failed: $GunzipError\n";
 	$first_line = <$gzip_fh>;
@@ -2652,7 +2669,7 @@ sub identify_rotated_logs {
 
 	# Find files that have been modified since our last check.
 	foreach $file (reverse (sort (@files))) {
-	    ($size, $mtime) = &get_size ("$logdir/$file");
+	    ($size, $mtime) = get_size ("$logdir/$file");
 	    if ($mtime > $old_checktime) { # a rotated log that needs checking
 		if (!$rotated_logs_flag) { # first one we find
 		    $rotated_logs_flag = 1;
@@ -2696,7 +2713,7 @@ sub direct_read_process_acct_log {
 
     # Returns @rotated_acct_logs with changes since $checktime, sorted
     # oldest to newest, which is what we want.
-    ($rotated_logs_flag, @rotated_acct_logs) = &identify_rotated_logs ($acct_log, $checktime);
+    ($rotated_logs_flag, @rotated_acct_logs) = identify_rotated_logs ($acct_log, $checktime);
     # Unlike using lastcomm, which presents the records from newest to
     # oldest, we're going to start with the oldest file and read its
     # records ourselves from oldest to newest.
@@ -2710,13 +2727,13 @@ sub direct_read_process_acct_log {
     $is_live_file = 0;
 
     # Start looking at accounting files, and allow for .gz rotated
-    # logs. (Don't sort here because &identify_rotated_logs already
+    # logs. (Don't sort here because identify_rotated_logs already
     # did it the way we want, oldest first.)
     foreach $acct_file (@rotated_acct_logs) {
-	if (&is_gzip ($acct_file)) {
+	if (is_gzip ($acct_file)) {
 	    # gunzip into a temp file and look at that (doesn't currently
 	    # happen on OpenBSD).
-	    $acct_temp_logfile = &gunzip_logfile ($acct_file, $temp_dir);
+	    $acct_temp_logfile = gunzip_logfile ($acct_file, $temp_dir);
 	    $acct_file = $acct_temp_logfile;
 	}
 
@@ -2724,14 +2741,14 @@ sub direct_read_process_acct_log {
 	# that point.
 	if ($acct_file eq $acct_log) {
 	    $is_live_file = 1;
-	    ($new_size, $new_mtime) = &get_size ($acct_log);
+	    ($new_size, $new_mtime) = get_size ($acct_log);
 	    $new_checktime = gettimeofday();
 	}
 
 	# Open file and look for first record if we need it. Once
 	# we have a first record, open temp file and start writing out
 	# to it.
-	if ($acct_fh = &nonpriv_open_fh ($acct_file)) {
+	if ($acct_fh = nonpriv_open_fh ($acct_file)) {
 	    $/ = \$RECORD_SIZE;
 	    # Starting with the oldest file with an mtime > checktime.
 	    # Skip past any records with time < checktime.
@@ -2745,7 +2762,7 @@ sub direct_read_process_acct_log {
 			if ($n_bytes == $RECORD_SIZE &&
 			    $old_first_line_hash ne 'null') {
 			    $new_first_line_hash =
-				&first_log_line_sha256_digest ($logfile,
+				first_log_line_sha256_digest ($logfile,
 							       $record);
 			    seek ($acct_fh, $old_size, 0) if ($old_first_line_hash eq $new_first_line_hash);
 			    # if not the live file we'll need to get a new one
@@ -2795,7 +2812,7 @@ sub direct_read_process_acct_log {
 			$offset == 0 &&
 			$position == $n_bytes &&
 			!defined ($new_first_line_hash)) {
-			$new_first_line_hash = &first_log_line_sha256_digest ($logfile, $record);
+			$new_first_line_hash = first_log_line_sha256_digest ($logfile, $record);
 		    }
 		
 		    if ($^O eq 'openbsd') {
@@ -2817,7 +2834,7 @@ sub direct_read_process_acct_log {
 		    if (!$processing_records &&
 			($^O eq 'linux' ? ($btime > $checktime) :
 			 ($btime > $checktime ||
-			  $btime + (&expand ($etime) / $AHZ) > $checktime))) {
+			  $btime + (expand ($etime) / $AHZ) > $checktime))) {
 			$found_first_record = 1;
 			$processing_records = 1;
 
@@ -2825,7 +2842,7 @@ sub direct_read_process_acct_log {
 			if ($^O eq 'openbsd') {
 			    ($temp_fh, $temp_logfile) = mkstemp ("$temp_dir/reportnew.XXXXXXX");
 			    if (!defined ($temp_logfile)) {
-				&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+				send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 				exit; # or just return?
 			    }
 			}
@@ -2833,7 +2850,7 @@ sub direct_read_process_acct_log {
 			    # create and open
 			    ($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
 			    if (!defined ($temp_logfile)) {
-				&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+				send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 				exit; # or just return?
 			    }
 			}
@@ -2847,7 +2864,7 @@ sub direct_read_process_acct_log {
 			    $tty = $devname_cache{$tty};
 			}
 			elsif ($^O eq 'linux') {
-			    $tty = &linux_device ($tty);
+			    $tty = linux_device ($tty);
 			}
 			else {
 			    $tty = '??';
@@ -2860,11 +2877,11 @@ sub direct_read_process_acct_log {
 			# by spaces). Duration is also now available without fakery.
 			$command = "$command\[$pid\]" unless ($^O eq 'darwin');
 			# Process flags.
-			$flags = &flagbits ($flags);
+			$flags = flagbits ($flags);
 			# User time plus system time.
-			$cpu = (&expand ($utime) + &expand ($stime)) / $AHZ;
+			$cpu = (expand ($utime) + expand ($stime)) / $AHZ;
 			$cpu = sprintf "%.2f", $cpu; # was %6.2f for formatted cols
-			$delta = &expand ($etime) / $AHZ;
+			$delta = expand ($etime) / $AHZ;
 			$duration = sprintf "%1.0f:%02.0f:%05.2f", $delta / SECSPERHOUR,
 			    fmod ($delta, SECSPERHOUR) / SECSPERMIN,
 			    fmod ($delta, SECSPERMIN);
@@ -2874,7 +2891,7 @@ sub direct_read_process_acct_log {
 	    } # while (1)
 	} # open
 	else {
-	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
+	    send_error ($acct_file, "Could not open acct file $acct_file. $!");
 	    exit;
 	}
 	close ($acct_fh);
@@ -2884,7 +2901,7 @@ sub direct_read_process_acct_log {
     if (!$found_first_record || !$processing_records) {
 	# This should provoke an error and exit, we never wrote anything
 	# out. This can happen if process accounting is turned off.
-	&send_error ($acct_file, "Could not find any new records in acct file $acct_file (direct method). This shouldn't happen--is process accounting on?");
+	send_error ($acct_file, "Could not find any new records in acct file $acct_file (direct method). This shouldn't happen--is process accounting on?");
 	exit;
     }
     # Otherwise, close the temp file and return log path.
@@ -3002,13 +3019,13 @@ sub read_process_acct_log {
     my ($req_response); # for privsep
 
     if ($^O eq 'linux' && $privsep_flag && $nonpriv_flag) {
-	$req_response = &get_priv_data ('get-linux-pacct', { logfile => $logfile, checktime => $checktime });
+	$req_response = get_priv_data ('get-linux-pacct', { logfile => $logfile, checktime => $checktime });
 	if (defined ($req_response)) {
 	    $temp_logfile = $req_response->{temp_logfile};
 	    $new_checktime = $req_response->{checktime};
 	    return ($temp_logfile, $new_checktime);
 	}
-	&send_error ($logfile, "Received unexpected response from privileged parent process trying to get Linux process accounting from $logfile.");
+	send_error ($logfile, "Received unexpected response from privileged parent process trying to get Linux process accounting from $logfile.");
 	exit; # or just return?
     }
 
@@ -3032,7 +3049,7 @@ sub read_process_acct_log {
     # $rotated_logs_flag ignored, we're always going to do something
     # unless there's no log at all, which should already have been
     # determined (unless it just got deleted).
-    ($rotated_logs_flag, @rotated_acct_logs) = &identify_rotated_logs ($acct_log, $checktime);
+    ($rotated_logs_flag, @rotated_acct_logs) = identify_rotated_logs ($acct_log, $checktime);
     # Insert current log at the front. It will be sorted anyway, but
     # this puts it where it belongs.
     unshift (@rotated_acct_logs, $acct_log);
@@ -3041,20 +3058,20 @@ sub read_process_acct_log {
     # (first one in the newest file, which we process first).
     $new_checktime = gettimeofday();
     # Sorting from oldest first to newest first. Maybe make an option
-    # to &identify_rotated_logs to avoid unnecessary sort.
-    # Note that sort here and in &identify_rotated_logs won't work
+    # to identify_rotated_logs to avoid unnecessary sort.
+    # Note that sort here and in identify_rotated_logs won't work
     # right if support is added for more than one digit in the filename,
     # unless we sort numerically on the number and keep the one without
     # a number at the front.
     foreach $acct_file (sort @rotated_acct_logs) {
-	if (&is_gzip ($acct_file)) {
+	if (is_gzip ($acct_file)) {
 	    # gunzip into a temp file and run lastcomm on that.
-	    $acct_temp_logfile = &gunzip_logfile ($acct_file, $temp_dir);
+	    $acct_temp_logfile = gunzip_logfile ($acct_file, $temp_dir);
 	    $acct_file = $acct_temp_logfile;
 	}
 
 	if (!open (LASTCOMM, '-|', $LASTCOMM, '-f', $acct_file)) {
-	    &send_error ($acct_file, "Could not open acct file $acct_file. $!");
+	    send_error ($acct_file, "Could not open acct file $acct_file. $!");
 	    exit; # or just return?
 	}
 	while (<LASTCOMM>) {
@@ -3115,7 +3132,7 @@ sub read_process_acct_log {
     if ($^O eq 'openbsd') {
 	($temp_fh, $temp_logfile) = mkstemp ("$temp_dir/reportnew.XXXXXXX");
 	if (!defined ($temp_logfile)) {
-	    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+	    send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 	    exit; # or just return?
 	}
     }
@@ -3123,7 +3140,7 @@ sub read_process_acct_log {
 	# create and open
 	($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
 	if (!defined ($temp_logfile)) {
-	    &send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+	    send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 	    exit; # or just return?
 	}
 	chomp ($temp_logfile);
@@ -3154,7 +3171,7 @@ sub read_linux_journal {
     my $result; # for privilege separation
 
     if ($privsep_flag && $nonpriv_flag) {
-	$result = &get_priv_data ('get-journal', { logfile => $logfile, checktime => $checktime });
+	$result = get_priv_data ('get-journal', { logfile => $logfile, checktime => $checktime });
 	return ($result->{temp_logfile}, $result->{checktime});
     }
 
@@ -3162,7 +3179,7 @@ sub read_linux_journal {
     # create and open
     ($temp_fh, $temp_logfile) = tempfile ("$temp_dir/reportnew.XXXXXXX");
     if (!defined ($temp_logfile)) {
-	&send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
+	send_error ($temp_logfile, "Could not open temp file $temp_logfile for writing. $!");
 	exit; # or just return?
     }
     chomp ($temp_logfile);
@@ -3178,7 +3195,7 @@ sub read_linux_journal {
     if ($logfile =~ /journal unit ([\w\-\.]+)$/) {
 	my $unit_arg = $1;
 	if (!grep (/^$unit_arg$/, @linux_journal_units)) {
-	    &send_error ($logfile, "Specified journal unit $unit_arg is not enabled.");
+	    send_error ($logfile, "Specified journal unit $unit_arg is not enabled.");
 	    exit; # or just return?
 	}
 	@selection_args = ('-u', $unit_arg);
@@ -3191,13 +3208,13 @@ sub read_linux_journal {
     elsif ($logfile =~ /journal syslog-facility ([\w\-\.]+)$/) {
 	my $syslog_facility_arg = $1;
 	if (!grep (/^$syslog_facility_arg$/, @linux_journal_syslog_facilities)) {
-	    &send_error ($logfile, "Specified journal syslog facility $syslog_facility_arg is not defined.");
+	    send_error ($logfile, "Specified journal syslog facility $syslog_facility_arg is not defined.");
 	    exit; # or just return?    
 	}
 	@selection_args = ('--facility=' . $syslog_facility_arg);
     }
     else {
-	&send_error ($logfile, "Could not parse journal logfile name. $logfile");
+	send_error ($logfile, "Could not parse journal logfile name. $logfile");
 	exit; # or just return?
     }
     
@@ -3206,7 +3223,7 @@ sub read_linux_journal {
 
     # Open journalctl to read log lines.
     if (!open (JOURNAL, '-|', $JOURNALCTL, @selection_args)) {
-	&send_error ($logfile, "Could not open file handle for $JOURNALCTL. $!");
+	send_error ($logfile, "Could not open file handle for $JOURNALCTL. $!");
 	exit; # or just return?
     }
 
@@ -3258,16 +3275,16 @@ sub read_size_file {
     else {
 	if (open (SIZEFILE, '<', $size_file)) {
 	    if (!flock (SIZEFILE, LOCK_SH)) {
-		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
+		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
 	    }
 	    while (<SIZEFILE>) {
 		chomp;
 		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = split (/,/);
 		if (!defined ($processing_pid)) { # bad line in size file
-		    &send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_\n");
+		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_\n");
 		}
 		if (!grep ($_ eq $logfile, @logfiles)) {
-		    &send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Logfile $logfile in size file is not in config file.");
+		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Logfile $logfile in size file is not in config file.");
 		}
 		if (!defined ($current_logfile) || $current_logfile ne $logfile) {
 		    $log_size{$logfile} = $size;
@@ -3287,25 +3304,25 @@ sub read_size_file {
 		}
 	    }
 	    if (!flock (SIZEFILE, LOCK_UN)) {
-		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
+		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
 	    }
 	    close (SIZEFILE);
 	}
 	else {
-	    &send_error ($size_file, "Cannot open size file. $!");
+	    send_error ($size_file, "Cannot open size file. $!");
 	    exit;
 	}
 
 	if (!defined ($current_logfile)) {
 	    foreach $logfile (@logfiles) {
 		if (!defined ($log_size{$logfile})) {
-		    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Logfile $logfile in config file is not in size file.");
+		    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Logfile $logfile in config file is not in size file.");
 		    $log_size{$logfile} = 0;
 		    $log_mtime{$logfile} = 0;
 		    $log_checktime{$logfile} = 0;
 		    $log_sha256_digest{$logfile} = '';
 		    $log_processing_pid{$logfile} = 0;
-		    &write_size_file ($size_file, $logfile, $LOG_APPEND);
+		    write_size_file ($size_file, $logfile, $LOG_APPEND);
 		}
 	    }
 	}
@@ -3466,10 +3483,10 @@ sub send_error {
     my ($filename, $error) = @_;
 
     if (defined ($master_notify)) {
-	&send_notify ($SHORT_HOSTNAME, $filename, $master_notify, $error);
+	send_notify ($SHORT_HOSTNAME, $filename, $master_notify, $error);
     }
     else {
-	&send_notify ($SHORT_HOSTNAME, $filename, $SECURITY_ADMIN, $error);
+	send_notify ($SHORT_HOSTNAME, $filename, $SECURITY_ADMIN, $error);
     }
 }
 
@@ -3493,20 +3510,20 @@ sub write_size_file {
     # do that.
     if (defined ($current_logfile) && $start_or_end == $LOG_APPEND) {
 	if (!open (SIZEFILE, '>>', $size_file)) {
-	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for appending. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for appending. $!");
 	    exit;
 	}
 	$lock_timeout_limit = time() + $SIZE_FILE_LOCK_TIMEOUT_LIMIT;
 	until (flock (SIZEFILE, LOCK_EX | LOCK_NB)) {
 	    if (time() > $lock_timeout_limit) {
-		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for writing. $!");
+		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for writing. $!");
 		exit;
 	    }
 	    sleep 1;
 	}
 	print SIZEFILE "$current_logfile,$log_size{$current_logfile},$log_mtime{$current_logfile},$log_checktime{$current_logfile},null,0\n";
 	if (!flock (SIZEFILE, LOCK_UN)) {
-	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after appending. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after appending. $!");
 	    exit;
 	}
 	close (SIZEFILE);
@@ -3522,16 +3539,16 @@ sub write_size_file {
 		@size_file_lines = <SIZEFILE>;
 	    }
 	    else {
-		&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
+		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
 		exit;
 	    }
 	}
 	else {
-	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for reading. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for reading. $!");
 	    exit;
 	}
 	if (!flock (SIZEFILE, LOCK_UN)) {
-	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
 	    exit;
 	}
 	close (SIZEFILE);
@@ -3543,14 +3560,14 @@ sub write_size_file {
     # Now, we write everything out, either with what we have or with what
     # was just read from the size file except for our current logfile.
     if (!open (SIZEFILE, '>', $size_file)) {
-	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
+	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
 	exit;
     }
 
     $lock_timeout_limit = time() + $SIZE_FILE_LOCK_TIMEOUT_LIMIT;
     until (flock (SIZEFILE, LOCK_EX | LOCK_NB)) {
 	if (time() > $lock_timeout_limit) {
-	    &send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for writing. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for writing. $!");
 	    exit;
 	}
 	sleep 1;
@@ -3609,7 +3626,7 @@ sub write_size_file {
 
     # Unlock and close size file.
     if (!flock (SIZEFILE, LOCK_UN)) {
-	&send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after writing. $!");
+	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after writing. $!");
 	exit;
     }
     close (SIZEFILE);
@@ -3645,7 +3662,7 @@ sub preproc_macro_substitution {
 		    $global_macro = 1;
 		}
 		else {
-		    &send_error ($config_file, "Undefined preproc macro %%$macro_name%% on line $line_num. $orig_regexp_line\n");
+		    send_error ($config_file, "Undefined preproc macro %%$macro_name%% on line $line_num. $orig_regexp_line\n");
 		    exit;
 		}
 	    }
@@ -3683,12 +3700,12 @@ sub postproc_macro_substitution {
 	foreach $output_line (@output_lines) {
 	    foreach $macro_value (keys (%append_macro)) {
 		if ($output_line =~ /$macro_value/) {
-		    $output_line = &postproc_match_and_replace ($output_line, $macro_value, $append_macro{$macro_value}, $APPEND);
+		    $output_line = postproc_match_and_replace ($output_line, $macro_value, $append_macro{$macro_value}, $APPEND);
 		}
 	    }
 	    foreach $macro_value (keys (%substitute_macro)) {
 		if ($output_line =~ /$macro_value/) {
-		    $output_line = &postproc_match_and_replace ($output_line, $macro_value, $substitute_macro{$macro_value}, $SUBSTITUTE);	    
+		    $output_line = postproc_match_and_replace ($output_line, $macro_value, $substitute_macro{$macro_value}, $SUBSTITUTE);	    
 		}
 	    }
 	}
@@ -3698,12 +3715,12 @@ sub postproc_macro_substitution {
 	foreach $output_line (@output_lines) {
 	    foreach $macro_value (keys (%global_append_macro)) {
 		if ($output_line =~ /$macro_value/) {
-		    $output_line = &postproc_match_and_replace ($output_line, $macro_value, $global_append_macro{$macro_value}, $APPEND);
+		    $output_line = postproc_match_and_replace ($output_line, $macro_value, $global_append_macro{$macro_value}, $APPEND);
 		}
 	    }
 	    foreach $macro_value (keys (%global_substitute_macro)) {
 		if ($output_line =~ /$macro_value/) {
-		    $output_line = &postproc_match_and_replace ($output_line, $macro_value, $global_substitute_macro{$macro_value}, $SUBSTITUTE);	    
+		    $output_line = postproc_match_and_replace ($output_line, $macro_value, $global_substitute_macro{$macro_value}, $SUBSTITUTE);	    
 		}
 	    }
 	}
