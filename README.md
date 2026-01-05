@@ -13,7 +13,7 @@ Current version is reportnew-1.29a of 4 January 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux),
 Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
-JSON::PP. The non-standard moduels are also on CPAN.
+JSON::PP. The non-standard modules are also on CPAN.
 
 Privileges::Drop fails with perl 5.34.1 which is the release on macOS Tahoe 26.1, but works properly with perl 5.40.2 which is the current stable Homebrew
 release. Workarounds are either use the Homebrew perl or patch Privileges::Drop on the lines beginning with my %GIDHash and my %EGIDHash to insert
