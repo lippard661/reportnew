@@ -3,7 +3,7 @@ Perl script to monitor logs for issues and issue alert emails, with some correla
 
 Supports syslog, cyclog, multilog, BSD (and macOS) and Linux process accounting logs, and Linux journal logs. Runs periodically rather than continuously.
 
-Now uses and requires Signify.pm for signed include files.
+Supports include files which may be signed (requires Signify.pm).
 
 Also available at https://www.discord.org/lippard/software
 
