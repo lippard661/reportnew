@@ -7,9 +7,9 @@ Supports include files which may be signed (requires Signify.pm).
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.29a.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
+reportnew-1.29b.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-Current version is reportnew-1.29a of 4 January 2026.
+Current version is reportnew-1.29b of 8 January 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux),
 Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
