@@ -213,6 +213,9 @@
 #    massive overkill for this script.
 # Modified 4 January 2026 by Jim Lippard to not require Signify unless
 #    signed files are used. Remove & on subroutine calls.
+# Modified 4 January 2026 by Jim Lippard to not export anything from
+#    Signify, only allow one privsep: in the config file, and strip
+#    carriage returns from mailed log output if found.
 #
 #
 # To Do:
@@ -300,7 +303,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.29a of 4 January 2026';
+my $VERSION = 'reportnew 1.29b of 8 January 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -443,7 +446,7 @@ BEGIN {
 
 # See if Signify is available.
 my $have_signify = 0;
-$have_signify = 1 if (require_module ('Signify', qw( signify_error )));
+$have_signify = 1 if (require_module ('Signify'));
 
 # If on OpenBSD, use pledge and unveil. Do as much as possible before
 # parsing the config, then finish unveiling after the config is parsed.
@@ -865,7 +868,8 @@ rmdir ($temp_dir);
 
 ### Subroutines.
 
-## Subroutine to assist in optional module importing.
+# Subroutine to assist in optional module importing.
+# (Also used in sigtree.pl.)
 sub require_module {
     my ($module, @imports) = @_;
 
@@ -894,7 +898,9 @@ sub parse_config {
 	$current_match_session_match_flag);
     my ($macro_name, $macro_value, $macro_options, $macro_file, $macro_dir);
     my ($multihost_config, $oldstyle_multihost, $found_my_host);
-    my ($linux_journal_unit, $linux_journal_syslogid, $linux_journal_syslogfacility);
+    my ($linux_journal_unit, $linux_journal_syslogid,
+	$linux_journal_syslogfacility);
+    my $have_privsep = 0;
 
     $line_num = 0;
     $specified_host = 0;
@@ -1020,14 +1026,16 @@ sub parse_config {
 			$email_sender = $value;
 		    }
 		    elsif ($directive eq 'privsep') {
-			# not checking for multiple of these, first yes
-			# overrides any subsequent no.
+			if ($have_privsep) {
+			    send_error ($config_file, "Second privsep directive on line $line_num. $value");
+			    exit;
+			}
+			$have_privsep = 1; # $use_privsep could come from -p
 			if ($value eq 'yes') {
 			    $use_privsep = 1;
 			}
 			elsif ($value eq 'no') {
-			    $use_privsep = 0 unless (defined ($use_privsep)
-						     && $use_privsep == 1);
+			    $use_privsep = 0;
 			}
 			else {
 			    send_error ($config_file, "Invalid value for privsep directive on line $line_num, must be \"yes\" or \"no\". $value");
@@ -3281,7 +3289,7 @@ sub read_size_file {
 		chomp;
 		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = split (/,/);
 		if (!defined ($processing_pid)) { # bad line in size file
-		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_\n");
+		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_");
 		}
 		if (!grep ($_ eq $logfile, @logfiles)) {
 		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Logfile $logfile in size file is not in config file.");
@@ -3437,6 +3445,7 @@ sub send_notify {
 	print MAIL "From: Reporter <$email_sender>\n";
 	print MAIL "To: $notify_list\n";
 	print MAIL "Subject: $hostname $logfile\n\n";
+	s/\r//g for @lines; # remove carriage returns
 	foreach $line (@lines) {
 	    print MAIL "$line\n";
 	}
@@ -3471,6 +3480,7 @@ sub send_text {
     else {
 	open (MAIL, '|-', $SENDMAIL, '-t');
 	print MAIL "To: $notify_list\n\n";
+	s/\r//g for @lines; # remove carriage returns
 	foreach $line (@lines) {
 	    print MAIL "$line\n";
 	}

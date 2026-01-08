@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.29b) Strip carriage returns from log output which can be rejected
+by sendmail.
+
 (Fixed 1.28a) Edge case in session match handling causes failure after
 handling a rotated log file.
 
