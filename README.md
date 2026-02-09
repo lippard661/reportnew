@@ -7,9 +7,9 @@ Supports include files which may be signed (requires Signify.pm).
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.29b.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
+reportnew-1.30.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-Current version is reportnew-1.29b of 8 January 2026.
+Current version is reportnew-1.30 of 8 February 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux),
 Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
@@ -36,6 +36,18 @@ to identify sections applicable to a set of space-separated hosts, or alternativ
    ...
    end-host: <hostname>
 to have a single unique section in the config file for each host. The former is preferred for compactness, simplicity, and eliminating redundancy between similarly-configured hosts.  reportnew -c can be used to check a config for possible syntax errors.
+
+Actions can be "notify" (send email), "text" (send email with fewer
+characters for SMS), "alert" (generate output to STDOUT), or "execute"
+(pass matching log lines to a script). For "execute," privileges are
+dropped and the script is executed as nobody:nogroup (or nobody group),
+unless privilege separation is used in which case it is executed as
+_reportnew:_reportnew. Scripts must be in a "scripts" subdirectory
+under the config file directory and must be signify-signed using a
+key defined in the config. If OpenBSD's OpenBSD::Pledge is updated
+in the future to support execpromises, reportnew will be modified
+to make use of it, but at present scripts are not bound by pledge
+or unveil unless the script applies them itself.
 
 "frequency" in config file comments is not implemented; config file doesn't include an example of
 the within-log correlation, here is an example used for alerting on an SMTP session of concern with
