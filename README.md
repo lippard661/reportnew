@@ -7,7 +7,7 @@ Supports include files which may be signed (requires Signify.pm).
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.30.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
+reportnew-1.30p0.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
 Current version is reportnew-1.30 of 8 February 2026.
 
