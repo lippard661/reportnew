@@ -216,6 +216,21 @@
 # Modified 4 January 2026 by Jim Lippard to not export anything from
 #    Signify, only allow one privsep: in the config file, and strip
 #    carriage returns from mailed log output if found.
+# Modified 8 February 2026 by Jim Lippard (with Claude) to complete
+#    implementation of 'execute' action. Scripts must be in a scripts
+#    subdirectory under the reportnew directory and must be signed with
+#    the signify key defined in the config, and are executed in the
+#    unprivileged child process (_reportnew:_reportnew) if privsep is
+#    used and as nobody:nogroup otherwise. If reportnew is already
+#    being run from a nonprivileged account, scripts are run from that
+#    same account. Since scripts must be signed to execute, I didn't
+#    bother creating a separate privileged script execution handler
+#    for privsep to run scripts as a different user. The main risk in
+#    this case is that a script could clobber the size file, which
+#    _reportnew:_reportnew has write access to. (Another alternative
+#    would be to make that root-owned and make all use of the size
+#    file run through the privileged process, which would be relatively
+#    straightforward.)
 #
 #
 # To Do:
@@ -303,7 +318,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.29b of 8 January 2026';
+my $VERSION = 'reportnew 1.30 of 8 February 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -311,6 +326,8 @@ my $DEFAULT_SIZE_FILE_DIR = '/etc/reportnew';
 my $DEFAULT_SIZE_FILE_NAME = 'reportnew.size';
 my $CONFIG_SUFFIX = ".conf";
 my $SIZE_SUFFIX = ".size";
+
+my ($MACRO_DIR, $SCRIPT_DIR); # config_dir and config_dir/scripts
 
 my $SIZE_FILE_LOCK_TIMEOUT_LIMIT = 10;
 
@@ -366,6 +383,7 @@ use vars qw(
     %match_hash_ref
     %exclude_hash_ref
     %action_hash_ref
+    %execute_scripts
     %global_preproc_macro
     $have_global_postproc_macros
     %global_append_macro
@@ -434,6 +452,9 @@ else {
     die "Usage: reportnew [-c (check)|-d (debug)|-V (version)] [config-file]\n";
 }
 
+$MACRO_DIR = dirname ($config_file);
+$SCRIPT_DIR = dirname ($config_file) . '/scripts';
+
 if (substr ($config_file, length ($config_file) - 5, 5) ne $CONFIG_SUFFIX) {
     $config_file .= $CONFIG_SUFFIX;
 }
@@ -477,8 +498,7 @@ if ($^O eq 'openbsd') {
 
     # Unveil directory where config file is, so that any macros
     # with file import can be processed.
-    my $macro_dir = dirname ($config_file);
-    unveil ($macro_dir, 'r');
+    unveil ($MACRO_DIR, 'r');
 
     # Allow writing to and creating files and dirs in /tmp.
     unveil ('/tmp', 'rwc');
@@ -545,11 +565,18 @@ if ($use_privsep && $user eq 'root' &&
     die "No JSON module available for privilege separation.\n" unless $json_loaded;
 }
 elsif ($^O eq 'openbsd') { # not using privsep
+    # If we have execute scripts, we need 'id' and 'prot_exec' promises to
+    # drop privileges when executing them (since we're not using privsep).
+    if (keys %execute_scripts) {
+	pledge (@INITIAL_PROMISES, @NONPRIVSEP_PROMISES, @PRIVSEP_INITIAL_CHILD_PROMISES) || die "Cannot pledge promises, non-privsep with script execution. $!\n";
+    }
+    else {
         pledge (@INITIAL_PROMISES, @NONPRIVSEP_PROMISES) || die "Cannot pledge promises, non-privsep. $!\n";
+    }
 }
 
 # Unveil log dirs from config and lock.
-# If script execution actions are added, will need to unveil here.
+# Also unveil execute scripts directory if any execute actions are defined.
 if ($^O eq 'openbsd') {
     my (%unveiled_dirs, $logdir, $size_file_dir);
 
@@ -561,6 +588,14 @@ if ($^O eq 'openbsd') {
 	    unveil ($logdir, "r");
 	    $unveiled_dirs{$logdir} = 1;
 	}
+    }
+
+    # Unveil execute scripts directory if any execute actions are defined.
+    # Use "rwx" to allow scripts to read, write and execute within the
+    # directory, no "c" (create) - admin must create any necessary data
+    # subdirectories.
+    if (keys %execute_scripts) {
+	unveil ($SCRIPT_DIR, "rwx");
     }
 
     # Need to unveil containing dir of size file, which can but
@@ -655,7 +690,7 @@ if ($privsep_flag) {
 
     # No longer need @PRIVSEP_INITIAL_CHILD_PROMISES.
     if ($^O eq 'openbsd') {
-	pledge (@NONPRIVSEP_PROMISES, @PRIVSEP_CHILD_PROMISES) || die "Cannot pledge promises. $!\n";
+	    pledge (@NONPRIVSEP_PROMISES, @PRIVSEP_CHILD_PROMISES) || die "Cannot pledge promises, nonpriv child. $!\n";
     }
 }
 
@@ -896,7 +931,7 @@ sub parse_config {
 	$line_num, $current_logfile, $specified_host, $current_host,
 	$all_host_master_notify, $action, $action_value,
 	$current_match_session_match_flag);
-    my ($macro_name, $macro_value, $macro_options, $macro_file, $macro_dir);
+    my ($macro_name, $macro_value, $macro_options, $macro_file);
     my ($multihost_config, $oldstyle_multihost, $found_my_host);
     my ($linux_journal_unit, $linux_journal_syslogid,
 	$linux_journal_syslogfacility);
@@ -1236,7 +1271,14 @@ sub parse_config {
 			# action: text
 			elsif ($action eq 'text') {
 			    if (defined ($action_value)) {
-				# Should probably validate email format?
+				# Validate email format at config parse time.
+				my @check_emails = split (/,\s*/, $action_value);
+				foreach my $check_email (@check_emails) {
+				    if (!valid_email ($check_email)) {
+					send_error ($config_file, "Invalid email address(es) following \"text\" action in action directive on line $line_num. $_");
+					exit;
+				    }
+				}
 				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
 			    }
 			    else {
@@ -1255,6 +1297,44 @@ sub parse_config {
 			# action: execute
 			elsif ($action eq 'execute') {
 			    if (defined ($action_value)) {
+				# Validate script name (no path traversal, alphanumeric/underscore/hyphen/dot only)
+				if ($action_value !~ /^[\w\-\.]+$/) {
+				    send_error ($config_file, "Invalid script name \"$action_value\" following \"execute\" action in action directive on line $line_num. $_");
+				    exit;
+				}
+
+				# Construct full script path
+				my $script_path = "$SCRIPT_DIR/$action_value";
+
+				# Verify script exists and is readable
+				if (!-r $script_path) {
+				    send_error ($config_file, "Cannot read execute script \"$script_path\" specified on line $line_num. $_");
+				    exit;
+				}
+
+				# Verify script is a regular file (not symlink or directory)
+				if (!-f $script_path || -l $script_path) {
+				    send_error ($config_file, "Execute script \"$script_path\" must be a regular file (not symlink or directory) on line $line_num. $_");
+				    exit;
+				}
+
+				# Verify signify signature exists and is valid
+				if (!defined ($signify_pubkey)) {
+				    send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of execute script \"$script_path\" on line $line_num. $_");
+				    exit;
+				}
+				if (!$have_signify) {
+				    send_error ($config_file, "Signify.pm not found on system, cannot verify signature on execute script \"$script_path\" on line $line_num. $_");
+				    exit;	
+				}
+				if (!verify_signify_sig ($script_path)) {
+				    send_error ($config_file, "Cannot verify signify signature on execute script \"$script_path\" on line $line_num. $_");
+				    exit;
+				}
+				
+				# Track this script for later verification and unveiling
+				$execute_scripts{$script_path} = 1;
+				
 				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
 			    }
 			    else {
@@ -1282,12 +1362,11 @@ sub parse_config {
 		    elsif ($directive eq 'include-macro-file' ||
 			   $directive eq 'include-macro-signedfile') {
 			$macro_file = $value;
-			$macro_dir = dirname ($config_file);
 			if ($macro_file !~  /^[\w\-\.]+$/) {
 			    send_error ($config_file, "Invalid macro include file name \"$macro_file\" in macro \"$macro_name\" on line $line_num. $_\n");
 			    exit;
 			}
-			$macro_file = $macro_dir . '/' . $macro_file;
+			$macro_file = $MACRO_DIR . '/' . $macro_file;
 			if (!-r $macro_file) {
 			    send_error ($config_file, "Cannot read macro include file $macro_file in macro \"$macro_name\" on line $line_num. $_\n");
 			    exit;
@@ -1483,7 +1562,7 @@ sub parse_macro {
     my ($macro_name, $macro_value, $macro_options,
 	$current_context, $current_host,
 	$line_num, $include_file_line_num) = @_;
-    my ($macro_file, $macro_dir); # macro value file
+    my ($macro_file); # macro value file
 
     # Combine config line number and macro include file line number in errors
     # if we're processing a macro include file.
@@ -1510,12 +1589,11 @@ sub parse_macro {
 	 ($current_context == $HOST_CONTEXT &&
 	  $current_host eq $HOSTNAME))){
 	$macro_file = $1;
-	$macro_dir = dirname ($config_file);
 	if ($macro_file !~  /^[\w\-\.]+$/) {
 	    send_error ($config_file, "Invalid macro value file name \"$macro_file\" in macro \"$macro_name\" on line $line_num. $_\n");
 	    exit;
 	}
-	$macro_file = $macro_dir . '/' . $macro_file;
+	$macro_file = $MACRO_DIR . '/' . $macro_file;
 	if (!-r $macro_file) {
 	    send_error ($config_file, "Cannot read macro value file $macro_file in macro \"$macro_name\" on line $line_num. $_\n");
 	    exit;
@@ -3396,21 +3474,126 @@ sub match_line {
     }
 }
 
-# Execute a script as nonprivileged user.
+# Execute a script as nonprivileged user. (If non privsep, drop
+# privileges and run as nobody/nogroup.) Script must be signed.
+# If OpenBSD, re-pledge? Need to allow writing to the file system
+# as a prime use case would be, e.g., extracting and logging IP
+# addresses, mail certs, etc.
 sub execute_script {
+    my ($script_name, $hostname, $logfile, @lines) = @_;
+    my ($script_path, $pid);
 
-# Should verify the existence of script, permissions, and what else?
+    # Construct full script path
+    $script_path = "$SCRIPT_DIR/$script_name";
 
-    if (fork) {
-	wait;
-	return $? >> 8;
+    # Re-validate script name (defense in depth)
+    if ($script_name !~ /^[\w\-\.]+$/) {
+	send_error ($script_path, "Invalid script name in execute_script: $script_name");
+	return;
     }
 
-    # -- child
-    # Drop privileges.
-# Not yet ready...
-#    drop_privileges('nobody'); # better, use _reportnew.
-#    exec @_;
+    # TOCTOU mitigation: Re-verify script existence and signature just before execution
+    if (!-r $script_path || !-f $script_path || -l $script_path) {
+	send_error ($script_path, "Execute script $script_path is not readable, not a regular file, or is a symlink");
+	return;
+    }
+
+    if (!verify_signify_sig ($script_path)) {
+	send_error ($script_path, "Cannot verify signify signature on execute script $script_path just before execution");
+	return;
+    }
+
+    # Create a pipe to pass matching lines to the script
+    pipe (my $read_fh, my $write_fh) || do {
+	send_error ($script_path, "Cannot create pipe for execute script. $!");
+	return;
+    };
+
+    # Fork to execute script
+    $pid = fork();
+    if (!defined ($pid)) {
+	send_error ($script_path, "Cannot fork to execute script $script_path. $!");
+	close ($read_fh);
+	close ($write_fh);
+	return;
+    }
+
+    # Parent process
+    if ($pid) {
+	close ($read_fh);
+	
+	# Write matching lines to the pipe
+	foreach my $line (@lines) {
+	    print $write_fh "$line\n";
+	}
+	close ($write_fh);
+	
+	# Wait for child to complete
+	waitpid ($pid, 0);
+	my $exit_status = $? >> 8;
+	if ($exit_status != 0) {
+	    send_error ($script_path, "Execute script $script_path exited with status $exit_status");
+	}
+	return $exit_status;
+    }
+
+    # Child process - will exec the script
+    close ($write_fh);
+    
+    # Drop privileges to nobody/nogroup unless using privsep or being run
+    # by a non-root user.
+    if ($< == 0 || $> == 0) { # Running as root (real or effective uid is 0)
+	my ($nobody_uid, $nobody_gid);
+    
+	# Try nobody first, then _reportnew as fallback
+	$nobody_uid = getpwnam ('nobody');
+	$nobody_gid = getgrnam ('nogroup') || getgrnam ('nobody');
+    
+	if (defined ($nobody_uid) && defined ($nobody_gid)) {
+	    # Drop privileges
+	    eval {
+		require Privileges::Drop;
+		Privileges::Drop::drop_uidgid ($nobody_uid, $nobody_gid);
+	    };
+	    if ($@) {
+		# If we can't load Privileges::Drop, try manual drop
+		$( = $nobody_gid;
+		$) = $nobody_gid;
+		$< = $nobody_uid;
+		$> = $nobody_uid;
+	    
+		# Verify privilege drop worked
+		if ($> != $nobody_uid || $< != $nobody_uid ||
+		    $) != $nobody_gid || $( != $nobody_gid) {
+		    die "Failed to drop privileges for execute script\n";
+		}
+	    }
+	}
+	else {
+	    die "Cannot find nobody:nogroup|nobody for privilege drop for script execution.\n";
+	}
+    }
+
+    # Redirect stdin from the pipe
+    open (STDIN, '<&', $read_fh) || die "Cannot redirect stdin. $!\n";
+    close ($read_fh);
+    
+    # Set up environment variables
+    $ENV{'REPORTNEW_HOSTNAME'} = $hostname;
+    $ENV{'REPORTNEW_LOGFILE'} = $logfile;
+    
+    # Clean environment for security
+    delete @ENV{qw(IFS CDPATH BASH_ENV PERL5LIB LD_PRELOAD LD_LIBRARY_PATH)};
+
+    # Exec the script
+    # The child inherits the unveil restrictions from the parent process.
+    # On OpenBSD, the script won't be able to access files outside the
+    # unveiled paths (scripts directory and /tmp).
+    # The child also inherits pledges - it can exec this one script, but
+    # the script itself won't be able to exec other programs or fork because
+    # shell scripts executed via exec don't inherit pledges, they run under
+    # the kernel's default restrictions for the executable format.
+    exec ($script_path) || die "Cannot exec $script_path. $!\n";
 }
 
 # Send a mail notification.
