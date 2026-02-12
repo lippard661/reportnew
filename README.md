@@ -7,9 +7,9 @@ Supports include files which may be signed (requires Signify.pm).
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.30p0.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
+reportnew-1.31.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-Current version is reportnew-1.30 of 8 February 2026.
+Current version is reportnew-1.31 of 11 February 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux),
 Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
@@ -48,6 +48,17 @@ key defined in the config. If OpenBSD's OpenBSD::Pledge is updated
 in the future to support execpromises, reportnew will be modified
 to make use of it, but at present scripts are not bound by pledge
 or unveil unless the script applies them itself.
+
+An "execute" action can be added as a second action after any "notify,"
+"text," or "alert" action by appending a semicolon to the end of the
+first action and adding the execute action, e.g.,:
+
+    action: notify foo@example.com; execute myscript.sh
+
+This is intended for cases such as a script collecting data from a log
+alert for some other purpose, e.g., for collecting malicious IPs or
+host names, mail certificate fingerprints of connecting mail servers,
+etc.
 
 "frequency" in config file comments is not implemented; config file doesn't include an example of
 the within-log correlation, here is an example used for alerting on an SMTP session of concern with
