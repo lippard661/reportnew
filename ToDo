@@ -75,6 +75,9 @@ the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
 
+* (Done 1.31) Implemented optional extra script execution action in
+a single match/exclude/action triplet.
+
 * (Done 1.30) Implemented script execution option.
 
 * (Done 1.29a) Improve request_id format, completely mitigate replay

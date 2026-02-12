@@ -231,11 +231,11 @@
 #    would be to make that root-owned and make all use of the size
 #    file run through the privileged process, which would be relatively
 #    straightforward.)
+# Modified 11 February 2026 by Jim Lippard (using Claude) to add an
+#    optional "execute" action to a notify/text/alert action.
 #
 #
 # To Do:
-#    - Find way to not miss additional process execution within the same
-#      minute of the last check?
 #    - Add time range checking option for match and exclude (new directive?)
 
 # Suggested enhancements:
@@ -318,7 +318,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.30 of 8 February 2026';
+my $VERSION = 'reportnew 1.31 of 11 February 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1242,111 +1242,146 @@ sub parse_config {
 			    send_error ($config_file, "No log directive corresponding to action directive on line $line_num. $_");
 			    exit;
 			}
-			# Parse action (action, whitespace, value).
-			if ($value !~ /\s/) {
-			    $action = $value;
-			    undef $action_value;
+			# Check for semicolon (multiple actions).
+			# Syntax: "action: notify email@example.com; execute script.sh"
+			# Only execute permitted as second action, and only after notify/alert/text.
+			my @action_specs;
+			if ($value =~ /^([^;]+);(.*)$/) { # multiple
+			    @action_specs = ($1, $2);
+			    # Trim whitespace
+			    $action_specs[0] =~ s/^\s+|\s+$//g;
+			    $action_specs[1] =~ s/^\s+|\s+$//g;
 			}
-			else {
-			    ($action, $action_value) = split (/\s+/, $value, 2);
+			else { # just one
+			    @action_specs = ($value);
 			}
-			# action: notify
-			if ($action eq 'notify') {
-			    if (defined ($action_value)) {
-				# Minimal email validation.
-				my @check_emails = split (/,\s*/, $action_value);
-				foreach my $check_email (@check_emails) {
-				    if (!valid_email ($check_email)) {
-					send_error ($config_file, "Invalid email address(es) following \"notify\" action in action directive on line $line_num. $_");
+			my @parsed_actions;
+			for (my $idx = 0; $idx <= $#action_specs; $idx++) {
+			    my $action_spec = $action_specs[$idx];
+			    my ($action, $action_value);
+			    # Parse action (action, whitespace, value).
+			    if ($action_spec !~ /\s/) {
+				$action = $value;
+				undef $action_value;
+			    }
+			    else {
+				($action, $action_value) = split (/\s+/, $action_spec, 2);
+			    }
+
+			    # Validate second action must be execute.
+			    if ($idx == 1 && $action ne 'execute') {
+				send_error ($config_file, "Second action after semicolon must be \"execute\" on line $line_num. $_");
+				exit;
+			    }
+
+			    # Validate first action cannot be execute if there's a second.
+			    if ($idx == 0 && @action_specs == 2 && $action eq 'execute') {
+				send_error ($config_file, "Cannot have \"execute\" as first action when using semicolon syntax on line $line_num. $_");
+				exit;
+			    }
+
+			    # Parse and validate each action type
+			    # action: notify
+			    if ($action eq 'notify') {
+				if (defined ($action_value)) {
+				    # Minimal email validation.
+				    my @check_emails = split (/,\s*/, $action_value);
+				    foreach my $check_email (@check_emails) {
+					if (!valid_email ($check_email)) {
+					    send_error ($config_file, "Invalid email address(es) following \"notify\" action in action directive on line $line_num. $_");
+					    exit;
+					}
+				    }
+				    push (@parsed_actions, "$action,$action_value");
+				}
+				else {
+				    send_error ($config_file, "Missing email address(es) following \"notify\" action in action directive on line $line_num. $_");
+				    exit;
+				}
+			    }
+			    # action: text
+			    elsif ($action eq 'text') {
+				if (defined ($action_value)) {
+				    # Validate email format at config parse time.
+				    my @check_emails = split (/,\s*/, $action_value);
+				    foreach my $check_email (@check_emails) {
+					if (!valid_email ($check_email)) {
+					    send_error ($config_file, "Invalid email address(es) following \"text\" action in action directive on line $line_num. $_");
+					    exit;
+					}
+				    }
+				    push (@parsed_actions, "$action,$action_value");
+
+				}
+				else {
+				    send_error ($config_file, "Missing email address(es) following \"text\" action in action directive on line $line_num. $_");
+				    exit;
+				}
+			    }
+			    # action: alert
+			    elsif ($action eq 'alert') {
+				if (defined ($action_value)) {
+				    send_error ($config_file, "Extraneous data following \"alert\" action in action directive on line $line_num. $_");
+				    exit;
+				}
+				push (@parsed_actions, $action);
+			    }
+			    # action: execute
+			    elsif ($action eq 'execute') {
+				if (defined ($action_value)) {
+				    # Validate script name (no path traversal, alphanumeric/underscore/hyphen/dot only)
+				    if ($action_value !~ /^[\w\-\.]+$/) {
+					send_error ($config_file, "Invalid script name \"$action_value\" following \"execute\" action in action directive on line $line_num. $_");
 					exit;
 				    }
-				}
-				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
-			    }
-			    else {
-				send_error ($config_file, "Missing email address(es) following \"notify\" action in action directive on line $line_num. $_");
-				exit;
-			    }
-			}
-			# action: text
-			elsif ($action eq 'text') {
-			    if (defined ($action_value)) {
-				# Validate email format at config parse time.
-				my @check_emails = split (/,\s*/, $action_value);
-				foreach my $check_email (@check_emails) {
-				    if (!valid_email ($check_email)) {
-					send_error ($config_file, "Invalid email address(es) following \"text\" action in action directive on line $line_num. $_");
+
+				    # Construct full script path
+				    my $script_path = "$SCRIPT_DIR/$action_value";
+
+				    # Verify script exists and is readable
+				    if (!-r $script_path) {
+					send_error ($config_file, "Cannot read execute script \"$script_path\" specified on line $line_num. $_");
 					exit;
 				    }
-				}
-				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
-			    }
-			    else {
-				send_error ($config_file, "Missing email address(es) following \"text\" action in action directive on line $line_num. $_");
-				exit;
-			    }
-			}
-			# action: alert
-			elsif ($action eq 'alert') {
-			    if (defined ($action_value)) {
-				send_error ($config_file, "Extraneous data following \"alert\" action in action directive on line $line_num. $_");
-				exit;
-			    }
-			    push (@{$action_hash{$current_logfile}}, $action);
-			}
-			# action: execute
-			elsif ($action eq 'execute') {
-			    if (defined ($action_value)) {
-				# Validate script name (no path traversal, alphanumeric/underscore/hyphen/dot only)
-				if ($action_value !~ /^[\w\-\.]+$/) {
-				    send_error ($config_file, "Invalid script name \"$action_value\" following \"execute\" action in action directive on line $line_num. $_");
-				    exit;
-				}
 
-				# Construct full script path
-				my $script_path = "$SCRIPT_DIR/$action_value";
+				    # Verify script is a regular file (not symlink or directory)
+				    if (!-f $script_path || -l $script_path) {
+					send_error ($config_file, "Execute script \"$script_path\" must be a regular file (not symlink or directory) on line $line_num. $_");
+					exit;
+				    }
 
-				# Verify script exists and is readable
-				if (!-r $script_path) {
-				    send_error ($config_file, "Cannot read execute script \"$script_path\" specified on line $line_num. $_");
-				    exit;
-				}
-
-				# Verify script is a regular file (not symlink or directory)
-				if (!-f $script_path || -l $script_path) {
-				    send_error ($config_file, "Execute script \"$script_path\" must be a regular file (not symlink or directory) on line $line_num. $_");
-				    exit;
-				}
-
-				# Verify signify signature exists and is valid
-				if (!defined ($signify_pubkey)) {
-				    send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of execute script \"$script_path\" on line $line_num. $_");
-				    exit;
-				}
-				if (!$have_signify) {
-				    send_error ($config_file, "Signify.pm not found on system, cannot verify signature on execute script \"$script_path\" on line $line_num. $_");
-				    exit;	
-				}
-				if (!verify_signify_sig ($script_path)) {
-				    send_error ($config_file, "Cannot verify signify signature on execute script \"$script_path\" on line $line_num. $_");
-				    exit;
-				}
+				    # Verify signify signature exists and is valid
+				    if (!defined ($signify_pubkey)) {
+					send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of execute script \"$script_path\" on line $line_num. $_");
+					exit;
+				    }
+				    if (!$have_signify) {
+					send_error ($config_file, "Signify.pm not found on system, cannot verify signature on execute script \"$script_path\" on line $line_num. $_");
+					exit;	
+				    }
+				    if (!verify_signify_sig ($script_path)) {
+					send_error ($config_file, "Cannot verify signify signature on execute script \"$script_path\" on line $line_num. $_");
+					exit;
+				    }
 				
-				# Track this script for later verification and unveiling
-				$execute_scripts{$script_path} = 1;
-				
-				push (@{$action_hash{$current_logfile}}, "$action,$action_value");
+				    # Track this script for later verification and unveiling
+				    $execute_scripts{$script_path} = 1;
+				    push (@parsed_actions, "$action,$action_value");
+				}
+				else {
+				    send_error ($config_file, "Missing script name following \"execute\" action in action directive on line $line_num. $_");
+				    exit;
+				}
 			    }
+			    # Other actions?
 			    else {
-				send_error ($config_file, "Missing script name following \"execute\" action in action directive on line $line_num. $_");
+				send_error ($config_file, "Unknown action \"$action\" specified in action directive on line $line_num. $_");
 				exit;
 			    }
 			}
-			# Other actions?
-			else {
-			    send_error ($config_file, "Unknown action specified in action directive on line $line_num. $_");
-			    exit;
-			}
+
+			# @parsed_actions is already an array of strings, make it an array ref.
+			push (@${$action_hash{$current_logfile}}, [@parsed_actions]);
 		    }
 		    # For backwards compatibility.
 		    elsif ($directive eq 'notify') {
@@ -1354,7 +1389,8 @@ sub parse_config {
 			    send_error ($config_file, "No log directive corresponding to notify directive on line $line_num. $_");
 			    exit;
 			}
-			push (@{$action_hash{$current_logfile}}, "$directive,$value");
+			# Store as array ref for consistency with action: directive
+			push (@{$action_hash{$current_logfile}}, ["$directive,$value"]);
 			# need to specify that action=notify, and add
 			# separate code to parse new action: directive.
 		    }
@@ -1464,10 +1500,13 @@ sub parse_config {
 	}
 	$exclude_hash_ref{$current_logfile} = \@{$exclude_hash{$current_logfile}};
 	if (!defined ($action_hash{$current_logfile})) {
-	    push (@{$action_hash{$current_logfile}}, $master_notify);
+	    # Default action is notify to master_notify (stored as array ref)
+	    push (@{$action_hash{$current_logfile}}, [$master_notify]);
 	    # need indicator for action=notify.
 	}
-	$action_hash_ref{$current_logfile} = \@{$action_hash{$current_logfile}};
+	# $action_hash{$current_logfile} in scalar context gives us a REF to the array ref
+	# We need to dereference it once to get the actual ARRAY ref
+	$action_hash_ref{$current_logfile} = ${$action_hash{$current_logfile}};
     }
 
     # If there are linux journal logs, pull validation data.
@@ -2451,7 +2490,8 @@ sub check_logfile {
     # Turn match/exclude/action refs into arrays.
     @match_hashes = @{$match_ref};
     @exclude_hashes = @{$exclude_ref};
-    @action_hashes = @{$action_ref};
+    # action_ref is an array ref of array refs - use directly.
+    my $action_hashes_ref = $action_ref;
 
     # Identify session rules.
     # Session rules collect matches as normal with the normal processing but most will be discarded.
@@ -2496,7 +2536,7 @@ sub check_logfile {
 		for ($idx = 0; $idx <= $#match_hashes; $idx++) {
 		    $match = $match_hashes[$idx];
 		    $exclude = $exclude_hashes[$idx];
-		    $action = $action_hashes[$idx]; # May not be necessary.
+#		    $action = $action_hashes[$idx]; # May not be necessary.
 
 		    # Process session matches. If we find a match to the exclude array, the relevant match group is returned so that
 		    # it can be added to the $session_match_array which will be used to identify the matches to keep.
@@ -2546,10 +2586,10 @@ sub check_logfile {
 
 	    # Perform action on corresponding matches, and reset
 	    # @notify_lines for the next match/exclude/action.
-	    for ($idx = 0; $idx <= $#action_hashes; $idx++) {
+	    for ($idx = 0; $idx <= $#{$action_hashes_ref}; $idx++) {
 		$have_matches_flag = 0;
-		$action = $action_hashes[$idx];
-		($action, $action_value) = split (/,/, $action, 2);
+		my $action_arrayref = $action_hashes_ref->[$idx];
+
 		if (exists ($notify_arrays[$idx])) {
 		    # Process session matches. Just return the notify_array lines which match the collected session match strings (from
 		    # the "$session_exclude_array").
@@ -2571,22 +2611,29 @@ sub check_logfile {
 		    if ($have_postproc_macros || $have_global_postproc_macros) {
 			@notify_lines = postproc_macro_substitution (@notify_lines);
 		    }
-		    if ($action eq 'notify') {
-			send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
-		    }
-		    elsif ($action eq 'alert') {
-			print "***$SHORT_HOSTNAME $ref_logfile\n";
-			foreach $line (@notify_lines) {
-			    print "$line\n";
+
+		    # Execute all actions for this match/exclude pair.
+		    # Actions are stored as array ref (may contain one or two actions).
+		    foreach my $action_string (@{$action_arrayref}) {
+			my ($action, $action_value) = split (/,/, $action_string, 2);
+			
+			if ($action eq 'notify') {
+			    send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
 			}
-			print "***\n";
-		    }
-		    elsif ($action eq 'text') {
-			# Might want to do separate text per line?
-			send_text ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
-		    }
-		    elsif ($action eq 'execute') {
-			execute_script ($action_value, $HOSTNAME, $ref_logfile, @notify_lines);
+			elsif ($action eq 'alert') {
+			    print "***$SHORT_HOSTNAME $ref_logfile\n";
+			    foreach $line (@notify_lines) {
+				print "$line\n";
+			    }
+			    print "***\n";
+			}
+			elsif ($action eq 'text') {
+			    # Might want to do separate text per line?
+			    send_text ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
+			}
+			elsif ($action eq 'execute') {
+			    execute_script ($action_value, $HOSTNAME, $ref_logfile, @notify_lines);
+			}
 		    }
 		}
 	    }
