@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.31a) Wrap log lines of more than 990 characters before sending
+in email (RFC 5321).
+
 (Fixed 1.29b) Strip carriage returns from log output which can be rejected
 by sendmail.
 

@@ -233,6 +233,8 @@
 #    straightforward.)
 # Modified 11 February 2026 by Jim Lippard (using Claude) to add an
 #    optional "execute" action to a notify/text/alert action.
+# Modified 19 February 2026 by Jim Lippard to wrap log lines > 990
+#    characters in length (RFC 5321 has a 998-char limit).
 #
 #
 # To Do:
@@ -318,7 +320,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.31 of 11 February 2026';
+my $VERSION = 'reportnew 1.31a of 20 February 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -3677,7 +3679,12 @@ sub send_notify {
 	print MAIL "Subject: $hostname $logfile\n\n";
 	s/\r//g for @lines; # remove carriage returns
 	foreach $line (@lines) {
-	    print MAIL "$line\n";
+	    if (length($line) > 990) {
+		print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
+	    }
+	    else {
+		print MAIL "$line\n";
+	    }
 	}
 	close (MAIL);
     }
@@ -3712,7 +3719,12 @@ sub send_text {
 	print MAIL "To: $notify_list\n\n";
 	s/\r//g for @lines; # remove carriage returns
 	foreach $line (@lines) {
-	    print MAIL "$line\n";
+	    if (length($line) > 990) {
+		print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
+	    }
+	    else {
+		print MAIL "$line\n";
+	    }
 	}
 	close (MAIL);
     }
