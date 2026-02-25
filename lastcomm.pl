@@ -16,6 +16,8 @@
 #   only). There are more Linux options that could be added.
 # Modified 4 January 2026 by Jim Lippard to remove & from subroutine
 #   calls.
+# Modified 25 February 2026 by Jim Lippard to adjust Linux format
+#   and flag order.
 
 # Optional arguments to match user, device/tty, or command, multiple
 # args treated as OR, not AND.
@@ -55,8 +57,8 @@ my $MACOS_RECORD_FORMAT = "Z10 S< S< S< l< L< L< S< S< l< b8";
 # OpenBSD and macOS using 64 bit btime, Linux using 32 bit btime
 
 my $BSD_OUTPUT_FORMAT = "%-*.*s %-*.*s %-*.*s %-*.*s %6.2f secs %.16s";
-my $LINUX_OUTPUT_FORMAT = "%-*.*s %*.*s %-*.*s %-*.*s %6.2f secs %.16s";
-my $LINUX_SWAPS_OUTPUT_FORMAT = "%-*.*s %*.*s %6.0fmin %6.0fmaj %4.0fswp %6.2f secs %.16s";
+my $LINUX_OUTPUT_FORMAT = "%-*.*s %-*.*s %-*.*s %-*.*s %6.2f secs %.16s";
+my $LINUX_SWAPS_OUTPUT_FORMAT = "%-*.*s %-*.*s %6.0fmin %6.0fmaj %4.0fswp %6.2f secs %.16s";
 
 my @PROMISES = ('unveil', 'rpath', 'getpw');
 
@@ -303,8 +305,9 @@ sub flagbits {
 	[ 10, 'B' ] # BT CFI violation
 	);
     @flagbitmap = (
-	[ 0, 'F' ], # fork'd but not exec'd
 	[ 1, 'S' ],
+	[ 0, 'F' ], # fork'd but not exec'd
+	[ 2, ' ' ], # ACOMP, unused
 	[ 3, 'C' ],
 	[ 4, 'X' ] # killed by a signal
 	) if ($^O eq 'linux' || $^O eq 'darwin');
