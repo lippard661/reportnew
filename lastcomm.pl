@@ -305,10 +305,10 @@ sub flagbits {
 	[ 10, 'B' ] # BT CFI violation
 	);
     @flagbitmap = (
-	[ 1, 'S' ],
+	[ 1, 'S' ], # process executed with superuser privs
 	[ 0, 'F' ], # fork'd but not exec'd
-	[ 2, ' ' ], # ACOMP, unused
-	[ 3, 'C' ],
+	[ 2, 'C' ], # ACOMPAT, compatibility mode (VAX/PDP, obsolete)
+	[ 3, 'D' ], # dumped core
 	[ 4, 'X' ] # killed by a signal
 	) if ($^O eq 'linux' || $^O eq 'darwin');
 
