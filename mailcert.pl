@@ -4,6 +4,8 @@
 # Written 10 February 2026 by Jim Lippard.
 # Modified 13 February 2026 by Jim Lippard to cache fingerprints and
 #    macros.
+# Modified 27 February 2026 by Jim Lippard to only log if it's a fingerprint
+#    (and not already a substitute macro).
 
 use strict;
 use warnings;
@@ -66,30 +68,32 @@ while (<STDIN>) {
 open (LOG, '>>', $LOGFILE) || die "Cannot open log file $LOGFILE. $!\n";
 
 foreach $uid (keys (%date)) {
-    print LOG "$date{$uid}: $sender_ip{$uid} ($sender_host{$uid}): $cert{$uid}\n" if ($cert{$uid} =~ /SHA256:[0-9a-f]+/);
-    # Is this new?
-    if (!defined ($cache_cert{$cert{$uid}})) {
-	$cache_cert{$cert{$uid}} = 1;
-	# Build macro name.
-	my @domain_parts = split (/\./, $sender_host{$uid});
-	my $domain_tld = shift (@domain_parts);
-	$domain_name = shift (@domain_parts);
-	my $seconds = parsedate ($date{$uid});
-	my $isodate = strftime ("%F", localtime ($seconds));
-	$isodate =~ s/-//g;
-	if ($sender_host{$uid} =~ /e100\.net/) {
-	    $domain_name = 'google';
-	}
-	my $macro_name = 'CERT_' . $domain_name . '_' . $isodate;
+    if ($cert{$uid} =~ /SHA256:[0-9a-f]+/) {
+	print LOG "$date{$uid}: $sender_ip{$uid} ($sender_host{$uid}): $cert{$uid}\n";
+	# Is this new?
+	if (!defined ($cache_cert{$cert{$uid}})) {
+	    $cache_cert{$cert{$uid}} = 1;
+	    # Build macro name.
+	    my @domain_parts = split (/\./, $sender_host{$uid});
+	    my $domain_tld = shift (@domain_parts);
+	    $domain_name = shift (@domain_parts);
+	    my $seconds = parsedate ($date{$uid});
+	    my $isodate = strftime ("%F", localtime ($seconds));
+	    $isodate =~ s/-//g;
+	    if ($sender_host{$uid} =~ /e100\.net/) {
+		$domain_name = 'google';
+	    }
+	    my $macro_name = 'CERT_' . $domain_name . '_' . $isodate;
 
-	if (defined ($cache_macro{$macro_name})) {
-	    $macro_name .= 'b';
+	    if (defined ($cache_macro{$macro_name})) {
+		$macro_name .= 'b';
+	    }
+	    $cache_macro{$macro_name} = 1;
+	    print LOG "$macro_name = \"$cert{$uid}\":substitute\n";
 	}
-	$cache_macro{$macro_name} = 1;
-	print LOG "$macro_name = \"$cert{$uid}\":substitute\n";
-    }
-    else {
-	print LOG "$domain_name fingerprint $cert{$uid} still needs macro.\n";
+	else {
+	    print LOG "$domain_name fingerprint $cert{$uid} still needs macro.\n";
+	}
     }
 }
 

@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.31c) Remove deprecated "tmppath" pledge. Fix bug in mailcert.pl
+sample script.
+
 (Fixed 1.31a) Wrap log lines of more than 990 characters before sending
 in email (RFC 5321).
 

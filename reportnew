@@ -235,6 +235,9 @@
 #    optional "execute" action to a notify/text/alert action.
 # Modified 19 February 2026 by Jim Lippard to wrap log lines > 990
 #    characters in length (RFC 5321 has a 998-char limit).
+# Modified 25 February 2026 by Jim Lippard for minor change to Linux
+#    process flags.
+# Modified 27 February 2026 by Jim Lippard to remove tmppath pledge.
 #
 #
 # To Do:
@@ -320,7 +323,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.31a of 20 February 2026';
+my $VERSION = 'reportnew 1.31c of 28 February 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -363,7 +366,7 @@ my $SKIPPING = 3;
 my $LOG_CONTEXT = 3; # not used, uses !defined($current_logfile)
 
 my @INITIAL_PROMISES = ('unveil');
-my @NONPRIVSEP_PROMISES = ('rpath', 'wpath', 'cpath', 'tmppath', 'flock', 'exec', 'proc');
+my @NONPRIVSEP_PROMISES = ('rpath', 'wpath', 'cpath', 'flock', 'exec', 'proc');
 my @PRIVSEP_INITIAL_CHILD_PROMISES = ('id', 'prot_exec');
 my @PRIVSEP_CHILD_PROMISES = ('recvfd');
 my @PRIVSEP_PARENT_PROMISES = ('chown', 'sendfd');
@@ -477,7 +480,7 @@ $have_signify = 1 if (require_module ('Signify'));
 if ($^O eq 'openbsd') {
     # Pledge. stdio is already included.
     # @INITIAL_PROMISES: unveil
-    # @NONPRIVSEP_PROMISES: rpath, wpath, cpath, tmppath, flock, proc, exec
+    # @NONPRIVSEP_PROMISES: rpath, wpath, cpath, flock, proc, exec
     #     flock for locking size file
     #     proc for pid testing and exec
     #     exec for sendmail
@@ -3089,9 +3092,10 @@ sub flagbits {
 	[ 10, 'B' ] # BT CFI violation
 	);
     @flagbitmap = (
-	[ 0, 'F' ], # fork'd but not exec'd
 	[ 1, 'S' ], # process executed with superuser privs
-	[ 3, 'C' ], # dumped core
+	[ 0, 'F' ], # fork'd but not exec'd
+	[ 2, 'C' ], # ACOMPAT, compatibility mode (VAX/PDP, obsolete)
+	[ 3, 'D' ], # dumped core
 	[ 4, 'X' ]  # killed by a signal
 	) if ($^O eq 'linux' || $^O eq 'darwin');
 
