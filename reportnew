@@ -238,6 +238,9 @@
 # Modified 25 February 2026 by Jim Lippard for minor change to Linux
 #    process flags.
 # Modified 27 February 2026 by Jim Lippard to remove tmppath pledge.
+# Modified 4 March 2026 by Jim Lippard to use Z24 instead of A24 for
+#    unpacking command names in process accounting logs, to avoid
+#    unnecessary (and sendmail-confusing) nulls.
 #
 #
 # To Do:
@@ -323,7 +326,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.31c of 28 February 2026';
+my $VERSION = 'reportnew 1.31d of 4 March 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -2840,7 +2843,7 @@ sub direct_read_process_acct_log {
     my ($rotated_logs_flag, @rotated_acct_logs, $acct_temp_logfile);
     my ($is_live_file);
 
-    my $OPENBSD_RECORD_FORMAT = "A24 S< S< S< S< q< L< L< L< l< L< b32";
+    my $OPENBSD_RECORD_FORMAT = "Z24 S< S< S< S< q< L< L< L< l< L< b32";
     my $LINUX_RECORD_FORMAT = "b8 C S< L< L< L< L< L< L< f< S< S< S< S< S< S< S< S< Z16";
     my $MACOS_RECORD_FORMAT = "Z10 S< S< S< l< L< L< S< S< l< b8";
 

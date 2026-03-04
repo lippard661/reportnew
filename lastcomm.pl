@@ -18,6 +18,8 @@
 #   calls.
 # Modified 25 February 2026 by Jim Lippard to adjust Linux format
 #   and flag order.
+# Modified 4 March 2026 by Jim Lippard to unpack with Z24 instead of A24
+#   on OpenBSD, to avoid nulls in output.
 
 # Optional arguments to match user, device/tty, or command, multiple
 # args treated as OR, not AND.
@@ -51,7 +53,7 @@ my $MACOS_COMMPIDSIZE = 10; # no PID in process accounting
 my $FLAGSIZE = 7;
 my $LINUX_FLAGSIZE = 5;
 
-my $OPENBSD_RECORD_FORMAT = "A24 S< S< S< S< q< L< L< L< l< L< b32";
+my $OPENBSD_RECORD_FORMAT = "Z24 S< S< S< S< q< L< L< L< l< L< b32";
 my $LINUX_RECORD_FORMAT = "b8 C S< L< L< L< L< L< L< f< S< S< S< S< S< S< S< S< Z16";
 my $MACOS_RECORD_FORMAT = "Z10 S< S< S< l< L< L< S< S< l< b8";
 # OpenBSD and macOS using 64 bit btime, Linux using 32 bit btime
