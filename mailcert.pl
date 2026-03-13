@@ -6,6 +6,8 @@
 #    macros.
 # Modified 27 February 2026 by Jim Lippard to only log if it's a fingerprint
 #    (and not already a substitute macro).
+# Modified 12 March 2026 by Jim Lippard to build domain name for logging if
+#    already cached.
 
 use strict;
 use warnings;
@@ -92,6 +94,9 @@ foreach $uid (keys (%date)) {
 	    print LOG "$macro_name = \"$cert{$uid}\":substitute\n";
 	}
 	else {
+	    my @domain_parts = split (/\./, $sender_host{$uid});
+	    my $domain_tld = shift (@domain_parts);
+	    $domain_name = shift (@domain_parts);
 	    print LOG "$domain_name fingerprint $cert{$uid} still needs macro.\n";
 	}
     }
