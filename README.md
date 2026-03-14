@@ -58,8 +58,9 @@ first action and adding the execute action, e.g.,:
 This is intended for cases such as a script collecting data from a log
 alert for some other purpose, e.g., for collecting malicious IPs or
 host names, mail certificate fingerprints of connecting mail servers,
-etc. A sample script for mail certificate fingerprint handling and
-creation of macros is included, mailcert.pl.
+etc. Sample scripts for mail certificate fingerprint handling and
+creation of macros is included, mailcert.pl, and for pulling WiFi SSID
+and MAC addresses from WAX620 neighbor AP logs, wifi.pl.
 
 "frequency" in config file comments is not implemented; config file doesn't include an example of
 the within-log correlation, here is an example used for alerting on an SMTP session of concern with
