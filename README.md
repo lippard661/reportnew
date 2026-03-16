@@ -7,9 +7,9 @@ Supports include files which may be signed (requires Signify.pm).
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.31dp1.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
+reportnew-1.32.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-Current version is reportnew-1.31d of 4 March 2026.
+Current version is reportnew-1.32 of 16 March 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux),
 Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
@@ -26,6 +26,9 @@ the only intent is to use it for process accounting log monitoring. (Use "launch
 will run every 30 minutes.)
 
 Another sample macOS PLIST for /Library/LaunchDaemons (org.discord.rotateacct.plist) is supplied for rotating process accounting logs using the rotateacct.sh shell script.
+
+Another sample macOS PLIST for /Library/LaunchDaemons (org.discord.accton.plist) is supplied for starting process
+accounting at system boot.
 
 Also included is a perl implementation of lastcomm.pl that works on OpenBSD, Linux, and macOS, but displays output chronologically (the order in the process accounting files) instead of in reverse chronological order.
 
