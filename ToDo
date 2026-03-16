@@ -1,5 +1,9 @@
 BUGS
 
+(Fixed 1.32) Fix multiple bugs in process accounting handling for Linux,
+including adding explicit ACK for file descriptor passing with privsep
+and order of gzip/live file tests.
+
 (Fixed 1.31d) Unpack OpenBSD commands with Z24 instead of A24 for
 process accounting to avoid null-terminated strings.
 

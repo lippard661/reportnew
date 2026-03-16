@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.discord.accton.plist</string>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>UserName</key>
+	<string>root</string>
+	
+	<key>Program</key>
+	<string>/usr/sbin/accton</string>
+	<key>ProgramArguments</key>
+	<array>
+	  <string>/usr/sbin/accton</string>
+	  <string>/var/account/acct</string>
+	</array>
+</dict>
+</plist>

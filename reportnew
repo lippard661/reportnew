@@ -241,6 +241,8 @@
 # Modified 4 March 2026 by Jim Lippard to use Z24 instead of A24 for
 #    unpacking command names in process accounting logs, to avoid
 #    unnecessary (and sendmail-confusing) nulls.
+# Modified 16 March 2026 by Jim Lippard to fix bug in process accounting
+#    processing on Linux.
 #
 #
 # To Do:
@@ -326,7 +328,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.31d of 4 March 2026';
+my $VERSION = 'reportnew 1.32 of 16 March 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -656,6 +658,10 @@ if ($privsep_flag) {
     # Create socket for interprocess communications.
     ($parent_sock, $child_sock) = IO::Socket::UNIX->socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC)
 	or die "socketpair: $!";
+
+    # Enable autoflush on both sockets to prevent buffering issues.
+    my $old_fh = select ($parent_sock); $| = 1; select ($old_fh);
+    $old_fh = select ($child_sock); $| = 1; select ($old_fh);
 
     # Create shared secret.
     $HMAC_SECRET = generate_random_secret();
@@ -1953,7 +1959,7 @@ sub handle_fd_request {
 
     # Validate that logfile is in allowed list.
     unless (is_allowed_logfile ($logfile)) {
-	send_error_response ("Logfile not in allowed list.");
+	send_error_response ("Logfile not in allowed list", $request->{request_id});
 	return;
     }
 
@@ -1981,6 +1987,35 @@ sub handle_fd_request {
 	};
 
 	send_response ($response);
+
+	# ACK protocol only on Linux to avoid FD passing race conditions.
+	if ($^O eq 'linux') {
+	    print "DEBUG: parent waiting for ACK before sending FD\n" if ($debug_mode);
+
+	    my $ack_buf;
+	    # Timeout to avoid hanging forever
+	    eval {
+		local $SIG{ALRM} = sub { die "ACK timeout\n"; };
+		alarm (5); # 5 second timeout
+		my $n = sysread ($parent_sock, $ack_buf, 3);
+		alarm (0);
+
+		unless (defined ($n) && $n == 3 && $ack_buf eq 'ACK') {
+		    warn "Failed to receive ACK for FD transfer for $logfile (got \"$ack_buf\", " .
+			(defined ($n) ? "$n bytes" : "undef") . ")\n";
+		    close $log_fh;
+		    send_error_response ("Failed to receive ACK for FD transfer", $request->{request_id});
+		    return;
+		}
+	    };
+	    if ($@) {
+		warn "ACK timeout or error for $logfile: $@\n";
+		close $log_fh;
+		send_error_response ("ACK timeout: $@", $request->{request_id});
+		return;
+	    }
+	    print "DEBUG: parent receivd ACK, sending FD\n" if ($debug_mode);
+	}
 
 	# Now send the file descriptor.
 	IO::FDPass::send (fileno ($parent_sock), fileno ($log_fh))
@@ -2311,6 +2346,13 @@ sub send_priv_req_for_fd {
     
     if ($response->{status} eq RESP_FD_FOLLOWS) {
 	print "DEBUG: receiving file descriptor\n" if ($debug_mode);
+
+	# On Linux, send ACK before calling recv to avoid race condition
+	if ($^O eq 'linux') {
+	    print "DEBUG: child sending ACK before recv\n" if ($debug_mode);
+	    syswrite ($child_sock, 'ACK', 3);
+	}
+	
 	my $fd = IO::FDPass::recv (fileno ($child_sock));
 	print "DEBUG: child received fd for $logfile\n" if ($debug_mode);
 
@@ -2871,13 +2913,6 @@ sub direct_read_process_acct_log {
     # logs. (Don't sort here because identify_rotated_logs already
     # did it the way we want, oldest first.)
     foreach $acct_file (@rotated_acct_logs) {
-	if (is_gzip ($acct_file)) {
-	    # gunzip into a temp file and look at that (doesn't currently
-	    # happen on OpenBSD).
-	    $acct_temp_logfile = gunzip_logfile ($acct_file, $temp_dir);
-	    $acct_file = $acct_temp_logfile;
-	}
-
 	# If we're on the main file, set new size/mtime/checktime and only read to
 	# that point.
 	if ($acct_file eq $acct_log) {
@@ -2886,10 +2921,30 @@ sub direct_read_process_acct_log {
 	    $new_checktime = gettimeofday();
 	}
 
+	if (is_gzip ($acct_file)) {
+	    # gunzip into a temp file and look at that (doesn't currently
+	    # happen on OpenBSD).
+	    $acct_temp_logfile = gunzip_logfile ($acct_file, $temp_dir);
+	    $acct_file = $acct_temp_logfile;
+	}
+
 	# Open file and look for first record if we need it. Once
 	# we have a first record, open temp file and start writing out
 	# to it.
-	if ($acct_fh = nonpriv_open_fh ($acct_file)) {
+	if ($acct_fh = nonpriv_open_fh ($acct_file, 0, 1)) { # not cyclog, use raw mode
+	    # If this is the live file, get size/mtime using fstat on the open FD
+	    # instead of stat on the path (which requires privileges).
+	    if ($is_live_file) {
+		my @stat = stat ($acct_fh);
+		if (@stat) {
+		    $new_size = $stat[7]; # size
+		    $new_mtime = $stat[8]; # mtime;
+		}
+		else {
+		    die "fstat failed on live file $acct_file: $!\n";
+		}
+	    }
+	    
 	    $/ = \$RECORD_SIZE;
 	    # Starting with the oldest file with an mtime > checktime.
 	    # Skip past any records with time < checktime.
