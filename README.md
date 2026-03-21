@@ -7,9 +7,9 @@ Supports include files which may be signed (requires Signify.pm).
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.32.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
+reportnew-1.33.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-Current version is reportnew-1.32 of 16 March 2026.
+Current version is reportnew-1.33 of 21 March 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux),
 Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
@@ -65,9 +65,8 @@ etc. Sample scripts for mail certificate fingerprint handling and
 creation of macros is included, mailcert.pl, and for pulling WiFi SSID
 and MAC addresses from WAX620 neighbor AP logs, wifi.pl.
 
-"frequency" in config file comments is not implemented; config file doesn't include an example of
-the within-log correlation, here is an example used for alerting on an SMTP session of concern with
-context for OpenSMTPD:
+Here is an example of within-log correlation, here is an example used for
+alerting on an SMTP session of concern with context for OpenSMTPD:
 
 <PRE>
 log: /var/log/maillog
@@ -85,6 +84,13 @@ by smtp.
 The "match" field tells reportnew to collect matches of that string for later comparison, the "exclude"
 field tells it to report on any of those collected log lines that have an envelope ID that matches the
 regular expression capture group from a line with a failure.
+
+An optional "times" field tells reportnew to only process a particular
+match/exclude/action triplet when the current system time (at the start
+of a reportnew run) meets the time constraint specified. Time constraints
+are defined in the config with a syntax similar to macros, using a
+"define_time:" directive described in the sample config file with
+examples.
   
 ---
   
