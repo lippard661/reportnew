@@ -1122,7 +1122,7 @@ sub parse_config {
 
 			# Parse the spec and immediately evaluate against current time.
 			my $constraint = parse_time_spec ($spec);
-			my $is_applicable = evaluate_time_constraint ($constraint);
+			my $is_applicable = evaluate_time_constraint ($constraint, time());
 
 			# Store just the boolean result
 			$time_ranges{$name} = $is_applicable;
@@ -1275,7 +1275,6 @@ sub parse_config {
     
 			    my $num_matches = defined($match_hash{$current_logfile}) ? scalar(@{$match_hash{$current_logfile}}) : 0;
 			    my $num_excludes = defined($exclude_hash{$current_logfile}) ? scalar(@{$exclude_hash{$current_logfile}}) : 0;
-			    my $num_actions = defined($action_hash{$current_logfile}) ? scalar(@{${$action_hash{$current_logfile}}}) : 0;
     
 			    if ($num_matches == 0) {
 				send_error ($config_file, "times directive on line $line_num must come after match directive");
@@ -1283,10 +1282,6 @@ sub parse_config {
 			    }
 			    if ($num_excludes != $num_matches) {
 				send_error ($config_file, "times directive on line $line_num must come after exclude directive (use 'exclude: none' if no exclusions)");
-				exit;
-			    }
-			    if ($num_actions > 0 && $num_actions != $num_matches) {
-				send_error ($config_file, "times directive on line $line_num: number of actions doesn't match number of matches");
 				exit;
 			    }
 
