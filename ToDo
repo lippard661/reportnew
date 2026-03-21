@@ -1,5 +1,9 @@
 BUGS
 
+(Fixed 1.33) Require exclude directives in every rule to avoid
+triplets (or now potential quadruplets with "times:" directive for
+time constraints) getting out-of-sync.
+
 (Fixed 1.32) Fix multiple bugs in process accounting handling for Linux,
 including adding explicit ACK for file descriptor passing with privsep
 and order of gzip/live file tests.
@@ -87,6 +91,10 @@ for them, anchor each end against likely separators (beginning of line,
 the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
+
+* (Done 1.33) added define_time for defining time ranges and times
+directive for making time constraints on match/exclude rule
+applicability.
 
 * (Done 1.31) Implemented optional extra script execution action in
 a single match/exclude/action triplet.
@@ -205,6 +213,9 @@ sigtree.
   and can be updated with data from:
      stat -f "%r,%N%n" /dev/tty*
   and a little editing.
+
+* (DONE)  The cyclog/multilog logic for looking at prior log files should
+  also be implemented for standard logfiles that have been rotated.
   
 * Provide a way to write match output to a new log. (new action)
   (can be approximated with "alert" action)
@@ -228,8 +239,6 @@ sigtree.
   table. Table contents should also be able to be regexps. (Would this
   be any more efficient? If not, no value.)
 
-* (DONE)  The cyclog/multilog logic for looking at prior log files should
-  also be implemented for standard logfiles that have been rotated.
 * Add action to re-log specific indicators from a log entry into
   an indicator log in something like Fortinet's log format, which
   identifies source host, source log, date/time from the original log
@@ -237,19 +246,13 @@ sigtree.
   client IP, protocol, permitted or blocked, mail from/rcpt to/subject,
   etc. Such a log would be useful for auto-generation of block and monitor
   lists for pf. This might be a replacement for the below script idea?
-* Finish action: execute <script>
+
 * Create a separate parsing script for both pf and DNS query logs,
     which keeps a database of observed IP addresses/ports and IP
     addresses/domain queries, along with first seen time, last seen
     time, number of times seen.  Generate alerts for novelty,
     i.e., newly appearing, newly appearing after an absence, and
     appearing in multiple places/contexts for the first time (pf).
-* (DONE) Set up a _reportnew user?  Drop privs more generally?
-
-* Process accounting time granularity is only to the nearest minute(?),
-and so any new commands which immediately followed the last seen, within
-the same minute, will not be shown in the next run--it will stop just before
-them.
 
 It would be nice to add a time component after the regexp. Maybe
    days:<day-of-week-list-or-range> hours:<hour-of-week-list-or-range>
@@ -275,8 +278,9 @@ etc. Support at least ten per log.
 DONE.
 
 Maybe it would be better to just use action: execute and pass to a
-script.
+script. (also DONE)
 
+Time constraints: original idea:
 Time options:
   [days: <day-list>] [hours: <hour-list>]
   <day-list>: [<day>|<day-range>][,<day>|<day-range>]
@@ -302,6 +306,8 @@ action: text user@host
 
 Actually, don't like weekdays/weekends, as the above example illustrates,
 unless "weekend" means Fri-Sat, not Sat-Sun.
+(Above DONE in 1.33 with different implementation (separate times: directive,
+define_time: directive)
 
 Would also like to be able to do field matching, which requires parsing
 out fields...

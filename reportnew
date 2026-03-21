@@ -243,10 +243,9 @@
 #    unnecessary (and sendmail-confusing) nulls.
 # Modified 16 March 2026 by Jim Lippard to fix bug in process accounting
 #    processing on Linux.
-#
-#
-# To Do:
-#    - Add time range checking option for match and exclude (new directive?)
+# Modified 20 March 2026 by Jim Lippard with Claude assistance to
+#    implement time range checking and explicitly require exclude
+#    directives in every match/exclude/action triplet.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -328,7 +327,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.32 of 16 March 2026';
+my $VERSION = 'reportnew 1.33 of 21 March 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -386,6 +385,7 @@ use vars qw(
     $master_notify
     $email_sender
     $signify_pubkey
+    %time_ranges
     @logfiles
     %match_hash
     %exclude_hash
@@ -393,6 +393,7 @@ use vars qw(
     %match_hash_ref
     %exclude_hash_ref
     %action_hash_ref
+    %time_hash
     %execute_scripts
     %global_preproc_macro
     $have_global_postproc_macros
@@ -1116,6 +1117,21 @@ sub parse_config {
 			}
 			$signify_pubkey = $SIGNIFY_DIR . '/' . $signify_pubkey;
 		    }
+		    elsif ($directive eq 'define_time') {
+			my ($name, $spec) = split (/\s*=\s*/, $value, 2);
+
+			# Parse the spec and immediately evaluate against current time.
+			my $constraint = parse_time_spec ($spec);
+			my $is_applicable = evaluate_time_constraint ($constraint);
+
+			# Store just the boolean result
+			$time_ranges{$name} = $is_applicable;
+
+			if ($debug_mode) {
+			    my $status = $is_applicable ? "ACTIVE" : "INACTIVE";
+			    print "DEBUG: define_time: $name = $spec [$status]\n";
+			}
+		    }
 		    elsif ($directive eq 'log') {
 			# No longer check for logfile existence here due to need
 			# to unveil first.
@@ -1251,9 +1267,68 @@ sub parse_config {
 			    send_error ($config_file, "Invalid exclude directive on line $line_num. $_");
 			}
 		    }
+		    elsif ($directive eq 'times') {
+			    if (!defined($current_logfile)) {
+				send_error($config_file, "No log directive corresponding to times directive on line $line_num. $_");
+				exit;
+			    }
+    
+			    my $num_matches = defined($match_hash{$current_logfile}) ? scalar(@{$match_hash{$current_logfile}}) : 0;
+			    my $num_excludes = defined($exclude_hash{$current_logfile}) ? scalar(@{$exclude_hash{$current_logfile}}) : 0;
+			    my $num_actions = defined($action_hash{$current_logfile}) ? scalar(@{${$action_hash{$current_logfile}}}) : 0;
+    
+			    if ($num_matches == 0) {
+				send_error ($config_file, "times directive on line $line_num must come after match directive");
+				exit;
+			    }
+			    if ($num_excludes != $num_matches) {
+				send_error ($config_file, "times directive on line $line_num must come after exclude directive (use 'exclude: none' if no exclusions)");
+				exit;
+			    }
+			    if ($num_actions > 0 && $num_actions != $num_matches) {
+				send_error ($config_file, "times directive on line $line_num: number of actions doesn't match number of matches");
+				exit;
+			    }
+
+			    # Evaluate the time constraint
+			    my $negate = 0;
+			    my $range_name = $value;
+
+			    if ($value =~ /^!(.+)$/) {
+				$negate = 1;
+				$range_name = $1;
+			    }
+
+			    if (!exists($time_ranges{$range_name})) {
+				send_error($config_file, "Undefined time range '$range_name' on line $line_num");
+				exit;
+			    }
+
+			    my $applicable = $negate ? !$time_ranges{$range_name} : $time_ranges{$range_name};
+    
+			    # Store in parallel hash
+			    push(@{$time_hash{$current_logfile}}, $applicable);
+
+			    if ($debug_mode && !$applicable) {
+				print "DEBUG: Line $line_num: times: $value -> rule will be skipped.\n";
+			    }
+		    }
 		    elsif ($directive eq 'action') {
 			if (!defined ($current_logfile)) {
 			    send_error ($config_file, "No log directive corresponding to action directive on line $line_num. $_");
+			    exit;
+			}
+
+			# Validate that we have matching match and exclude directives
+			my $num_matches = defined($match_hash{$current_logfile}) ? scalar(@{$match_hash{$current_logfile}}) : 0;
+			my $num_excludes = defined($exclude_hash{$current_logfile}) ? scalar(@{$exclude_hash{$current_logfile}}) : 0;
+    
+			if ($num_matches == 0) {
+			    send_error ($config_file, "action directive on line $line_num has no corresponding match directive");
+			    exit;
+			}
+			if ($num_excludes != $num_matches) {
+			    send_error ($config_file, "action directive on line $line_num: mismatch between number of match ($num_matches) and exclude ($num_excludes) directives. Each match must have a corresponding exclude (use 'exclude: none' if no exclusions needed)");
 			    exit;
 			}
 			# Check for semicolon (multiple actions).
@@ -1507,20 +1582,44 @@ sub parse_config {
 	    my $rule = { type => 'all', text => 'all' };
 	    push (@{$match_hash{$current_logfile}}, $rule);
 	}
-	$match_hash_ref{$current_logfile} = \@{$match_hash{$current_logfile}};
 	if (!defined ($exclude_hash{$current_logfile})) {
 	    my $rule = { type => 'none', text => 'none' };
 	    push (@{$exclude_hash{$current_logfile}}, $rule);
 	}
-	$exclude_hash_ref{$current_logfile} = \@{$exclude_hash{$current_logfile}};
 	if (!defined ($action_hash{$current_logfile})) {
 	    # Default action is notify to master_notify (stored as array ref)
 	    push (@{$action_hash{$current_logfile}}, [$master_notify]);
 	    # need indicator for action=notify.
 	}
-	# $action_hash{$current_logfile} in scalar context gives us a REF to the array ref
-	# We need to dereference it once to get the actual ARRAY ref
-	$action_hash_ref{$current_logfile} = ${$action_hash{$current_logfile}};
+
+	# Build *_hash_ref structures, filtering by time constraints
+	my @applicable_matches;
+	my @applicable_excludes;
+	my @applicable_actions;
+
+	# Dereference the hash-of-arrays value to get the actual array ref
+	my $actions_arrayref = ${$action_hash{$current_logfile}};
+
+	for (my $idx = 0; $idx < scalar(@{$actions_arrayref}); $idx++) {
+	    # Check time constraint (if it exists)
+	    if (defined($time_hash{$current_logfile}) && 
+		defined($time_hash{$current_logfile}[$idx]) &&
+		!$time_hash{$current_logfile}[$idx]) {
+		# Time constraint not met - skip entire triplet
+		next;
+	    }
+	    
+	    # Include this triplet
+	    push(@applicable_matches, $match_hash{$current_logfile}[$idx]);
+	    push(@applicable_excludes, $exclude_hash{$current_logfile}[$idx]);
+	    push(@applicable_actions, $actions_arrayref->[$idx]);
+	}
+    
+	# Store references to the NEW arrays we just built
+	# These are local @arrays, so just take normal references
+	$match_hash_ref{$current_logfile} = \@applicable_matches;
+	$exclude_hash_ref{$current_logfile} = \@applicable_excludes;
+	$action_hash_ref{$current_logfile} = \@applicable_actions;
     }
 
     # If there are linux journal logs, pull validation data.
@@ -1829,6 +1928,155 @@ sub build_devname_cache {
           }, $DEVDIR);
 
     $devname_cache{-1} = '__';
+}
+
+## Subroutines for time specifications.
+sub parse_time_spec {
+    my ($spec) = @_;
+    
+    # Split on comma to check for multiple ranges
+    # Use lookahead to avoid splitting on commas within day lists (Mon,Wed,Fri)
+    my @ranges;
+    
+    # Simple approach: split on ", " (comma-space) which separates ranges
+    # Day lists use "," (comma-no-space) so they won't be split
+    if ($spec =~ /, /) {
+        @ranges = split(/, /, $spec);
+        
+        # Parse each range and return OR structure
+        my @constraints;
+        foreach my $range (@ranges) {
+            my $constraint = parse_single_time_spec($range);
+            return undef unless defined $constraint;
+            push(@constraints, $constraint);
+        }
+        return { type => 'OR', constraints => \@constraints };
+    } else {
+        # Single range
+        return parse_single_time_spec($spec);
+    }
+}
+
+sub parse_single_time_spec {
+    my ($spec) = @_;
+    
+    # Format: "Mon-Fri 09:00-17:00" or "daily 02:00-04:00" or "Sat-Sun all"
+    if ($spec =~ /^([\w,-]+)\s+(all|\d{2}:\d{2}-\d{2}:\d{2})$/) {
+        my ($day_spec, $time_spec) = ($1, $2);
+        
+        my %constraint;
+        
+        # Parse days
+        $constraint{days} = parse_day_spec($day_spec);
+        return undef unless defined $constraint{days};
+        
+        # Parse time range
+        unless ($time_spec eq 'all') {
+            if ($time_spec =~ /^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/) {
+                my $start_min = $1 * 60 + $2;
+                my $end_min = $3 * 60 + $4;
+                $constraint{time_range} = [$start_min, $end_min];
+            } else {
+                return undef;  # Invalid time format
+            }
+        }
+        
+        return \%constraint;
+    }
+    
+    return undef;  # Invalid format
+}
+
+sub parse_day_spec {
+    my ($day_spec) = @_;
+    
+    my %day_map = (
+        'Mon' => 1, 'Tue' => 2, 'Wed' => 3, 'Thu' => 4,
+        'Fri' => 5, 'Sat' => 6, 'Sun' => 0
+    );
+    
+    my @applicable_days = (0) x 7;  # Array of 7 booleans
+    
+    if ($day_spec eq 'daily') {
+        @applicable_days = (1) x 7;
+    }
+    elsif ($day_spec =~ /^(\w+)-(\w+)$/) {
+        # Range: Mon-Fri
+        my $start = $day_map{$1};
+        my $end = $day_map{$2};
+        
+        if (!defined($start) || !defined($end)) {
+            return undef;  # Invalid day names
+        }
+        
+        # Handle wrapping (e.g., Fri-Mon)
+        if ($start <= $end) {
+            for (my $d = $start; $d <= $end; $d++) {
+                $applicable_days[$d] = 1;
+            }
+        } else {
+            # Wraps around week
+            for (my $d = $start; $d <= 6; $d++) {
+                $applicable_days[$d] = 1;
+            }
+            for (my $d = 0; $d <= $end; $d++) {
+                $applicable_days[$d] = 1;
+            }
+        }
+    }
+    elsif ($day_spec =~ /,/) {
+        # Comma-separated: Mon,Wed,Fri
+        my @days = split(/,/, $day_spec);
+        foreach my $day (@days) {
+            my $day_num = $day_map{$day};
+            return undef unless defined($day_num);
+            $applicable_days[$day_num] = 1;
+        }
+    }
+    else {
+        # Single day: Mon
+        my $day_num = $day_map{$day_spec};
+        return undef unless defined($day_num);
+        $applicable_days[$day_num] = 1;
+    }
+    
+    return \@applicable_days;
+}
+
+sub evaluate_time_constraint {
+    my ($constraint, $timestamp) = @_;
+    
+    # If it's an OR of multiple constraints
+    if ($constraint->{type} && $constraint->{type} eq 'OR') {
+        # Match if ANY sub-constraint matches
+        foreach my $sub_constraint (@{$constraint->{constraints}}) {
+            return 1 if evaluate_time_constraint($sub_constraint, $timestamp);
+        }
+        return 0;  # None matched
+    }
+    
+    # Single constraint
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday) = localtime($timestamp);
+    
+    # Check day of week
+    if (defined($constraint->{days})) {
+        return 0 unless $constraint->{days}[$wday];
+    }
+    
+    # Check time range (if day matched or no day constraint)
+    if (defined($constraint->{time_range})) {
+        my $current_min = $hour * 60 + $min;
+        my ($start_min, $end_min) = @{$constraint->{time_range}};
+        
+        # Handle overnight ranges (22:00-06:00)
+        if ($start_min > $end_min) {
+            return ($current_min >= $start_min || $current_min < $end_min);
+        } else {
+            return ($current_min >= $start_min && $current_min < $end_min);
+        }
+    }
+    
+    return 1;  # No constraints or all matched
 }
 
 ## Subroutines for privilege separation.
