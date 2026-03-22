@@ -1,5 +1,9 @@
 BUGS
 
+(Fixed 1.33a) Better timespec validation and error reporting, fix
+major bug that caused times directives to be out of alignment with
+match/exclude/action triplets.
+
 (Fixed 1.33) Require exclude directives in every rule to avoid
 triplets (or now potential quadruplets with "times:" directive for
 time constraints) getting out-of-sync.

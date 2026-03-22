@@ -246,6 +246,10 @@
 # Modified 20 March 2026 by Jim Lippard with Claude assistance to
 #    implement time range checking and explicitly require exclude
 #    directives in every match/exclude/action triplet.
+# Modified 22 March 2026 by Jim Lippard to provide better validation
+#    and error reporting on invalid time specifications and to fix bug
+#    in keeping time constraints aligned with match/exclude/action
+#    triplets when many rules have no "times:" directives.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -327,7 +331,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.33 of 21 March 2026';
+my $VERSION = 'reportnew 1.33a of 22 March 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1122,6 +1126,10 @@ sub parse_config {
 
 			# Parse the spec and immediately evaluate against current time.
 			my $constraint = parse_time_spec ($spec);
+			if (!defined($constraint)) {
+			    send_error($config_file, "Invalid time specification on line $line_num: $spec\nHours must be 00-23, minutes must be 00-59. $_\n");
+			    exit;
+			}
 			my $is_applicable = evaluate_time_constraint ($constraint, time());
 
 			# Store just the boolean result
@@ -1466,6 +1474,16 @@ sub parse_config {
 
 			# @parsed_actions is already an array of strings, make it an array ref.
 			push (@${$action_hash{$current_logfile}}, [@parsed_actions]);
+
+			# After storing action, ensure time_hash is aligned
+			# Check if time constraint was added for this triplet
+			my $num_actions = scalar(@{${$action_hash{$current_logfile}}});
+			my $num_times = defined($time_hash{$current_logfile}) ? scalar(@{$time_hash{$current_logfile}}) : 0;
+    
+			if ($num_times < $num_actions) {
+			    # No times: directive for this triplet - add undef placeholder
+			    push(@{$time_hash{$current_logfile}}, undef);
+			}
 		    }
 		    # For backwards compatibility.
 		    elsif ($directive eq 'notify') {
@@ -1942,7 +1960,7 @@ sub parse_time_spec {
         my @constraints;
         foreach my $range (@ranges) {
             my $constraint = parse_single_time_spec($range);
-            return undef unless defined $constraint;
+	    return undef unless defined ($constraint); # Propagate error
             push(@constraints, $constraint);
         }
         return { type => 'OR', constraints => \@constraints };
@@ -1968,10 +1986,16 @@ sub parse_single_time_spec {
         # Parse time range
         unless ($time_spec eq 'all') {
             if ($time_spec =~ /^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/) {
-                my $start_min = $1 * 60 + $2;
-                my $end_min = $3 * 60 + $4;
+		my ($h1, $m1, $h2, $m2) = ($1, $2, $3, $4);
+                
+                # Validate time values
+                return undef if ($h1 > 23 || $h2 > 23 || $m1 > 59 || $m2 > 59);
+                
+                my $start_min = $h1 * 60 + $m1;
+                my $end_min = $h2 * 60 + $m2;
                 $constraint{time_range} = [$start_min, $end_min];
-            } else {
+            }
+	    else {
                 return undef;  # Invalid time format
             }
         }
