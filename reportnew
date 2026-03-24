@@ -250,6 +250,8 @@
 #    and error reporting on invalid time specifications and to fix bug
 #    in keeping time constraints aligned with match/exclude/action
 #    triplets when many rules have no "times:" directives.
+# Modified 23 March 2026 by Jim Lippard to a a shorthand for time
+#    constraints range every hour or half hour.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -331,7 +333,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.33a of 22 March 2026';
+my $VERSION = 'reportnew 1.33b of 23 March 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1947,26 +1949,35 @@ sub build_devname_cache {
 sub parse_time_spec {
     my ($spec) = @_;
     
-    # Split on comma to check for multiple ranges
-    # Use lookahead to avoid splitting on commas within day lists (Mon,Wed,Fri)
-    my @ranges;
-    
-    # Simple approach: split on ", " (comma-space) which separates ranges
-    # Day lists use "," (comma-no-space) so they won't be split
+    # First, expand any shorthand notation
+    my @range_specs;
     if ($spec =~ /, /) {
-        @ranges = split(/, /, $spec);
-        
-        # Parse each range and return OR structure
+        # Multiple ranges specified
+        my @parts = split(/, /, $spec);
+        foreach my $part (@parts) {
+            my @expanded = expand_time_spec($part);
+            return undef unless @expanded;  # Expansion failed
+            push(@range_specs, @expanded);
+        }
+    } else {
+        # Single range
+        @range_specs = expand_time_spec($spec);
+        return undef unless @range_specs;  # Expansion failed
+    }
+    
+    # Now parse the expanded ranges
+    if (@range_specs > 1) {
+        # Multiple ranges - create OR constraint
         my @constraints;
-        foreach my $range (@ranges) {
+        foreach my $range (@range_specs) {
             my $constraint = parse_single_time_spec($range);
-	    return undef unless defined ($constraint); # Propagate error
+            return undef unless defined($constraint);
             push(@constraints, $constraint);
         }
         return { type => 'OR', constraints => \@constraints };
     } else {
         # Single range
-        return parse_single_time_spec($spec);
+        return parse_single_time_spec($range_specs[0]);
     }
 }
 
@@ -2060,6 +2071,34 @@ sub parse_day_spec {
     }
     
     return \@applicable_days;
+}
+
+# *:MM-MM shorthand expansion
+sub expand_time_spec {
+    my ($spec) = @_;
+    
+    # Check for *:MM-MM shorthand (every hour at minute MM)
+    if ($spec =~ /^([\w,-]+)\s+\*:(\d{2})-(\d{2})$/) {
+        my ($day_spec, $start_min, $end_min) = ($1, $2, $3);
+        
+        # Validate minutes
+        if ($start_min > 59 || $end_min > 59) {
+            return undef;  # Invalid - caller will report error
+        }
+        
+        # Expand to 24 ranges (one per hour)
+        my @expanded;
+        for (my $hour = 0; $hour < 24; $hour++) {
+            my $range_start = sprintf("%02d:%02d", $hour, $start_min);
+            my $range_end = sprintf("%02d:%02d", $hour, $end_min);
+            push(@expanded, "$day_spec $range_start-$range_end");
+        }
+        
+        return @expanded;
+    }
+    
+    # No shorthand - return as-is
+    return ($spec);
 }
 
 sub evaluate_time_constraint {

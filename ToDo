@@ -96,6 +96,7 @@ the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
 
+* (Done 1.33b) Added short-hand for *:MM-MM time ranges in define_time.
 * (Done 1.33) added define_time for defining time ranges and times
 directive for making time constraints on match/exclude rule
 applicability.

@@ -13,7 +13,7 @@ reportnew-1.33a.tgz is a Legion of Dynamic Discord signify-signed
 OpenBSD package. Signify public key is
 https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-Current version is reportnew-1.33a of 22 March 2026.
+Current version is reportnew-1.33b of 23 March 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and
 Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl
