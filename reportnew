@@ -1177,14 +1177,17 @@ sub parse_config {
 			    exit;
 			}
 			if ($value =~ /^journal (unit|syslog-id|syslog-facility)/) {
-			    if ($1 eq 'unit') {
-				$linux_journal_unit = 1;
-			    }
-			    elsif ($1 eq 'syslog-id') {
-				$linux_journal_syslogid = 1;
-			    }
-			    else {
-				$linux_journal_syslogfacility = 1;
+			    # Don't validate the journal info if we're doing a config check unless we're on the right host.
+			    if (!$config_check || my_host ($line_num, $current_host)) {
+				if ($1 eq 'unit') {
+				    $linux_journal_unit = 1;
+				}
+				elsif ($1 eq 'syslog-id') {
+				    $linux_journal_syslogid = 1;
+				}
+				else {
+				    $linux_journal_syslogfacility = 1;
+				}
 			    }
 			}
 			push (@logfiles, $value);
@@ -4324,6 +4327,11 @@ sub preproc_macro_substitution {
 	    if (!defined ($preproc_macro{$macro_name})) {
 		if (defined ($global_preproc_macro{$macro_name})) {
 		    $global_macro = 1;
+		}
+		elsif ($config_check) {
+		    # Non-fatal error in config check mode. Leave macro unexpanded.
+		    print "Warning: Undefined preproc macro %%$macro_name%% on line $line_num. $orig_regexp_line\n";
+		    return ($regexp_line); # End processing on this line for config check.
 		}
 		else {
 		    send_error ($config_file, "Undefined preproc macro %%$macro_name%% on line $line_num. $orig_regexp_line");
