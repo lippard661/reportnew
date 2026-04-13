@@ -9,11 +9,11 @@ Supports include files which may be signed (requires Signify.pm).
 
 Also available at https://www.discord.org/lippard/software
 
-reportnew-1.33b.tgz is a Legion of Dynamic Discord signify-signed
+reportnew-1.34.tgz is a Legion of Dynamic Discord signify-signed
 OpenBSD package. Signify public key is
 https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-Current version is reportnew-1.33b of 23 March 2026.
+Current version is reportnew-1.34 of 13 April 2026.
 
 This version supports privilege separation on OpenBSD, macOS, and
 Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl
@@ -54,11 +54,12 @@ chronological order.
 
 Multiple hosts can be supported with a single config file using either
 hosts: to identify sections applicable to a set of space-separated
-hosts, or alternatively, begin-host: ... end-host: to have a single
-unique section in the config file for each host. The former is
-preferred for compactness, simplicity, and eliminating redundancy
-between similarly-configured hosts. reportnew -c can be used to check
-a config for possible syntax errors.
+hosts (or "all" or "all except <host list>"), or alternatively,
+begin-host: ... end-host: to have a single unique section in the
+config file for each host. The former is preferred for compactness,
+simplicity, and eliminating redundancy between similarly-configured
+hosts. reportnew -c can be used to check a config for possible syntax
+errors.
 
 Actions can be "notify" (send email), "text" (send email with fewer
 characters for SMS), "alert" (generate output to STDOUT), or "execute"
