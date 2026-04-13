@@ -253,7 +253,10 @@
 # Modified 23 March 2026 by Jim Lippard to a a shorthand for time
 #    constraints range every hour or half hour.
 # Modified 13 April 2026 by Claude at the direction of Jim Lippard to
-#    add "all except <host list>" for the "hosts:" directive.
+#    add "all except <host list>" for the "hosts:" directive. Fix -c
+#    config check to not complain about the nonexistence, nonreadability,
+#    nonexecutability, and non-signedness or bad signatures of files for
+#    other hosts.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -1434,30 +1437,33 @@ sub parse_config {
 				    # Construct full script path
 				    my $script_path = "$SCRIPT_DIR/$action_value";
 
-				    # Verify script exists and is readable
-				    if (!-r $script_path) {
-					send_error ($config_file, "Cannot read execute script \"$script_path\" specified on line $line_num. $_");
-					exit;
-				    }
+				    # Don't do these checks if we're doing a config check (-c) unless it's the current host.
+				    if (!$config_check || my_host ($line_num, $current_host)) {
+					# Verify script exists and is readable
+					if (!-r $script_path) {
+					    send_error ($config_file, "Cannot read execute script \"$script_path\" specified on line $line_num. $_");
+					    exit;
+					}
 
-				    # Verify script is a regular file (not symlink or directory)
-				    if (!-f $script_path || -l $script_path) {
-					send_error ($config_file, "Execute script \"$script_path\" must be a regular file (not symlink or directory) on line $line_num. $_");
-					exit;
-				    }
+					# Verify script is a regular file (not symlink or directory)
+					if (!-f $script_path || -l $script_path) {
+					    send_error ($config_file, "Execute script \"$script_path\" must be a regular file (not symlink or directory) on line $line_num. $_");
+					    exit;
+					}
 
-				    # Verify signify signature exists and is valid
-				    if (!defined ($signify_pubkey)) {
-					send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of execute script \"$script_path\" on line $line_num. $_");
-					exit;
-				    }
-				    if (!$have_signify) {
-					send_error ($config_file, "Signify.pm not found on system, cannot verify signature on execute script \"$script_path\" on line $line_num. $_");
-					exit;	
-				    }
-				    if (!verify_signify_sig ($script_path)) {
-					send_error ($config_file, "Cannot verify signify signature on execute script \"$script_path\" on line $line_num. $_");
-					exit;
+					# Verify signify signature exists and is valid
+					if (!defined ($signify_pubkey)) {
+					    send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of execute script \"$script_path\" on line $line_num. $_");
+					    exit;
+					}
+					if (!$have_signify) {
+					    send_error ($config_file, "Signify.pm not found on system, cannot verify signature on execute script \"$script_path\" on line $line_num. $_");
+					    exit;	
+					}
+					if (!verify_signify_sig ($script_path)) {
+					    send_error ($config_file, "Cannot verify signify signature on execute script \"$script_path\" on line $line_num. $_");
+					    exit;
+					}
 				    }
 				
 				    # Track this script for later verification and unveiling
@@ -1509,25 +1515,37 @@ sub parse_config {
 			    exit;
 			}
 			$macro_file = $MACRO_DIR . '/' . $macro_file;
-			if (!-r $macro_file) {
-			    send_error ($config_file, "Cannot read macro include file $macro_file in macro \"$macro_name\" on line $line_num. $_\n");
-			    exit;
+			# Don't verify readability during config check if not current host.
+			if (!$config_check || my_host ($line_num, $current_host)) {
+			    if (!-r $macro_file) {
+				send_error ($config_file, "Cannot read macro include file $macro_file in macro \"$macro_name\" on line $line_num. $_\n");
+				exit;
+			    }
 			}
 			if ($directive =~ /signed/) {
 			    if (!defined ($signify_pubkey)) {
 				send_error ($config_file, "No signify_pubkey directive has been parsed yet in config file before use of macro include file \"$macro_file\" on line $line_num. $_\n");
 				exit;
 			    }
-			    if (!$have_signify) {
-				send_error ($config_file, "Signify.pm not found on system, cannot verify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
-				exit;	
-			    }
-			    if (!verify_signify_sig ($macro_file)) {
-				send_error ($config_file, "Cannot verify signify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
-				exit;
+			    # Don't verify presence of Signify.pm or signature during config check if not current host.
+			    if (!$config_check || my_host ($line_num, $current_host)) {
+				if (!$have_signify) {
+				    send_error ($config_file, "Signify.pm not found on system, cannot verify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
+				    exit;	
+				}
+				if (!verify_signify_sig ($macro_file)) {
+				    send_error ($config_file, "Cannot verify signify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
+				    exit;
+				}
 			    }
 			}
-			if (open (INCLUDEFILE, '<', $macro_file)) {
+			# Don't verify contents of macro file during config check if not current host, but warn about potential subsequent
+			# missing macro definitions.
+			if ($config_check && !my_host ($line_num, $current_host)) {
+			    print "Note: Skipping macro file \"$macro_file\" on $line_num (applied to different host(s): $current_host)\n";
+			    print "      Any macros defined in this file may show as undefined in subsequent warnings.\n";
+			}
+			elsif (open (INCLUDEFILE, '<', $macro_file)) {
 			    my $include_file_line_num = 0;
 			    while (<INCLUDEFILE>) {
 				$include_file_line_num++;
@@ -4308,7 +4326,7 @@ sub preproc_macro_substitution {
 		    $global_macro = 1;
 		}
 		else {
-		    send_error ($config_file, "Undefined preproc macro %%$macro_name%% on line $line_num. $orig_regexp_line\n");
+		    send_error ($config_file, "Undefined preproc macro %%$macro_name%% on line $line_num. $orig_regexp_line");
 		    exit;
 		}
 	    }
