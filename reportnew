@@ -257,6 +257,8 @@
 #    config check to not complain about the nonexistence, nonreadability,
 #    nonexecutability, and non-signedness or bad signatures of files for
 #    other hosts.
+# Modified 16 April 2026 by Jim Lippard to move umask earlier so size
+#    file is mode 0600.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -338,7 +340,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.34 of 13 April 2026';
+my $VERSION = 'reportnew 1.34a of 16 April 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -632,6 +634,10 @@ if ($^O eq 'openbsd') {
     # Don't lock yet.
 }
 
+# Any files we create are rw for root (or running user, non-priv works
+# fine for process accounting on non-Linux) only.
+umask 0077;
+
 # Need to temporarily unveil containing dir with rwc in order to create
 # size file if it doesn't already exist. Go ahead and create it.
 if (!-e $size_file) {
@@ -654,10 +660,6 @@ if (!-e $size_file) {
 # (which so far only contains 'unveil').
 unveil() if ($^O eq 'openbsd');
     
-# Any files we create are rw for root (or running user, non-priv works
-# fine for process accounting on non-Linux) only.
-umask 0077;
-
 # Create a temp_dir.
 $temp_dir = mkdtemp ('/tmp/reportnew.XXXXXXX') || die "Cannot create temp dir. $!\n";
 chomp ($temp_dir);

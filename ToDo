@@ -96,6 +96,10 @@ the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
 
+* (Done 1.34a) Move umask earlier to limit permissions on size file.
+Add more comprehensive post-install message to OpenBSD package (suitable
+for use with install.pl script on macOS and Linux).
+
 * (Done 1.34) Added "all except <host list>" syntax for "hosts:" directive.
 
 * (Done 1.33b) Added short-hand for *:MM-MM time ranges in define_time.
