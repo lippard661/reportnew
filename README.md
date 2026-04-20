@@ -1,175 +1,458 @@
 # reportnew
-Perl script to monitor logs for issues and issue alert emails, with some correlation capability within a log.
 
-Supports syslog, cyclog, multilog, BSD (and macOS) and Linux process accounting logs, and Linux journal logs. Runs periodically rather than continuously.
+A Perl script for periodic log monitoring and alerting. Monitors syslog
+files, Linux journals, BSD/macOS/Linux process accounting logs, and
+DJB-style cyclog/multilog logs for patterns of interest, sending email
+alerts or executing signed scripts when matches are found.
 
-Supports include files which may be signed (requires Signify.pm).
+Runs periodically (e.g., every 30 minutes via cron or launchd) rather than
+continuously. Tracks log file positions between runs using a state file,
+detects log rotation via a SHA256 hash of the first line, and handles
+rotated and gzipped archive logs.
 
-Also available at https://www.discord.org/lippard/software
+Primary platform is OpenBSD, with full support for Linux and macOS. Uses
+pledge/unveil on OpenBSD. Supports privilege separation on all three
+platforms using a `_reportnew` user and group.
 
-reportnew-1.34a.tgz is a Legion of Dynamic Discord signify-signed OpenBSD package. Signify public key is https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
+Available at https://www.discord.org/lippard/software/ and
+https://github.com/lippard661/reportnew
 
-Current version is reportnew-1.34a of 16 April 2026.
+The OpenBSD package is signed with signify. To verify:
+```
+signify -C -p discord.org-2026-pkg.pub -x reportnew-<version>.tgz
+```
+Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
-This version supports privilege separation on OpenBSD, macOS, and Linux, which requires the perl modules IO::FDPass (libio-fdpass-perl on Linux),
-Privileges::Drop (libprivileges-drop-perl on Linux), and either JSON::MaybeXS (libjson-maybexs-perl on Linux) or standard but slower module
-JSON::PP. The non-standard modules are also on CPAN.
+## Features
 
-Privileges::Drop fails with perl 5.34.1 which is the release on macOS Tahoe 26.1, but works properly with perl 5.40.2 which is the current stable Homebrew
-release. Workarounds are either use the Homebrew perl or patch Privileges::Drop on the lines beginning with my %GIDHash and my %EGIDHash to insert
-"grep { $_ != 4294967295 }" immediately before "split(\s/," in each line, as the problem is that setgid in perl 5.34.1 ends up putting a -1 into $GID
-and $EGID (which is 4294967295 as an unsigned 32-bit integer).
+- **Multiple log formats**: syslog files, Linux journals (by unit, syslog-id,
+  or syslog-facility), BSD/macOS/Linux process accounting (binary format,
+  no external tools required), and DJB cyclog/multilog
+- **Match/exclude rules**: each log can have multiple match/exclude/action
+  triplets; matches are Perl regular expressions
+- **Macros**: define named regular expression fragments for reuse across
+  rules; macros can be preproc (substituted into match/exclude patterns),
+  postproc (appended to or substituted for matching text in output), or both
+- **Signed macro include files**: macro definitions can be loaded from
+  separate files, optionally requiring a signify signature; useful for
+  keeping the main config immutable while allowing signed macro updates
+- **Time constraints**: rules can be restricted to specific time windows
+  using `define_time:` and `times:` directives, with negation support
+- **Actions**: notify (email), text (minimal email for SMS), alert (stdout),
+  or execute (pass matching lines to a signed script)
+- **Combined actions**: any action can be followed by an execute action
+  for simultaneous alerting and data collection
+- **Session correlation**: `session-with`/`session-without` matching
+  groups log lines by session ID and reports entire sessions only when
+  a specified error pattern appears anywhere in the session
+- **Multi-host configs**: a single config file can cover multiple hosts
+  using `hosts:` directives to scope sections to specific hosts
+- **Multiple configs**: multiple reportnew configs can run independently
+  on the same host, each with its own state file; useful for different
+  monitoring frequencies (e.g., 30-minute and daily configs)
+- **Privilege separation**: privileged process handles file access;
+  unprivileged `_reportnew` process does pattern matching and alerting
+- **Signed execute scripts**: scripts invoked by execute actions must be
+  in a `scripts/` subdirectory under the config directory and must be
+  signed with the signify key defined in the config
 
-A sample macOS PLIST for /Library/LaunchDaemons (org.discord.reportnew.plist) is supplied for running as root with privilege separation (be sure to specify "privsep: yes" in
-the config file, or alternatively add a -p option in the arguments list in the PLIST file); it can also run as an unprivileged user if
-the only intent is to use it for process accounting log monitoring. (Use "launchctl load -w /Library/LaunchDaemons/org.discord.reportnew.plist" and it
-will run every 30 minutes.)
+## Process Accounting Monitoring
 
-Another sample macOS PLIST for /Library/LaunchDaemons (org.discord.rotateacct.plist) is supplied for rotating process accounting logs using the rotateacct.sh shell script.
+Process accounting logs record every command executed on the system.
+reportnew parses the binary process accounting format directly on OpenBSD,
+Linux, and macOS — no external tools required.
 
-Another sample macOS PLIST for /Library/LaunchDaemons (org.discord.accton.plist) is supplied for starting process
-accounting at system boot.
+The recommended monitoring pattern is:
 
-Also included is a perl implementation of lastcomm.pl that works on OpenBSD, Linux, and macOS, but displays output chronologically (the order in the process accounting files) instead of in reverse chronological order.
+1. A rule matching all activity from unknown users (alerts on any unknown
+   user running anything)
+2. A rule matching core dump, pledge/unveil violation, or memory violation
+   anomalies (OpenBSD-specific; has helped identify real security vulnerabilities)
+3. Per-user rules matching everything and excluding the commands expected
+   of that user — narrow for service accounts, broader for humans and root
 
-Multiple hosts can be supported with a single config file using either
-   hosts: <hostname-list>
-to identify sections applicable to a set of space-separated hosts, or alternatively,
-   begin-host: <hostname>
-   ...
-   end-host: <hostname>
-to have a single unique section in the config file for each host. The former is preferred for compactness, simplicity, and eliminating redundancy between similarly-configured hosts.  reportnew -c can be used to check a config for possible syntax errors.
+The sample config includes extensive macro sets for expected commands by
+user type on OpenBSD, Linux/Proxmox, and macOS, covering system daemons,
+service accounts, and common user activity patterns.
 
-Actions can be "notify" (send email), "text" (send email with fewer
-characters for SMS), "alert" (generate output to STDOUT), or "execute"
-(pass matching log lines to a script). For "execute," privileges are
-dropped and the script is executed as nobody:nogroup (or nobody group),
-unless privilege separation is used in which case it is executed as
-_reportnew:_reportnew. Scripts must be in a "scripts" subdirectory
-under the config file directory and must be signify-signed using a
-key defined in the config. If OpenBSD's OpenBSD::Pledge is updated
-in the future to support execpromises, reportnew will be modified
-to make use of it, but at present scripts are not bound by pledge
-or unveil unless the script applies them itself.
+Combined with `times:` constraints, process accounting monitoring can
+alert on activity outside expected windows — for example, alerting on
+SSH logins during sleeping hours, or on `_rsyncu` activity outside backup
+windows.
 
-An "execute" action can be added as a second action after any "notify,"
-"text," or "alert" action by appending a semicolon to the end of the
-first action and adding the execute action, e.g.,:
+## Session Correlation
 
-    action: notify foo@example.com; execute myscript.sh
+The `session-with`/`session-without` feature groups log lines by session
+ID and reports the entire group only when an error appears in it. This
+provides full context for failures rather than just the error line.
 
-This is intended for cases such as a script collecting data from a log
-alert for some other purpose, e.g., for collecting malicious IPs or
-host names, mail certificate fingerprints of connecting mail servers,
-etc. Sample scripts for mail certificate fingerprint handling and
-creation of macros is included, mailcert.pl, and for pulling WiFi SSID
-and MAC addresses from WAX620 neighbor AP logs, wifi.pl.
+Example for OpenSMTPD mail logs:
+```
+match: session-with /[a-f0-9]{16} (?:mta|smtp)/
+exclude: session-without /([a-f0-9]{16}) (?:mta|smtp) (?:.*reject|fail|error|timeout)/
+action: notify admin@example.com
+```
 
-Here is an example of within-log correlation, here is an example used for
-alerting on an SMTP session of concern with context for OpenSMTPD:
+The `session-with` pattern identifies lines belonging to the same session
+(the capture group matches the session ID). The `session-without` pattern
+identifies sessions to discard — any session that does NOT contain a
+matching error line is discarded; sessions that DO contain an error are
+reported in full including surrounding context lines.
 
-<PRE>
-log: /var/log/maillog
-match: session-with /[a-f0-9]{16} smtp/
-exclude: session-without /([a-f0-9]{16}) smtp (?:failed-command|client-cert-check result="failure")/
-action: notify <emailaddress>
-</PRE>
+## Time Constraints
 
-This will start capturing logs when it matches a 16-character hex string followed by smtp, and then will
-discard that collected set of logs unless it matches an smtp failed-command or smtp client-cert-check with
-result=failure that uses that same 16-character hex string. If it does find the match, it reports the entire
-collected context, including lines before and after the failures which contain the same hex string followed
-by smtp.
+Define named time windows and apply them to rules:
 
-The "match" field tells reportnew to collect matches of that string for later comparison, the "exclude"
-field tells it to report on any of those collected log lines that have an envelope ID that matches the
-regular expression capture group from a line with a failure.
+```
+define_time: overnight = daily 22:00-06:00
+define_time: backup_window = daily 02:00-04:00
+define_time: reportnew_window = daily *:00-05, daily *:30-35
 
-An optional "times" field tells reportnew to only process a particular
-match/exclude/action triplet when the current system time (at the start
-of a reportnew run) meets the time constraint specified. Time constraints
-are defined in the config with a syntax similar to macros, using a
-"define_time:" directive described in the sample config file with
-examples.
-  
----
-  
-To monitor process accounting logs to identify unusual activity from service accounts, normal users, or root, use something like the following:
+# Alert on SSH logins overnight
+match: /sshd.*Accepted/
+times: overnight
+action: notify admin@example.com
 
-<PRE>
-  log: /var/account/acct
-  match: all
-  exclude: /(__|tty..) (_dovecot | _file | _identd | _ntp | _ping | _smtpd | _syspatch | _tcpdump | _traceroute | user1 | user2 | root | sshd | www)/
-  action: notify myemailaddr
-  
-  match: /_dovecot/
-  exclude: /anvil|auth|stats/
-  action: notify myemailaddr
-  
-  match: /_file/
-  exclude: /file/
-  action: notify myemailaddr
-  
-  match: /_ntp/
-  exclude: / ntpd/
-  action: notify myemailaddr
-  
-  match: /_ping/
-  exclude: / ping/
-  action: notify myemailaddr
-  
-  match: /_smtpd/
-  exclude: / mail.mboxf| sh | smtpctl | smtpd/
-  action: notify myemailaddr
-  
-  match: /_syspatch/
-  exclude: /ftp| sh | signify/
-  action: notify myemailaddr
-  
-  match: /_tcpdump/
-  exclude: / tcpdump/
-  action: notify myemailddr
-  
-  match: /_traceroute/
-  exclude: / traceroute/
-  action: notify myemailaddr
-  
-  match: / user1/
-  exclude: / list of commands | used by user1/
-  action: notify myemailaddr
- </PRE>
-  
-and so on. The first set of directives will cause alerts for unknown users and the rest for unexpected activity by known users.
+# Alert on _rsyncu activity outside backup window
+match: /_rsyncu /
+times: !backup_window
+action: notify admin@example.com
 
-Quickstart for privilege separation support:
-OpenBSD: pkg_add p5-IO-FDPass p5-Privileges-Drop p5-JSON-MaybeXS
-Debian: apt-get install libio-fdpass-perl libprivileges-drop-perl libjson-maybexs-perl
-FreeBSD: pkg install p5-IO-FDPass p5-Privileges-Drop p5-JSON-MaybeXS
-CPAN: cpanm IO::FDPass Privileges::Drop JSON::MaybeXS
+# Alert on _reportnew activity outside its own run window
+match: /_reportnew /
+times: !reportnew_window
+action: notify admin@example.com
+```
 
-Create user _reportnew and group _reportnew
+Time specification syntax:
+```
+daily                   Every day
+Mon-Fri                 Day range
+Mon,Wed,Fri             Specific days (no spaces)
+all                     All day (00:00-23:59)
+HH:MM-HH:MM             Time range (wraps midnight if end < start)
+*:MM-MM                 Minute range of every hour
+```
 
-Set privsep: yes in reportnew.conf
+Multiple ranges can be combined with commas (OR logic).
+Negate a constraint with `!`: `times: !business_hours`
 
-Quickstart for process accounting support:
-OpenBSD:
-As root: touch /var/account/acct; accton
-Verify with: lastcomm
-Keeps 5 days by default, will rotate automatically
+## Configuration
 
-Debian:
-As root: touch /var/log/account/pacct; accton
-Verify with: lastcomm
-Keeps 30 days by default, will rotate automatically.
+The config file has three sections: global settings, macro definitions,
+and log/rule definitions. The last argument to reportnew is always the
+config file path.
 
-On macOS:
-As root (admin user, with sudo): sudo touch /var/account/acct; sudo accton
-Install rotateacct.sh into /usr/local/bin
-Install org.discord.reportnew.plist and org.discord.rotateacct.plist into /Library/LaunchDaemons
-sudo launchctl load -w org.discord.reportnew.plist
-sudo launchctl load -w org.discord.rotateacct.plist
-Verify with: lastcomm (may require reboot)
-Keeps forever and does not rotate by default, with org.discord.retateacct.plist, will
-keep 5 days and rotate automatically.
-(Requires postfix configuration for email delivery: minimal change is to update myhostname
-and set relayhost in /etc/postfix/main.cf to send email off-host.)
+**Global settings**:
+```
+master_notify: admin@example.com   # default notification address
+size_file: /etc/reportnew/reportnew.size  # state file location
+email_sender: nobody@example.com   # optional sender address
+privsep: yes                        # use privilege separation
+signify_pubkey: keyname.pub         # key for signed includes and scripts
+```
+
+**Macro definitions**:
+```
+# Preproc macro (substituted into match/exclude patterns as %%name%%)
+known_hosts = "10\.0\.0\.1|10\.0\.0\.2"
+
+# Postproc append macro (appended to matching output)
+mac_addr = "ae:f0:b4:3b:83:a7":append
+
+# Postproc substitute macro (replaces matching text in output)
+ssh_pub_key = "AAAA...base64...":substitute
+
+# Macro value from a file
+known_fingerprints = "<file:fingerprints.txt>"
+
+# Macro value from a signed file
+known_fingerprints = "<signedfile:fingerprints.txt>"
+```
+
+Macro include files:
+```
+macro-include-file: shared-macros.conf
+macro-include-signedfile: signed-macros.conf
+```
+
+**Log and rule definitions**:
+```
+log: /var/log/messages
+match: /error|fail|reject/
+exclude: /newsyslog.*logfile turned over/
+action: notify admin@example.com
+
+# With time constraint
+match: /sshd.*Accepted/
+times: overnight
+action: notify admin@example.com
+
+# Combined notify + execute
+match: /cert-check result.*fingerprint/
+exclude: /%%known_fingerprints%%/
+action: notify admin@example.com; execute collect-certs.sh
+```
+
+**Journal log syntax** (Linux):
+```
+log: journal unit ssh.service
+log: journal syslog-id doas
+log: journal syslog-facility authpriv
+```
+
+**Multi-host scoping**:
+```
+hosts: host1 host2 host3
+log: /var/log/messages
+match: /error/
+action: notify admin@example.com
+
+hosts: host1
+log: /var/log/authlog
+match: /ROOT/
+action: notify admin@example.com
+```
+
+Sections without a `hosts:` line apply to all hosts. The old
+`begin-host:`/`end-host:` syntax is deprecated but still supported;
+the two styles cannot be mixed.
+
+## Actions
+
+```
+action: notify admin@example.com        # email full report
+action: text admin@example.com          # email minimal (for SMS)
+action: alert                            # output to STDOUT
+action: execute script.pl               # pipe matching lines to signed script
+action: notify admin@example.com; execute script.pl  # both
+```
+`notify` is the primary action for most use cases. `execute` is
+particularly useful for automated data collection from alerts.
+`alert` outputs to stdout and is mainly useful for manual testing;
+-d (debug mode) is more practical for troubleshooting without config
+changs. `text` sends a minimal email suitable for SMS gateways and may
+be enhanced in a future version.
+
+Execute scripts must be in a `scripts/` subdirectory under the config
+file directory and must be signed with the key specified in `signify_pubkey`.
+Scripts are executed as `_reportnew:_reportnew` (with privsep) or
+`nobody:nogroup` (without). Scripts are not bound by pledge/unveil unless
+they apply it themselves.
+
+Two sample execute scripts are included:
+- `mailcert.pl` — collects TLS certificate fingerprints from mail logs
+  and generates macros for known certificates
+- `wifi.pl` — collects WiFi SSIDs and MAC addresses from access point
+  neighbor logs
+
+## State File
+
+reportnew maintains one state file covering all logs being monitored by
+a given config. For each log it records the last processed offset and a
+SHA256 hash of the first line at the time of last processing. On each
+run it detects rotation (first line changed), truncation (file shorter
+than last run), and new rotated/gzipped archive files, processing each
+appropriately. The state file location is set by `size_file:` in the
+config.
+
+## Installation
+
+### Recommended: OpenBSD signed package
+
+```
+pkg_add ./reportnew-<version>.tgz
+```
+
+Or using [install.pl](https://github.com/lippard661/distribute) on OpenBSD,
+Linux, or macOS.
+
+### Manual installation
+
+```sh
+cp src/reportnew.pl /usr/local/bin/reportnew
+chmod 755 /usr/local/bin/reportnew
+mkdir -p /etc/reportnew/scripts
+cp etc/reportnew.conf /etc/reportnew/reportnew.conf
+chmod 600 /etc/reportnew/reportnew.conf
+```
+
+### Dependencies
+
+**Required**:
+- Perl 5
+- Standard modules: strict, warnings, Getopt::Std, Sys::Hostname,
+  File::Basename, POSIX, Digest::SHA, Storable, File::Temp,
+  IO::Uncompress::Gunzip
+
+**For privilege separation** (recommended):
+- IO::FDPass
+- Privileges::Drop
+- JSON::MaybeXS (preferred) or JSON::PP (standard, slower)
+
+Install on OpenBSD: `pkg_add p5-IO-FDPass p5-Privileges-Drop p5-JSON-MaybeXS`
+Install on Debian/Linux: `apt install libio-fdpass-perl libprivileges-drop-perl libjson-maybexs-perl`
+Install via CPAN: `cpanm IO::FDPass Privileges::Drop JSON::MaybeXS`
+
+Note: Privileges::Drop fails with the system Perl (5.34.1) on macOS Tahoe
+26.1. Use Homebrew Perl (5.40.2+) or patch Privileges::Drop: on the lines
+beginning with `my %GIDHash` and `my %EGIDHash`, insert
+`grep { $_ != 4294967295 }` immediately before `split(/\s/,` in each line.
+This works around a bug where setgid in Perl 5.34.1 puts -1 (0xFFFFFFFF
+unsigned) into $GID and $EGID.
+
+**For cyclog/multilog support**:
+- Time::TAI64 (CPAN)
+
+(Note: tai64nlocal from djb's daemontools was previously used but was
+removed from OpenBSD ports due to licensing; Time::TAI64 provides the
+same functionality.)
+
+**For signed includes and execute scripts**:
+- [Signify.pm](https://github.com/lippard661/Signify)
+- signify (OpenBSD standard), signify-openbsd (Linux apt), or
+  signify via Homebrew (macOS)
+
+### Setting up privilege separation
+
+```sh
+# OpenBSD
+useradd -r -d /var/empty -s /sbin/nologin _reportnew
+
+# Linux
+useradd -r -d /var/empty -s /usr/sbin/nologin _reportnew
+```
+
+Set `privsep: yes` in reportnew.conf.
+
+### Setting up process accounting
+
+**OpenBSD**:
+```sh
+touch /var/account/acct
+accton
+# Verify: lastcomm
+# Rotates automatically, keeps 5 days by default
+```
+
+**Debian/Linux**:
+```sh
+apt install acct
+touch /var/log/account/pacct
+accton
+# Verify: lastcomm
+# Rotates automatically, keeps 30 days by default
+```
+
+**macOS**:
+```sh
+sudo touch /var/account/acct
+sudo accton
+# Install rotation and launch scripts from launchd/ directory:
+sudo cp launchd/org.discord.accton.plist /Library/LaunchDaemons/
+sudo cp launchd/org.discord.rotateacct.plist /Library/LaunchDaemons/
+sudo cp src/rotateacct.sh /usr/local/bin/
+sudo launchctl load -w /Library/LaunchDaemons/org.discord.accton.plist
+sudo launchctl load -w /Library/LaunchDaemons/org.discord.rotateacct.plist
+# Verify: lastcomm (may require reboot)
+# Without rotateacct.plist, logs are never rotated.
+# With it, keeps 5 days and rotates automatically.
+```
+
+### Scheduling on macOS
+
+Three LaunchDaemon plists are provided in `launchd/`:
+- `org.discord.accton.plist` — enable process accounting at boot
+- `org.discord.reportnew.plist` — run reportnew every 30 minutes as root
+  with privilege separation (ensure `privsep: yes` in config, or add `-p`
+  to the plist arguments)
+- `org.discord.rotateacct.plist` — rotate process accounting logs
+
+```sh
+sudo launchctl load -w /Library/LaunchDaemons/org.discord.reportnew.plist
+```
+
+reportnew can also run as an unprivileged user if only process accounting
+monitoring is needed.
+
+macOS requires a mail relay configuration for email delivery. Minimal
+postfix configuration: set `myhostname` and `relayhost` in
+`/etc/postfix/main.cf`.
+
+### Scheduling on OpenBSD/Linux
+
+Add to root's crontab:
+```
+*/30 * * * * /usr/local/bin/reportnew /etc/reportnew/reportnew.conf
+```
+
+Or with a randomized start within a window to reduce timing predictability:
+```
+0,30 * * * * sleep $((RANDOM \% 600)); /usr/local/bin/reportnew /etc/reportnew/reportnew.conf
+```
+
+## Command-Line Options
+
+```
+reportnew [options] configfile
+
+-p          Use privilege separation
+-c          Check config file for syntax errors and exit
+-v          Verbose output
+-d          Debug output
+-V          Display version
+```
+
+## Security Notes
+
+- `reportnew.conf` should be mode 0600 (root only); it reveals your
+  monitoring rules and alert addresses. reportnew will warn if it finds
+  the config world-readable.
+- Macro include files that are not signed should also be protected;
+  signed include files can be uchg-protected while the main config
+  is schg-protected (see [syslock](https://github.com/lippard661/syslock))
+- Execute scripts must be signify-signed; privileges are dropped before
+  execution
+- The state file (size_file) does not need to be tightly protected but
+  should be root-owned; an attacker who can modify it could cause entries
+  to be missed or re-reported, but cannot inject false alerts
+- Running reportnew on both individual hosts and a central log server
+  (receiving syslog via TLS with mutual certificate authentication)
+  provides detection even if an individual host is compromised
+
+## Extras
+
+- `lastcomm.pl` — a Perl implementation of lastcomm that works on
+  OpenBSD, Linux, and macOS, displaying output in chronological order
+  (oldest first) rather than reverse chronological order. Supports
+  output format options to match the native lastcomm on each platform.
+  Written as a development aid for validating binary process accounting
+  format parsing.
+
+## Related Tools
+
+- [syslock](https://github.com/lippard661/syslock) — manages immutability
+  of log files (append-only live logs, immutable rotated logs) and config files
+- [rsync-tools](https://github.com/lippard661/rsync-tools) — provides the
+  _rsyncu user infrastructure monitored by reportnew
+- [sigtree](https://github.com/lippard661/sigtree) — file integrity
+  monitoring; reportnew can monitor sigtree's own activity via process
+  accounting
+- [distribute](https://github.com/lippard661/distribute) — uses rsync-tools
+  infrastructure to sync signed reportnew macro include files across hosts
+- [Signify](https://github.com/lippard661/Signify) — used for signed macro
+  includes and execute script verification
+
+## Author
+
+Jim Lippard
+https://www.discord.org/lippard/
+https://github.com/lippard661
+
+## License
+
+See individual files for license information.
+
+## Changelog
+
+See docs/ChangeLog for detailed modification history.
