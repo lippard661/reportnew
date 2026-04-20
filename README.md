@@ -388,6 +388,9 @@ Add to root's crontab:
 
 Or with a randomized start within a window to reduce timing predictability:
 ```
+# OpenBSD
+0~10,30~40 * * * * /usr/local/bin/reportnew /etc/reportnew/reportnew.conf
+# Other systems
 0,30 * * * * sleep $((RANDOM \% 600)); /usr/local/bin/reportnew /etc/reportnew/reportnew.conf
 ```
 
