@@ -4177,6 +4177,7 @@ sub send_text {
 	else {
 	    die "Unable to open $SENDMAIL. $!\n";
 	}
+    }
 }
 
 # Send error notification.
