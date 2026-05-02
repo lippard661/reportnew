@@ -1,5 +1,15 @@
 BUGS
 
+(Fixed 1.34b) Fixed about 18 minor issues identified in Claude
+(Opus 4.7) security and error review. Most significant were
+an operator precedence bug in validate_request, a latent bug
+in direct_read_process_acct_log and read_process_acct_log
+(using global $logfile as parameter instead of $acct_log),
+ensuring all bytes are read in priv_listener, fixing inconsistent
+macro regex check (to permit whitespace in values in both places),
+other improved edge case error checking, some debug or error
+message typos, corrected comments.
+
 (Fixed 1.33a) Better timespec validation and error reporting, fix
 major bug that caused times directives to be out of alignment with
 match/exclude/action triplets.

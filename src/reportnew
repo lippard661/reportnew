@@ -259,6 +259,8 @@
 #    other hosts.
 # Modified 16 April 2026 by Jim Lippard to move umask earlier so size
 #    file is mode 0600.
+# Modified 2 May 2026 by Jim Lippard to fix just over a dozen minor issues
+#    identified by Claude security and error assessment (Opus 4.7).
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -340,7 +342,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.34a of 16 April 2026';
+my $VERSION = 'reportnew 1.34b of 2 May 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1557,7 +1559,7 @@ sub parse_config {
 				chomp;
 				# ignore blank lines and comments
 				if (!/^\s*$|^\s*#.*$/) {
-				    if (/^([\w\-]+)\s*=\s*\"(\S+)\"(.*$)/) {
+				    if (/^([\w\-]+)\s*=\s*\"(.+)\"(.*$)/) {
 					$macro_name = $1;
 					$macro_value = $2;
 					$macro_options = $3;
@@ -1776,7 +1778,7 @@ sub parse_macro {
     # Allow importation of macro value from a file in same
     # dir as config file. Only expand if either in global
     # context or if in host context for current host.
-    if ($macro_value =~ /^<(?:signed)*file:(.*)>$/ &&
+    if ($macro_value =~ /^<(?:signed)?file:(.*)>$/ &&
 	(($current_context == $GLOBAL_CONTEXT) ||
 	 ($current_context == $HOST_CONTEXT &&
 	  $current_host eq $HOSTNAME))){
@@ -1796,7 +1798,7 @@ sub parse_macro {
 		exit;			
 	    }
 	    if (!$have_signify) {
-		send_error ($config_file, "Signify.pm not found on system, cannt verify signature on signed macro value file \"$macro_file\" on line $line_num. $_\n");
+		send_error ($config_file, "Signify.pm not found on system, can't verify signature on signed macro value file \"$macro_file\" on line $line_num. $_\n");
 		exit;	
 	    }
 	    if (!verify_signify_sig ($macro_file)) {
@@ -1823,6 +1825,7 @@ sub parse_macro {
 	}
 	else {
 	    send_error ($config_file, "Cannot open macro value file $macro_file in macro \"$macro_name\" on line $line_num. $! $_\n");
+	    exit;
 	}
     }
     if ($current_context == $GLOBAL_CONTEXT) {
@@ -2208,7 +2211,7 @@ sub evaluate_time_constraint {
 # gunzip: lofname. Gunzips the file and returns temp_logfile name.
 sub priv_listener {
     my ($req, $req_type);
-    my $MAX_REQUEST_LENGTH = 1024 * 1024;;
+    my $MAX_REQUEST_LENGTH = 1024 * 1024;
 
     print "DEBUG: starting priv_listener\n" if ($debug_mode);
     while (1) {
@@ -2221,12 +2224,24 @@ sub priv_listener {
 	}
 
 	# Read full message.
-	read ($parent_sock, my $buffer, $msg_len);
+	my $buffer = '';
+	my $remaining = $msg_len;
+	while ($remaining > 0) {
+	    my $n = read($parent_sock, my $chunk, $remaining);
+	    last unless defined($n) && $n > 0;
+	    $buffer .= $chunk;
+	    $remaining -= $n;
+	}
+	if ($remaining > 0) {
+	    warn "Short read on message body\n";
+	    send_error_response_nohmac("Short read");
+	    next;
+	}
 
 	my $envelope = eval {decode_json ($buffer) };
 
 	if ($@) {
-	    warn "Faild to parse envelope JSON: $@\n";
+	    warn "Failed to parse envelope JSON: $@\n";
 	    send_error_response_nohmac ("Invalid JSON.");
 	    next;
 	}
@@ -2236,6 +2251,8 @@ sub priv_listener {
 	my $received_hmac = $envelope->{hmac};
 	my $expected_hmac = hmac_sha256_hex ($request_json, $HMAC_SECRET);
 
+	# This is potentially subject to timing attacks since it is not a constant-time
+	# comparison, but using HMACs is already overkill in this implementation.
 	unless ($received_hmac eq $expected_hmac) {
 	    warn "HMAC verification failed.\n";
 	    send_error_response_nohmac ("HMAC verification failed.");
@@ -2369,7 +2386,7 @@ sub handle_fd_request {
 		send_error_response ("ACK timeout: $@", $request->{request_id});
 		return;
 	    }
-	    print "DEBUG: parent receivd ACK, sending FD\n" if ($debug_mode);
+	    print "DEBUG: parent received ACK, sending FD\n" if ($debug_mode);
 	}
 
 	# Now send the file descriptor.
@@ -2560,7 +2577,7 @@ sub validate_request {
     my $REQUEST_ID_MAX_LENGTH = 128;
 
     return 0 unless ref ($request) eq 'HASH';
-    return 0 unless $request->{version} == 1;
+    return 0 unless defined ($request->{version}) && $request->{version} =~ /^\d+$/ && $request->{version} == 1;
     return 0 unless exists $request->{type};
     return 0 unless ref ($request->{params}) eq 'HASH';
     return 0 unless exists $request->{request_id};
@@ -2574,8 +2591,8 @@ sub validate_request {
     return 0 unless $request->{timestamp} =~ /^\d+$/;
 
     # Check for path traversal or nulls in logfile name.
-    if ($request->{params}{logfile} && $request->{params}{logfile} =~ /\.\./ ||
-	$request->{params}{logfile} =~ /\0/) {
+    if ($request->{params}{logfile} &&
+	($request->{params}{logfile} =~ /\.\./ || $request->{params}{logfile} =~ /\0/)) {
 	return 0;
     }
 
@@ -2614,9 +2631,13 @@ sub generate_random_secret {
 	);
 
     if (open (my $urandom, '<:raw', '/dev/urandom')) {
-	read ($urandom, my $random_bytes, 32);
+	my $n = read ($urandom, my $random_bytes, 32);
 	close ($urandom);
+	die "Could not get 32 bytes of randomness from /dev/urandom for HMAC secret generation.\n" if (!defined ($n) || $n != 32);
 	$entropy .= unpack ('H*', $random_bytes);
+    }
+    else {
+	die "Could not open /dev/urandom for HMAC secret generation. $!\n";
     }
 
     # Hash it all together for shared secret between priv and nonpriv process.
@@ -2627,7 +2648,7 @@ sub generate_random_secret {
 # get a response, including for file descriptor requests.
 sub send_priv_req {
     my ($req_type, $req_params) = @_;
-    my $MAX_RESPONSE_LENGTH = 1024 * 1024;;
+    my $MAX_RESPONSE_LENGTH = 1024 * 1024;
 
     if (!$privsep_flag) {
 	die "Call to send_priv_req when not using privilege separation.\n";
@@ -2675,8 +2696,10 @@ sub send_priv_req {
     my $resp_hmac = $resp_envelope->{hmac};
     my $expected_hmac = hmac_sha256_hex ($resp_data, $HMAC_SECRET);
 
+    # This is potentially subject to timing attacks since it is not a constant-time
+    # comparison, but using HMACs is already overkill in this implementation.
     unless ($resp_hmac eq $expected_hmac) {
-	die "Response HMAC verification failed!|n";
+	die "Response HMAC verification failed!\n";
     }
     
     my $response = decode_json ($resp_data);
@@ -3065,14 +3088,15 @@ sub is_gzip {
     my $raw_mode_flag = 1;
 
     if (substr ($logfile, length ($logfile) -3, 3) eq '.gz') {
-	return 1 if (!-r $logfile); # assume it is
+	return 1 if (!-r $logfile); # assume it is (may require priv read)
 	if ($gzip_fh = nonpriv_open_fh ($logfile, $cyclog_flag, $raw_mode_flag)) {
-	    read ($gzip_fh, $magic_bytes, 2);
+	    my $n = read ($gzip_fh, $magic_bytes, 2);
 	    close ($gzip_fh);
+	    return 0 if (!defined ($n) || $n < 2); # not a gzip
 	    $magic_number = unpack ('S>', $magic_bytes); # unsigned, short, big endian
 	    return $magic_number == 0x1f8b;
 	}
-	return 1; # if we can't open, assume it is.
+	return 1; # if we can't open, assume it is (may require priv read)
     }
 
     return 0;
@@ -3112,7 +3136,7 @@ sub first_log_line_sha256_digest {
     my ($logfile, $first_line) = @_;
     my ($sha256_digest, $gzip_fh);
 
-    # Process if supplied.
+    # Process if $first_line is supplied and return.
     if (defined ($first_line)) {
 	chomp ($first_line);
 	$sha256_digest = sha256_hex ($first_line);
@@ -3313,7 +3337,7 @@ sub direct_read_process_acct_log {
 			if ($n_bytes == $RECORD_SIZE &&
 			    $old_first_line_hash ne 'null') {
 			    $new_first_line_hash =
-				first_log_line_sha256_digest ($logfile,
+				first_log_line_sha256_digest ($acct_log,
 							       $record);
 			    seek ($acct_fh, $old_size, 0) if ($old_first_line_hash eq $new_first_line_hash);
 			    # if not the live file we'll need to get a new one
@@ -3363,7 +3387,7 @@ sub direct_read_process_acct_log {
 			$offset == 0 &&
 			$position == $n_bytes &&
 			!defined ($new_first_line_hash)) {
-			$new_first_line_hash = first_log_line_sha256_digest ($logfile, $record);
+			$new_first_line_hash = first_log_line_sha256_digest ($acct_log, $record);
 		    }
 		
 		    if ($^O eq 'openbsd') {
@@ -3571,13 +3595,13 @@ sub read_process_acct_log {
     my ($req_response); # for privsep
 
     if ($^O eq 'linux' && $privsep_flag && $nonpriv_flag) {
-	$req_response = get_priv_data ('get-linux-pacct', { logfile => $logfile, checktime => $checktime });
+	$req_response = get_priv_data ('get-linux-pacct', { logfile => $acct_log, checktime => $checktime });
 	if (defined ($req_response)) {
 	    $temp_logfile = $req_response->{temp_logfile};
 	    $new_checktime = $req_response->{checktime};
 	    return ($temp_logfile, $new_checktime);
 	}
-	send_error ($logfile, "Received unexpected response from privileged parent process trying to get Linux process accounting from $logfile.");
+	send_error ($acct_log, "Received unexpected response from privileged parent process trying to get Linux process accounting from $logfile.");
 	exit; # or just return?
     }
 
@@ -4011,7 +4035,7 @@ sub execute_script {
     if ($< == 0 || $> == 0) { # Running as root (real or effective uid is 0)
 	my ($nobody_uid, $nobody_gid);
     
-	# Try nobody first, then _reportnew as fallback
+	# Use nobody:nogroup (and nobody:nobody as fallback).
 	$nobody_uid = getpwnam ('nobody');
 	$nobody_gid = getgrnam ('nogroup') || getgrnam ('nobody');
     
@@ -4036,7 +4060,7 @@ sub execute_script {
 	    }
 	}
 	else {
-	    die "Cannot find nobody:nogroup|nobody for privilege drop for script execution.\n";
+	    die "Cannot find nobody:nogroup (or nobody:nobody) for privilege drop for script execution.\n";
 	}
     }
 
@@ -4090,20 +4114,24 @@ sub send_notify {
     }
 
     else {
-	open (MAIL, '|-', $SENDMAIL, '-t');
-	print MAIL "From: Reporter <$email_sender>\n";
-	print MAIL "To: $notify_list\n";
-	print MAIL "Subject: $hostname $logfile\n\n";
-	s/\r//g for @lines; # remove carriage returns
-	foreach $line (@lines) {
-	    if (length($line) > 990) {
-		print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
+	if (open (MAIL, '|-', $SENDMAIL, '-t')) {
+	    print MAIL "From: Reporter <$email_sender>\n";
+	    print MAIL "To: $notify_list\n";
+	    print MAIL "Subject: $hostname $logfile\n\n";
+	    s/\r//g for @lines; # remove carriage returns
+	    foreach $line (@lines) {
+		if (length($line) > 990) {
+		    print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
+		}
+		else {
+		    print MAIL "$line\n";
+		}
 	    }
-	    else {
-		print MAIL "$line\n";
-	    }
+	    close (MAIL);
 	}
-	close (MAIL);
+	else {
+	    die "Unable to open $SENDMAIL. $!\n";
+	}
     }
 }
 
@@ -4132,19 +4160,23 @@ sub send_text {
     }
 
     else {
-	open (MAIL, '|-', $SENDMAIL, '-t');
-	print MAIL "To: $notify_list\n\n";
-	s/\r//g for @lines; # remove carriage returns
-	foreach $line (@lines) {
-	    if (length($line) > 990) {
-		print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
+	if (open (MAIL, '|-', $SENDMAIL, '-t')) {
+	    print MAIL "From: Reporter <$email_sender>\n";	    
+	    print MAIL "To: $notify_list\n\n";
+	    s/\r//g for @lines; # remove carriage returns
+	    foreach $line (@lines) {
+		if (length($line) > 990) {
+		    print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
+		}
+		else {
+		    print MAIL "$line\n";
+		}
 	    }
-	    else {
-		print MAIL "$line\n";
-	    }
+	    close (MAIL);
 	}
-	close (MAIL);
-    }
+	else {
+	    die "Unable to open $SENDMAIL. $!\n";
+	}
 }
 
 # Send error notification.
