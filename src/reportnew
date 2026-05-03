@@ -261,6 +261,10 @@
 #    file is mode 0600.
 # Modified 2 May 2026 by Jim Lippard to fix just over a dozen minor issues
 #    identified by Claude security and error assessment (Opus 4.7).
+# Modified 3 May 2026 by Jim Lippard to fix long-standing double dereference
+#    issue that was a latent bug for configs with rules without action:
+#    directives (that use default). Use block eq greps for Linux journal
+#    unit and syslog facility checks.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -342,7 +346,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.34b of 2 May 2026';
+my $VERSION = 'reportnew 1.35 of 3 May 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -645,7 +649,7 @@ umask 0077;
 if (!-e $size_file) {
     my $size_file_dir = dirname ($size_file);
     unveil ($size_file_dir, 'rwc') if ($^O eq 'openbsd');
-    if (open (SIZEFILE, '>', "$size_file_dir/$size_file")) {
+    if (open (SIZEFILE, '>', $size_file)) {
 	close (SIZEFILE);
     }
     else {
@@ -874,10 +878,10 @@ foreach $logfile (@logfiles) {
     else { # cyclog or multilog
 	@cyclog_files = get_cyclog_files ($logfile);
 	if ($!) {
-	    send_error ($logfile, "Could not open cyclog/multilog $logfile. $!");
+	    send_error ($logfile, "Could not open cyclog/multilog directory for $logfile. $!");
 	}
 	elsif (!@cyclog_files) {
-	    send_error ($logfile, "Empty cyclog/multilog $logfile. $!");
+	    send_error ($logfile, "Empty cyclog/multilog $logfile.");
 	}
 	$got_first_cyclog_file = 0;
 	$old_log_checktime = $log_checktime{$logfile};
@@ -1490,11 +1494,11 @@ sub parse_config {
 			}
 
 			# @parsed_actions is already an array of strings, make it an array ref.
-			push (@${$action_hash{$current_logfile}}, [@parsed_actions]);
+			push (@{$action_hash{$current_logfile}}, [@parsed_actions]);
 
 			# After storing action, ensure time_hash is aligned
 			# Check if time constraint was added for this triplet
-			my $num_actions = scalar(@{${$action_hash{$current_logfile}}});
+			my $num_actions = scalar(@{$action_hash{$current_logfile}});
 			my $num_times = defined($time_hash{$current_logfile}) ? scalar(@{$time_hash{$current_logfile}}) : 0;
     
 			if ($num_times < $num_actions) {
@@ -1639,8 +1643,7 @@ sub parse_config {
 	my @applicable_excludes;
 	my @applicable_actions;
 
-	# Dereference the hash-of-arrays value to get the actual array ref
-	my $actions_arrayref = ${$action_hash{$current_logfile}};
+	my $actions_arrayref = $action_hash{$current_logfile};
 
 	for (my $idx = 0; $idx < scalar(@{$actions_arrayref}); $idx++) {
 	    # Check time constraint (if it exists)
@@ -2410,11 +2413,20 @@ sub handle_hash_request {
     my $logfile = $request->{params}{logfile};
 
     unless (is_allowed_logfile ($logfile)) {
-	send_error_response ("Logfile not in allowed list.");
+	send_error_response ("Logfile not in allowed list.", $request->{request_id});
 	return;
     }
 
-    my $hash = first_log_line_sha256_digest ($logfile);
+    my $hash = eval { first_log_line_sha256_digest ($logfile) };
+    
+    if ($@) {
+        send_error_response ("Error computing hash for $logfile: $@", $request->{request_id});
+        return;
+    }
+    if (!defined ($hash) || $hash eq '' || $hash eq '0') {
+        send_error_response ("Could not compute hash for $logfile.", $request->{request_id});
+        return;
+    }
 
     my $response = {
 	status => RESP_SUCCESS,
@@ -2438,6 +2450,12 @@ sub handle_journal_request {
     }
 
     my ($temp_logfile, $new_checktime) = read_linux_journal ($logfile, $checktime, $temp_dir);
+
+    if (!defined ($temp_logfile)) {
+        send_error_response ("Could not read journal for $logfile.", $request->{request_id});
+        return;
+    }
+    
     chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
     my $response = {
@@ -2465,6 +2483,12 @@ sub handle_linux_pacct_request {
     }
 
     my ($temp_logfile, $new_checktime) = read_process_acct_log ($logfile, $checktime, $temp_dir);
+    
+    if (!defined ($temp_logfile)) {
+	send_error_response ("Could not read process accounting log for $logfile.", $request->{request_id});
+	return;
+    }
+    
     chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
     my $response = {
@@ -2490,7 +2514,17 @@ sub handle_mclog_files_request {
 	return;
     }
 
+    $! = 0; # clear errno before call
     my @cyclog_files = get_cyclog_files ($logfile);
+
+    if ($!) {
+	send_error_response ("Could not open cyclog/multilog directory for $logfile: $!", $request->{request_id});
+	return;
+    }
+    if (!@cyclog_files) {
+	send_error_response ("Empty cyclog/multilog directory for $logfile.", $request->{request_id});
+	return;
+    }
 
     my $response = {
 	status => RESP_SUCCESS,
@@ -2512,7 +2546,17 @@ sub handle_gunzip_request {
 	return;
     }
 
-    my $temp_logfile = gunzip_logfile ($logfile, $temp_dir);
+    my $temp_logfile = eval { gunzip_logfile ($logfile, $temp_dir) };
+
+    if ($@) {
+	send_error_response ("Error gunzipping $logfile: $@", $request->{request_id});
+	return;
+    }
+    if (!defined ($temp_logfile)) {
+	send_error_response ("Could not gunzip $logfile.", $request->{request_id});
+	return;
+    }
+    
     chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
     my $response = {
@@ -3770,7 +3814,7 @@ sub read_linux_journal {
     # Formulate selection arguments.
     if ($logfile =~ /journal unit ([\w\-\.]+)$/) {
 	my $unit_arg = $1;
-	if (!grep (/^$unit_arg$/, @linux_journal_units)) {
+	if (!grep ($_ eq $unit_arg, @linux_journal_units)) {
 	    send_error ($logfile, "Specified journal unit $unit_arg is not enabled.");
 	    exit; # or just return?
 	}
@@ -3783,7 +3827,7 @@ sub read_linux_journal {
     }
     elsif ($logfile =~ /journal syslog-facility ([\w\-\.]+)$/) {
 	my $syslog_facility_arg = $1;
-	if (!grep (/^$syslog_facility_arg$/, @linux_journal_syslog_facilities)) {
+	if (!grep ($_ eq $syslog_facility_arg, @linux_journal_syslog_facilities)) {
 	    send_error ($logfile, "Specified journal syslog facility $syslog_facility_arg is not defined.");
 	    exit; # or just return?    
 	}
@@ -4261,7 +4305,8 @@ sub write_size_file {
 
     # Now, we write everything out, either with what we have or with what
     # was just read from the size file except for our current logfile.
-    if (!open (SIZEFILE, '>', $size_file)) {
+    # Modified to remove race condition (was truncating before lock).
+    if (!sysopen (SIZEFILE, $size_file, O_RDWR | O_CREAT, 0600)) {
 	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
 	exit;
     }
@@ -4274,6 +4319,12 @@ sub write_size_file {
 	}
 	sleep 1;
     }
+
+    # Now have lock, truncate.
+    truncate (SIZEFILE, 0) || do {
+	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot truncate size file. $!");
+	exit;
+    };
 
     # If we're writing out all log files, do that.
     if ($write_all_logfiles) {

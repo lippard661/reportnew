@@ -20,6 +20,8 @@
 #   and flag order.
 # Modified 4 March 2026 by Jim Lippard to unpack with Z24 instead of A24
 #   on OpenBSD, to avoid nulls in output.
+# Modified 3 May 2026 by Jim Lippard to fix bug in Linux tty calculations,
+#   use cache for getpwuid calls, remove dead code, minor enhancements.
 
 # Optional arguments to match user, device/tty, or command, multiple
 # args treated as OR, not AND.
@@ -36,6 +38,9 @@ use if $^O eq 'openbsd', 'OpenBSD::Unveil';
 
 my $DEFAULT_LOG = '/var/account/acct'; # BSD
 $DEFAULT_LOG = '/var/log/account/pacct' if ($^O eq 'linux');
+
+my $RECORDSIZE = 64;
+$RECORDSIZE = 40 if ($^O eq 'darwin');
 
 my $AHZ = accounting_hz();
 # from utmp.h UT_
@@ -72,6 +77,7 @@ my ($user, $commpid, $time, $delta, $tty_name);
 my ($ppid, $minflt, $majflt, $swaps);
 
 my %devname_cache;
+my %uid_cache;
 
 my ($output_format, $bsd_format, $linux_format); # output formats
 my ($filename, $paging_flag, $pid_flag);
@@ -126,9 +132,10 @@ if ($^O eq 'openbsd') {
 }
 
 open (ACCTLOG, '<', $logfile) || die "Cannot open accounting log $logfile. $!\n";
-$/ = \64;
-$/ = \40 if ($^O eq 'darwin');
+local $/ = \$RECORDSIZE;
 while ($acctline = <ACCTLOG>) {
+    # Skip incomplete records (truncated file or partial read)
+    next if length ($acctline) < $RECORDSIZE;
     if ($^O eq 'openbsd') {
 	($command, $utime, $stime, $etime,
 	 $io, $btime, $uid, $gid, $mem, $tty,
@@ -145,7 +152,7 @@ while ($acctline = <ACCTLOG>) {
 	 $ppid, $btime, $etime, $utime, $stime, $mem, $io,
 	 $rw, $minflt, $majflt, $swaps, $command) = unpack ($LINUX_RECORD_FORMAT, $acctline);
     }
-    $user = getpwuid ($uid) || $uid;
+    $user = get_username ($uid);
     $commpid = "$command\[$pid\]";
     $commpid = $command if ($linux_format || $^O eq 'darwin');
     $time = expand ($utime) + expand ($stime);
@@ -180,6 +187,7 @@ while ($acctline = <ACCTLOG>) {
 	print "\n";
     }
 }
+close (ACCTLOG);
 
 ### Subroutines
 
@@ -234,21 +242,24 @@ sub linux_device {
     my ($dev) = @_;
     my ($devname, $major, $minor);
 
+    # Linux ac_tty is __u16, encoded as legacy 8/8 major/minor.
+    # All terminal device types (tty, pts, console) use major numbers <= 255
+    # so this is sufficient for process accounting.
     $major = ($dev >> 8) & 0xff;
     $minor = $dev & 0xff;
 
-    if ($major == 4) {
+    if ($dev == 0) {
+	$devname = '__';
+    }
+    elsif ($major == 4) {
 	$devname = "tty$minor"; # virtual consoles
     }
-    elsif ($major >= 136 && $minor <= 143) {
+    elsif ($major >= 136 && $major <= 143) {
 	my $pts = ($major - 136) * 256 + $minor;
 	$devname = "pts/$pts"; # UNIX98 pts
     }
     elsif ($major == 5 && $minor == 1) {
 	$devname = 'console'; # system console
-    }
-    elsif ($dev == 0) {
-	$devname = '__';
     }
     else {
 	$devname = "tty($major, $minor)"; # fallback
@@ -274,6 +285,16 @@ sub getdev {
     }
 
     return ($dev_name);
+}
+
+# Return username from cache if available.
+sub get_username {
+    my ($uid) = @_;
+
+    unless (exists $uid_cache{$uid}) {
+        $uid_cache{$uid} = getpwuid($uid) // $uid;
+    }
+    return $uid_cache{$uid};
 }
 
 # flags are defined in acct.h
@@ -326,10 +347,11 @@ sub flagbits {
     # than the alotted five characters in it for flags PTUSB -- could
     # pull out some spaces in that case (removing flag alignment but
     # keeping all the other alignment). This attempts to do that.
-    if ($linux_format && length ($output) > 5) {
-	for (my $idx = 0; $idx <= length ($output) - 4; $idx++) {
-	    $output =~ s/ (?=\S*$)//;
-	}
+    if ($linux_format) {
+	# Remove trailing-area spaces until length is acceptable or no more to remove.
+        while (length ($output) > 5 && $output =~ s/ (?=\S*$)//) {
+            # Loop body intentionally empty - the substitution and length check are the conditions
+        }
     }
     
     return $output;
@@ -346,32 +368,6 @@ sub requested {
     }
 
     return 0;
-}
-
-sub flagbits_hex {
-    my ($flags) = @_;
-    my ($AFORK, $AMAP, $ACORE, $AXSIG,
-	$APLEDGE, $ATRAP, $AUNVEIL, $APINSYS,
-	$ABTCFI);
-    my ($hexflags, $output);
-
-    $hexflags = pack ("H32", $flags);
-    
-    vec ($AFORK, 0, 8) = 0x01;
-#    vec ($ASU, 0, 8) = 0x02; (removed)
-    vec ($AMAP, 0, 8) = 0x04;
-    vec ($ACORE, 0, 8) = 0x08;
-    vec ($AXSIG, 0, 8) = 0x10;
-    vec ($APLEDGE, 0, 8) = 0x20;
-    vec ($ATRAP, 0, 8) = 0x40;
-    vec ($AUNVEIL, 0, 8) = 0x80;
-    vec ($APINSYS, 0, 8) = 0x200;
-    vec ($ABTCFI, 0, 8) = 0x400;
-
-    $output = "-";
-    $output .= "F" if ($hexflags & $AFORK);
-    # etc.
-    return ($output);
 }
 
 # OpenBSD process accounting log format in acct.h

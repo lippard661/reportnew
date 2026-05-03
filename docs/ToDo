@@ -1,5 +1,9 @@
 BUGS
 
+(Fixed 1.35) Finally fixed issue which required double dereference
+on the action hash which had a latent bug for any configs that had
+rules without defined actions (i.e., using the default).
+
 (Fixed 1.34b) Fixed about 18 minor issues identified in Claude
 (Opus 4.7) security and error review. Most significant were
 an operator precedence bug in validate_request, a latent bug
