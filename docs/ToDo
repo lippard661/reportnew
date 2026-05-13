@@ -110,6 +110,8 @@ the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
 
+* (Done 1.35a) Rename processes when privilege separation is used.
+
 * (Done 1.34a) Move umask earlier to limit permissions on size file.
 Add more comprehensive post-install message to OpenBSD package (suitable
 for use with install.pl script on macOS and Linux).

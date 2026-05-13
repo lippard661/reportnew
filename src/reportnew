@@ -265,6 +265,8 @@
 #    issue that was a latent bug for configs with rules without action:
 #    directives (that use default). Use block eq greps for Linux journal
 #    unit and syslog facility checks.
+# Modified 12 May 2026 by Jim Lippard to rename processes when using
+#    privilege separation.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -346,7 +348,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.35 of 3 May 2026';
+my $VERSION = 'reportnew 1.35a of 13 May 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -694,6 +696,9 @@ if ($privsep_flag) {
     if ($pid != 0) {
 	close $child_sock;
 
+	# Rename process.
+	$0 = 'reportnew: [priv] (reportnew)';
+
 	print "DEBUG: child proc=$pid, parent proc=$$\n" if ($debug_mode);
 	# Don't need @PRIVSEP_CHILD_PROMISES or @PRIVSEP_INITIAL_CHILD_PROMISES.
 	if ($^O eq 'openbsd') {
@@ -715,6 +720,10 @@ if ($privsep_flag) {
 
     # Child.
     close $parent_sock;
+
+    # Rename process.
+    $0 = 'reportnew: log processor (reportnew)';
+    
     # This call will die if it fails.
     print "DEBUG: Privileges::Drop will always fail on macOS with perl 5.34.1 unless patched.\n" if ($debug_mode && $^O eq 'darwin' && $^V eq 'v5.34.1');
     Privileges::Drop::drop_uidgid ($reporter_uid, $reporter_gid);
@@ -4073,6 +4082,9 @@ sub execute_script {
 
     # Child process - will exec the script
     close ($write_fh);
+
+    # Rename process.
+    $0 = 'reportnew: script exec (reportnew)';
     
     # Drop privileges to nobody/nogroup unless using privsep or being run
     # by a non-root user.
