@@ -267,6 +267,7 @@
 #    unit and syslog facility checks.
 # Modified 12 May 2026 by Jim Lippard to rename processes when using
 #    privilege separation.
+# Modified 15 May 2026 by Jim Lippard to shorten process names.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -697,7 +698,7 @@ if ($privsep_flag) {
 	close $child_sock;
 
 	# Rename process.
-	$0 = 'reportnew: [priv] (reportnew)';
+	$0 = 'reportnew [priv]';
 
 	print "DEBUG: child proc=$pid, parent proc=$$\n" if ($debug_mode);
 	# Don't need @PRIVSEP_CHILD_PROMISES or @PRIVSEP_INITIAL_CHILD_PROMISES.
@@ -722,7 +723,7 @@ if ($privsep_flag) {
     close $parent_sock;
 
     # Rename process.
-    $0 = 'reportnew: log processor (reportnew)';
+    $0 = 'reportnew log processor';
     
     # This call will die if it fails.
     print "DEBUG: Privileges::Drop will always fail on macOS with perl 5.34.1 unless patched.\n" if ($debug_mode && $^O eq 'darwin' && $^V eq 'v5.34.1');
@@ -4084,7 +4085,7 @@ sub execute_script {
     close ($write_fh);
 
     # Rename process.
-    $0 = 'reportnew: script exec (reportnew)';
+    $0 = 'reportnew script exec';
     
     # Drop privileges to nobody/nogroup unless using privsep or being run
     # by a non-root user.
