@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.35b) Fixed Gemini-identified bug in time string passed to
+journalctl --since.
+
 (Fixed 1.35) Finally fixed issue which required double dereference
 on the action hash which had a latent bug for any configs that had
 rules without defined actions (i.e., using the default).

@@ -268,6 +268,10 @@
 # Modified 12 May 2026 by Jim Lippard to rename processes when using
 #    privilege separation.
 # Modified 15 May 2026 by Jim Lippard to shorten process names.
+# Modified 16 May 2026 by Jim Lippard to pass epoch time to journalctl --since.
+#    (Bug identified by Gemini, along with five false positives; was passing
+#    malformed time string with erroneous fractional seconds which were likely
+#    being ignored.)
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -297,7 +301,7 @@ use File::Find;
 use if $^O ne 'openbsd', 'File::Temp', qw( :mktemp tempfile );
 use Getopt::Std;
 use IO::Uncompress::Gunzip qw( gunzip $GunzipError);
-use POSIX qw( ctime fmod strftime sysconf _SC_CLK_TCK );
+use POSIX qw( ctime fmod sysconf _SC_CLK_TCK );
 use Sys::Hostname;
 use Time::HiRes qw( gettimeofday );
 use Time::ParseDate;
@@ -349,7 +353,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.35a of 13 May 2026';
+my $VERSION = 'reportnew 1.35b of 16 May 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -3795,7 +3799,6 @@ sub read_process_acct_log {
 sub read_linux_journal {
     my ($logfile, $checktime, $temp_dir) = @_;
     my ($temp_logfile, $temp_fh, $new_checktime);
-    my (@time_components, $time_string, $full_time);
     my @selection_args;
     my $NO_ENTRIES = '-- No entries --';
     my $result; # for privilege separation
@@ -3815,10 +3818,9 @@ sub read_linux_journal {
     chomp ($temp_logfile);
 
     # Convert last checktime to English.
+    my $since_param;
     if ($checktime != 0) {
-	@time_components = localtime ($checktime);
-	$time_string = strftime "%Y-%m-%d %H:%M:%S", @time_components;
-	$full_time = sprintf "%s.%06d", $time_string, $checktime;
+	$since_param = sprintf("\@%d", $checktime);  # journalctl epoch syntax
     }
 
     # Formulate selection arguments.
@@ -3849,7 +3851,7 @@ sub read_linux_journal {
     }
     
     # Append date if checktime nonzero.
-    push (@selection_args, '--since', $full_time) unless (!$checktime);
+    push (@selection_args, '--since', $since_param) unless (!$checktime);
 
     # Open journalctl to read log lines.
     if (!open (JOURNAL, '-|', $JOURNALCTL, @selection_args)) {
