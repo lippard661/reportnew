@@ -3534,7 +3534,7 @@ sub direct_read_process_acct_log {
     if (!$found_first_record || !$processing_records) {
 	# This should provoke an error and exit, we never wrote anything
 	# out. This can happen if process accounting is turned off.
-	send_error ($acct_file, "Could not find any new records in acct file $acct_file (direct method). This shouldn't happen--is process accounting on?");
+	send_error ($acct_log, "Could not find any new records in acct file $acct_log (direct method). This shouldn't happen--is process accounting on?");
 	exit;
     }
     # Otherwise, close the temp file and return log path.
@@ -4161,8 +4161,9 @@ sub send_notify {
 	}
     }
 
-    # It is possible to get here before $email_sender is defined if
-    # an error occurs while still parsing the config.
+    # Defensive checks against undef parameters
+    $hostname = $SHORT_HOSTNAME if (!defined ($hostname));
+    $logfile = '(unknown)' if (!defined ($logfile));
     $email_sender = $EMAIL_SENDER if (!defined ($email_sender));
 
     if ($debug_mode) {
@@ -4210,6 +4211,11 @@ sub send_text {
 	    $notify_list = $master_notify;
 	}
     }
+
+    # Defensive checks against undef parameters
+    $hostname = $SHORT_HOSTNAME if (!defined ($hostname));
+    $logfile = '(unknown)' if (!defined ($logfile));
+    $email_sender = $EMAIL_SENDER if (!defined ($email_sender));
 
     if ($debug_mode) {
 	print "$hostname: $logfile ($notify_list)\n";
