@@ -98,7 +98,10 @@ session.  Any line matching this pattern is collected into the session
 it belongs to. The `session-without` pattern identifies which sessions
 are interesting and excludes any session that doesn't have it. Its
 capture group must extract the same session identifier that
-session-with uses. Sessions that do not contain a matching
+`session-with` uses. When a line matches `session-without`, its
+captured identifier is used to find all of the lines from
+`session-with` that share that identifier, and the entire group is
+reported together. Sessions that do not contain a matching
 `session-without` line are discarded; sessions that do contain such a
 line are reported in full, including all the session's lines.
 
