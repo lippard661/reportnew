@@ -93,11 +93,14 @@ exclude: session-without /([a-f0-9]{16}) (?:mta|smtp) (?:.*reject|fail|error|tim
 action: notify admin@example.com
 ```
 
-The `session-with` pattern identifies lines belonging to the same session
-(the capture group matches the session ID). The `session-without` pattern
-identifies sessions to discard — any session that does NOT contain a
-matching error line is discarded; sessions that DO contain an error are
-reported in full including surrounding context lines.
+The `session-with` pattern identifies lines belonging to the same
+session.  Any line matching this pattern is collected into the session
+it belongs to. The `session-without` pattern identifies which sessions
+are interesting and excludes any session that doesn't have it. Its
+capture group must extract the same session identifier that
+session-with uses. Sessions that do not contain a matching
+`session-without` line are discarded; sessions that do contain such a
+line are reported in full, including all the session's lines.
 
 ## Time Constraints
 
