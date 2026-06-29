@@ -110,7 +110,7 @@
 #    directly on OpenBSD for greater efficiency.
 # Modified 17 April 2024 by Jim Lippard to set last log checktime more
 #    appropriately for process accounting logs (to match end of most recent
-#    log processing for OpenBSD, and start of most recent log procesing for
+#    log processing for OpenBSD, and start of most recent log processing for
 #    the old lastcomm/reverse order processing).
 # Modified 22 April 2024 by Jim Lippard to remove 'ps' pledge by using
 #    kill to verify existence of running processes instead of calling ps.
@@ -272,6 +272,22 @@
 #    (Bug identified by Gemini, along with five false positives; was passing
 #    malformed time string with erroneous fractional seconds which were likely
 #    being ignored.)
+# Modified 29 June 2026 by Jim Lippard after Claude 4.8 review:
+#    1) fix typo in priv call ("get-mclogfiles" instead of "get-mclog-files").
+#    2) fix linux_device major range test (bug not present in equivalent
+#       lastcomm.pl code)
+#    3) use errno in pid_exists rather than relying in English string
+#    4) exit after error for bad exclude directive
+#    5) remove dead code/properly generate email error when config file
+#       can't be opened
+#    6) improve IPv4 regexp to match with or without backslash-escaped dots
+#    7) properly warn on malformed line in size file once instead of
+#       repeatedly and check field counts explicitly
+#    8) update comment on run continuously to reflect need to update
+#       time constraint handling if every done, update comment on manual
+#       priv dropping to note it isn't handling supplementary groups,
+#       modify session-match code to build log-line capture groups as
+#       literal string ignoring any potential regexp chars in log content.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -286,7 +302,9 @@
 #   messages, though, so that it doesn't send a separate message for
 #   each log line.  (Easiest way might be to make it go into an
 #   infinite loop, sleeping every N minutes at the end.  Though
-#   it would be more efficient to use select.)
+#   it would be more efficient to use select.) If this is done, the
+#   define_time constraints would need to be re-evaluated and not
+#   just evaluated once at run time.
 
 ### Required packages.
 
@@ -294,6 +312,7 @@ use strict;
 use warnings;
 use feature 'state';
 use Digest::SHA qw( hmac_sha256_hex sha256_hex );
+use Errno qw( EPERM );
 use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Copy;
@@ -353,7 +372,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.35b of 16 May 2026';
+my $VERSION = 'reportnew 1.36 of 29 June 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -1305,6 +1324,7 @@ sub parse_config {
 			}
 			else {
 			    send_error ($config_file, "Invalid exclude directive on line $line_num. $_");
+			    exit;
 			}
 		    }
 		    elsif ($directive eq 'times') {
@@ -1605,9 +1625,8 @@ sub parse_config {
 	close (CONFIG);
     }
     else {
-	die "Cannot open config file $config_file. $!\n";
 	send_error ($config_file, "Cannot open config file. $!");
-	exit;
+	die "Cannot open config file $config_file. $!\n";
     }
 
     # If multi-host, did we find our host in the config?
@@ -2881,7 +2900,7 @@ sub get_cyclog_files {
 	return (@cyclog_files);
     }
     elsif ($privsep_flag && $nonpriv_flag) {
-	my $files_ref = get_priv_data ('get-mclogfiles', { logfile => $logfile });
+	my $files_ref = get_priv_data ('get-mclog-files', { logfile => $logfile });
 	@cyclog_files = @$files_ref;
 	return (@cyclog_files);
     }
@@ -3030,6 +3049,7 @@ sub check_logfile {
 		    # capture groups for later use.
 		    if ($session_match_flag[$idx]) {
 			if ($session_append_string = match_line ($session_exclude_array[$idx], $_, 1)) {
+			    $session_append_string = quotemeta ($session_append_string); # match literally
 			    if ($session_match_array[$idx] eq '') {
 				$session_match_array[$idx] = $session_append_string;
 			    }
@@ -3614,7 +3634,7 @@ sub linux_device {
     if ($major == 4) {
 	$devname = "tty$minor"; # virtual console
     }
-    elsif ($major >= 136 && $minor <= 143) {
+    elsif ($major >= 136 && $major <= 143) {
 	my $pts = ($major - 136) * 256 + $minor;
 	$devname = "pts/$pts"; # UNIX98 pts
     }
@@ -3659,7 +3679,7 @@ sub read_process_acct_log {
 	    $new_checktime = $req_response->{checktime};
 	    return ($temp_logfile, $new_checktime);
 	}
-	send_error ($acct_log, "Received unexpected response from privileged parent process trying to get Linux process accounting from $logfile.");
+	send_error ($acct_log, "Received unexpected response from privileged parent process trying to get Linux process accounting from $acct_log.");
 	exit; # or just return?
     }
 
@@ -3905,16 +3925,22 @@ sub read_size_file {
 	$processing_pid = 0;
     }
     else {
-	if (open (SIZEFILE, '<', $size_file)) {
-	    if (!flock (SIZEFILE, LOCK_SH)) {
+	if (open (my $sizefile_fh, '<', $size_file)) {
+	    if (!flock ($sizefile_fh, LOCK_SH)) {
 		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
 	    }
-	    while (<SIZEFILE>) {
+	    while (<$sizefile_fh>) {
 		chomp;
-		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = split (/,/);
-		if (!defined ($processing_pid)) { # bad line in size file
+		my @fields = split (/,/, $_, -1); # -1 keeps trailing empty fields
+		my $nf = @fields;
+
+		# Accept 6 (current), 5 (no pid), 4 (no sha, no pid).
+		if ($nf < 4 || $nf > 6 || $fields[0] eq '') {
 		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_");
+		    next;
 		}
+		
+		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = @fields;
 		if (!grep ($_ eq $logfile, @logfiles)) {
 		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Logfile $logfile in size file is not in config file.");
 		}
@@ -3929,16 +3955,16 @@ sub read_size_file {
 			$sha256_digest = '';
 		    }
 		    $log_sha256_digest{$logfile} = $sha256_digest;
-		    if (!defined ($processing_pid)) { # old size file
+		    if (!defined ($processing_pid) || $processing_pid eq '') { # old size file
 			$processing_pid = 0;
 		    }
 		    $log_processing_pid{$logfile} = $processing_pid;
 		}
 	    }
-	    if (!flock (SIZEFILE, LOCK_UN)) {
+	    if (!flock ($sizefile_fh, LOCK_UN)) {
 		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
 	    }
-	    close (SIZEFILE);
+	    close ($sizefile_fh);
 	}
 	else {
 	    send_error ($size_file, "Cannot open size file. $!");
@@ -4110,6 +4136,8 @@ sub execute_script {
 		$) = $nobody_gid;
 		$< = $nobody_uid;
 		$> = $nobody_uid;
+		# Note this doesn't drop supplementary groups
+		# (Privileges::Drop does).
 	    
 		# Verify privilege drop worked
 		if ($> != $nobody_uid || $< != $nobody_uid ||
@@ -4410,10 +4438,11 @@ sub write_size_file {
 sub pid_exists {
     my ($pid) = @_;
 
-    if (kill (0, $pid) || $!) {
-	return 1 unless $! eq 'No such process';
-    }
+    return 0 unless defined ($pid) && $pid =~ /^\d+/ && $pid > 0;
 
+    return 1 if (kill (0, $pid));
+
+    return 1 if $! == EPERM;
     return 0;
 }
     
@@ -4522,7 +4551,7 @@ sub postproc_match_and_replace {
     # macros), as we assume the match rule will contain the context for
     # anchoring the match--if we stuck things in it could break a rule
     # and would be very counter-intuitive to the builder of the config.
-    my $IPv4_REGEXP = '^\d{1,3}\\\.\d{1,3}\\\.\d{1,3}\\\.\d{1,3}$';
+    my $IPv4_REGEXP = qr/\d{1,3}(?:\\?\.\d{1,3}){3}/;   # \\? = optional backslash, \. = literal dot
     my $IPv6_REGEXP = '^(((?=(?>.*?::)(?!.*::)))(::)?(([0-9A-F]{1,4})::?){0,5}|((?5):){6})(\2((?5)(::?|$)){0,2}|((25[0-5]|(2[0-4]|1[0-9]|[1-9])?[0-9])(\.|$)){4}|(?5):(?5))(?<![^:]:)(?<!\.)\z';
     my $START_TOKENS = '^|[\s:\[]';
     my $END_TOKENS = '[\s:\.\]]|$';

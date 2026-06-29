@@ -1,5 +1,22 @@
 BUGS
 
+(Fixed 1.36) Fixed Claude Opus 4.8 identified bugs:
+   1) fix typo in priv call ("get-mclogfiles" instead of "get-mclog-files").
+   2) fix linux_device major range test (bug not present in equivalent
+      lastcomm.pl code)
+   3) use errno in pid_exists rather than relying in English string
+   4) exit after error for bad exclude directive
+   5) remove dead code/properly generate email error when config file
+      can't be opened
+   6) improve IPv4 regexp to match with or without backslash-escaped dots
+   7) properly warn on malformed line in size file once instead of
+      repeatedly and check field counts explicitly
+   8) update comment on run continuously to reflect need to update
+      time constraint handling if every done, update comment on manual
+      priv dropping to note it isn't handling supplementary groups,
+      modify session-match code to build log-line capture groups as
+      literal string ignoring any potential regexp chars in log content.
+
 (Fixed 1.35b) Fixed Gemini-identified bug in time string passed to
 journalctl --since.
 
