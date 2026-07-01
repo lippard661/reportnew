@@ -10,6 +10,8 @@
 #    already cached.
 # Modified 14 March 2026 by Claude: Added input sanitization, improved domain
 #    extraction, better collision handling, stricter validation.
+# Modified 30 June 2026 by Jim Lippard after Claude Opus 4.8 review for some
+#    minor improvements.
 
 use strict;
 use warnings;
@@ -123,12 +125,17 @@ if ($^O eq 'openbsd') {
 
 # If cache file exists, read its contents.
 if (-e $CACHEFILE && !-z $CACHEFILE) {
-    $cacheref = lock_retrieve ($CACHEFILE);
-    if (defined ($cacheref->{CERTS})) {
-	%cache_cert = %{$cacheref->{CERTS}};
-    }
-    if (defined ($cacheref->{MACROS})) {
-	%cache_macro = %{$cacheref->{MACROS}};
+    # if it fails, we proceed with empty hashes and rebuild
+    eval {
+	$cacheref = lock_retrieve ($CACHEFILE);
+    };
+    if (!$@) {
+	if (defined ($cacheref->{CERTS})) {
+	    %cache_cert = %{$cacheref->{CERTS}};
+	}
+	if (defined ($cacheref->{MACROS})) {
+	    %cache_macro = %{$cacheref->{MACROS}};
+	}
     }
 }
 
@@ -154,7 +161,7 @@ open (LOG, '>>', $LOGFILE) || die "Cannot open log file $LOGFILE. $!\n";
 
 foreach $uid (keys (%date)) {
     # Stricter fingerprint validation: SHA256 should be exactly 64 hex chars
-    if ($cert{$uid} =~ /^SHA256:[0-9a-f]{64}$/) {
+    if (defined ($cert{$uid}) && $cert{$uid} =~ /^SHA256:[0-9a-f]{64}$/) {
 	# Sanitize all output data to prevent log injection
 	my $safe_date = sanitize_log_data($date{$uid});
 	my $safe_ip = sanitize_log_data($sender_ip{$uid});
@@ -169,10 +176,11 @@ foreach $uid (keys (%date)) {
 	    
 	    # Extract proper domain name
 	    $domain_name = extract_domain_name($sender_host{$uid});
+	    $domain_name =~ s/[^A-Za-z0-9-]/_/g;
 	    
 	    # Build macro name with date
-	    my $seconds = parsedate ($date{$uid});
-	    my $isodate = strftime ("%F", localtime ($seconds));
+	    my $seconds = parsedate ($date{$uid}, PREFER_PAST => 1);
+	    my $isodate = strftime ("%F", localtime (defined($seconds) ? $seconds : time()));
 	    $isodate =~ s/-//g;
 	    
 	    my $base_macro = 'CERT_' . $domain_name . '_' . $isodate;
