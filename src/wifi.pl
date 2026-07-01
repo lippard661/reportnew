@@ -11,6 +11,8 @@
 # Modified 14 March 2026 by Jim Lippard to make randomized MAC reporting optional
 #    and by Claude to fix bug in when randomized MAC reporting was occurring (was
 #    only doing it for new MACs, not cached).
+# Modified 30 June 2026 by Jim Lippard for minor enhancement after Claude
+#    Opus 4.8 review.
 
 use strict;
 use warnings;
@@ -111,18 +113,23 @@ if ($^O eq 'openbsd') {
 
 # If cache file exists, read its contents.
 if (-e $CACHEFILE && !-z $CACHEFILE) {
-    $cacheref = lock_retrieve ($CACHEFILE);
-    if (defined ($cacheref->{SSIDS})) {
-	%cache_ssid = %{$cacheref->{SSIDS}};
-    }
-    if (defined ($cacheref->{MACS})) {
-	%cache_mac = %{$cacheref->{MACS}};
-    }
-    if (defined ($cacheref->{BANDS})) {
-	%cache_band = %{$cacheref->{BANDS}};
-    }
-    if (defined ($cacheref->{EPOCHS})) {
-	%cache_epoch = %{$cacheref->{EPOCHS}};
+    # If it fails, we proceed with empty hashes and rebuild.
+    eval {
+	$cacheref = lock_retrieve ($CACHEFILE);
+    };
+    if (!$@) {
+	if (defined ($cacheref->{SSIDS})) {
+	    %cache_ssid = %{$cacheref->{SSIDS}};
+	}
+	if (defined ($cacheref->{MACS})) {
+	    %cache_mac = %{$cacheref->{MACS}};
+	}
+	if (defined ($cacheref->{BANDS})) {
+	    %cache_band = %{$cacheref->{BANDS}};
+	}
+	if (defined ($cacheref->{EPOCHS})) {
+	    %cache_epoch = %{$cacheref->{EPOCHS}};
+	}
     }
     # Legacy support: if old cache has DATES instead of EPOCHS, ignore it
     # (next run will create new cache with epochs)
@@ -194,7 +201,7 @@ foreach $mac (keys (%epoch)) {
 	    $cache_epoch{$mac} = $epoch{$mac};
 	    print LOG " (new)";
 	}
-	elsif ($cache_ssid{$mac} ne $ssid{$mac}) {
+	elsif ($cache_ssid{$mac} // '' ne $ssid{$mac}) {
 	    # SSID changed for known MAC
 	    my $safe_old_ssid = sanitize_log_data($cache_ssid{$mac});
 	    print LOG " (former SSID: $safe_old_ssid)";
