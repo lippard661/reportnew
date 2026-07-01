@@ -22,6 +22,8 @@
 #   on OpenBSD, to avoid nulls in output.
 # Modified 3 May 2026 by Jim Lippard to fix bug in Linux tty calculations,
 #   use cache for getpwuid calls, remove dead code, minor enhancements.
+# Modified 30 June 2026 by Jim Lippard to modify Linux $delta calculation
+#    and use expand on paging values.
 
 # Optional arguments to match user, device/tty, or command, multiple
 # args treated as OR, not AND.
@@ -131,9 +133,10 @@ if ($^O eq 'openbsd') {
     unveil ();
 }
 
-open (ACCTLOG, '<', $logfile) || die "Cannot open accounting log $logfile. $!\n";
+open (my $acctlog_fh, '<', $logfile) || die "Cannot open accounting log $logfile. $!\n";
+binmode ($acctlog_fh);
 local $/ = \$RECORDSIZE;
-while ($acctline = <ACCTLOG>) {
+while ($acctline = <$acctlog_fh>) {
     # Skip incomplete records (truncated file or partial read)
     next if length ($acctline) < $RECORDSIZE;
     if ($^O eq 'openbsd') {
@@ -156,7 +159,7 @@ while ($acctline = <ACCTLOG>) {
     $commpid = "$command\[$pid\]";
     $commpid = $command if ($linux_format || $^O eq 'darwin');
     $time = expand ($utime) + expand ($stime);
-    $delta = expand ($etime) / $AHZ;
+    $delta = ($^O eq 'linux') ? $etime / $AHZ : expand ($etime) / $AHZ;
     $tty_name = getdev ($tty);
     if ($#ARGV == -1 || requested (@ARGV)) {
 	printf "$output_format",
@@ -168,7 +171,7 @@ while ($acctline = <ACCTLOG>) {
 	printf "$output_format",
 	    $COMMPIDSIZE, $COMMPIDSIZE, $commpid,
 	    $FLAGSIZE, $FLAGSIZE, flagbits ($flag),
-	    $minflt, $majflt, $swaps,
+	    expand ($minflt), expand ($majflt), expand ($swaps),
 	    $time / $AHZ, ctime ($btime) if ($paging_flag);
 	printf " (%1.0f:%02.0f:%05.2f)",
 	    $delta / $SECSPERHOUR,
@@ -187,7 +190,7 @@ while ($acctline = <ACCTLOG>) {
 	print "\n";
     }
 }
-close (ACCTLOG);
+close ($acctlog_fh);
 
 ### Subroutines
 

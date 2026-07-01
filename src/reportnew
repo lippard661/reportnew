@@ -288,6 +288,8 @@
 #       priv dropping to note it isn't handling supplementary groups,
 #       modify session-match code to build log-line capture groups as
 #       literal string ignoring any potential regexp chars in log content.
+# Modified 30 June 2026 by Jim Lippard to correct $delta calculation on
+#    Linux for process accounting records. 
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -372,7 +374,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.36 of 29 June 2026';
+my $VERSION = 'reportnew 1.36a of 30 June 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -3534,7 +3536,7 @@ sub direct_read_process_acct_log {
 			# User time plus system time.
 			$cpu = (expand ($utime) + expand ($stime)) / $AHZ;
 			$cpu = sprintf "%.2f", $cpu; # was %6.2f for formatted cols
-			$delta = expand ($etime) / $AHZ;
+			$delta = ($^O eq 'linux') ? $etime / $AHZ : expand ($etime) / $AHZ;
 			$duration = sprintf "%1.0f:%02.0f:%05.2f", $delta / SECSPERHOUR,
 			    fmod ($delta, SECSPERHOUR) / SECSPERMIN,
 			    fmod ($delta, SECSPERMIN);
