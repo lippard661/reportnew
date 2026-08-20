@@ -289,7 +289,13 @@
 #       modify session-match code to build log-line capture groups as
 #       literal string ignoring any potential regexp chars in log content.
 # Modified 30 June 2026 by Jim Lippard to correct $delta calculation on
-#    Linux for process accounting records. 
+#    Linux for process accounting records.
+# Modified 20 August 2026 by Jim Lippard to merge send_text into send_notify.
+# Modified 20 August 2026 by Claude at the direction of Jim Lippard to
+#    complete text notification formatting: subject with match count and
+#    time range, timestamp and local hostname stripping, deduplication,
+#    per-message line/length caps.
+#    Also allow "notify + text" as a valid two-action combination.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -374,7 +380,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.36a of 30 June 2026';
+my $VERSION = 'reportnew 1.37 of 20 August 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -421,6 +427,37 @@ my @NONPRIVSEP_PROMISES = ('rpath', 'wpath', 'cpath', 'flock', 'exec', 'proc');
 my @PRIVSEP_INITIAL_CHILD_PROMISES = ('id', 'prot_exec');
 my @PRIVSEP_CHILD_PROMISES = ('recvfd');
 my @PRIVSEP_PARENT_PROMISES = ('chown', 'sendfd');
+
+my $NOTIFY_STD = 0;
+my $NOTIFY_TEXT = 1;
+
+# Timestamp patterns used by strip_leading_timestamp and
+# extract_leading_timestamp. Add new formats here to extend recognition.
+# Each entry is [regex, description]. The regex must be anchored at the
+# start of the line and match through the end of the timestamp (including
+# trailing whitespace to be consumed). Order matters: more specific
+# patterns should come first.
+my @TIMESTAMP_PATTERNS = (
+    # ISO 8601 / RFC 3339: 2026-08-20T13:32:34, 2026-08-20T13:32:34.123456,
+    # 2026-08-20 13:32:34, with optional Z or timezone offset (+00:00, -0700).
+    [qr/^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:?\d{2})?)\s+/,
+     'ISO 8601 / RFC 3339'],
+    # BSD syslog with year and day-of-week: "Thu Aug 20 07:34:16 2026" or
+    # "Thu Aug 20 07:34:16" (used by e.g., BSD process accounting).
+    [qr/^([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\s+\d{4})?)\s+/,
+     'BSD syslog with day-of-week'],
+    # BSD syslog without year or day-of-week: "Aug 20 13:32:34".
+    [qr/^([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+/,
+     'BSD syslog without year'],
+    # Apache/nginx common log format: "[20/Aug/2026:13:32:34 -0700]".
+    [qr/^\[(\d{1,2}\/[A-Z][a-z]{2}\/\d{4}:\d{2}:\d{2}:\d{2}(?:\s+[+\-]\d{4})?)\]\s+/,
+     'Apache/nginx common log'],
+);
+
+# Text notification limits. These are constants for now but could be
+# made configurable in the future.
+my $TEXT_MAX_LINES = 5;
+my $TEXT_MAX_LINE_LENGTH = 180;
 
 ### Variables.
 
@@ -681,7 +718,7 @@ if (!-e $size_file) {
 	close (SIZEFILE);
     }
     else {
-	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot create size file. $!");
+	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot create size file. $!");
     }
     # If using privilege separation, give _reportnew:_reportnew ownership.
     chown ($reporter_uid, $reporter_gid, $size_file) if ($privsep_flag);
@@ -1390,7 +1427,10 @@ sub parse_config {
 			}
 			# Check for semicolon (multiple actions).
 			# Syntax: "action: notify email@example.com; execute script.sh"
-			# Only execute permitted as second action, and only after notify/alert/text.
+			#         "action: notify email@example.com; text sms@example.com"
+			#         "action: text sms@example.com; execute script.sh"
+			# Second action must be text or execute. First action must not
+			# be execute. Only two actions permitted per rule.
 			my @action_specs;
 			if ($value =~ /^([^;]+);(.*)$/) { # multiple
 			    @action_specs = ($1, $2);
@@ -1414,9 +1454,9 @@ sub parse_config {
 				($action, $action_value) = split (/\s+/, $action_spec, 2);
 			    }
 
-			    # Validate second action must be execute.
-			    if ($idx == 1 && $action ne 'execute') {
-				send_error ($config_file, "Second action after semicolon must be \"execute\" on line $line_num. $_");
+			    # Validate second action must be text or execute.
+			    if ($idx == 1 && $action ne 'execute' && $action ne 'text') {
+				send_error ($config_file, "Second action after semicolon must be \"text\" or \"execute\" on line $line_num. $_");
 				exit;
 			    }
 
@@ -1424,6 +1464,15 @@ sub parse_config {
 			    if ($idx == 0 && @action_specs == 2 && $action eq 'execute') {
 				send_error ($config_file, "Cannot have \"execute\" as first action when using semicolon syntax on line $line_num. $_");
 				exit;
+			    }
+
+			    # Prevent duplicate action types (e.g., "text A; text B" or "notify A; notify B").
+			    if ($idx == 1 && @parsed_actions) {
+				my ($first_action) = split (/,/, $parsed_actions[0], 2);
+				if ($first_action eq $action) {
+				    send_error ($config_file, "Cannot use the same action type twice in one action directive on line $line_num. $_");
+				    exit;
+				}
 			    }
 
 			    # Parse and validate each action type
@@ -3126,7 +3175,7 @@ sub check_logfile {
 			my ($action, $action_value) = split (/,/, $action_string, 2);
 			
 			if ($action eq 'notify') {
-			    send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
+			    send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, $NOTIFY_STD, @notify_lines);
 			}
 			elsif ($action eq 'alert') {
 			    print "***$SHORT_HOSTNAME $ref_logfile\n";
@@ -3137,7 +3186,7 @@ sub check_logfile {
 			}
 			elsif ($action eq 'text') {
 			    # Might want to do separate text per line?
-			    send_text ($SHORT_HOSTNAME, $ref_logfile, $action_value, @notify_lines);
+			    send_notify ($SHORT_HOSTNAME, $ref_logfile, $action_value, $NOTIFY_TEXT, @notify_lines);
 			}
 			elsif ($action eq 'execute') {
 			    execute_script ($action_value, $HOSTNAME, $ref_logfile, @notify_lines);
@@ -3929,7 +3978,7 @@ sub read_size_file {
     else {
 	if (open (my $sizefile_fh, '<', $size_file)) {
 	    if (!flock ($sizefile_fh, LOCK_SH)) {
-		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
+		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot lock size file for reading. $!");
 	    }
 	    while (<$sizefile_fh>) {
 		chomp;
@@ -3938,13 +3987,13 @@ sub read_size_file {
 
 		# Accept 6 (current), 5 (no pid), 4 (no sha, no pid).
 		if ($nf < 4 || $nf > 6 || $fields[0] eq '') {
-		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Malformed line in size file. $_");
+		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, $NOTIFY_STD,  "Malformed line in size file. $_");
 		    next;
 		}
 		
 		($logfile, $size, $mtime, $checktime, $sha256_digest, $processing_pid) = @fields;
 		if (!grep ($_ eq $logfile, @logfiles)) {
-		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, "Logfile $logfile in size file is not in config file.");
+		    send_notify ($SHORT_HOSTNAME, $config_file, $master_notify, $NOTIFY_STD, "Logfile $logfile in size file is not in config file.");
 		}
 		if (!defined ($current_logfile) || $current_logfile ne $logfile) {
 		    $log_size{$logfile} = $size;
@@ -3964,7 +4013,7 @@ sub read_size_file {
 		}
 	    }
 	    if (!flock ($sizefile_fh, LOCK_UN)) {
-		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
+		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot unlock size file after reading. $!");
 	    }
 	    close ($sizefile_fh);
 	}
@@ -3976,7 +4025,7 @@ sub read_size_file {
 	if (!defined ($current_logfile)) {
 	    foreach $logfile (@logfiles) {
 		if (!defined ($log_size{$logfile})) {
-		    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Logfile $logfile in config file is not in size file.");
+		    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Logfile $logfile in config file is not in size file.");
 		    $log_size{$logfile} = 0;
 		    $log_mtime{$logfile} = 0;
 		    $log_checktime{$logfile} = 0;
@@ -4175,60 +4224,88 @@ sub execute_script {
     exec ($script_path) || die "Cannot exec $script_path. $!\n";
 }
 
-# Send a mail notification.
-sub send_notify {
-    my ($hostname, $logfile, $notify_list, @lines) = @_;
-    my ($line);
+# Subroutine to strip a recognized leading timestamp from a log line.
+# Returns the line with the timestamp removed, or the original line if
+# no known timestamp format is found at the start.
+sub strip_leading_timestamp {
+    my ($line) = @_;
 
-    if (!defined ($notify_list)) {
-	if (!defined ($master_notify)) {
-	    # This seems to happen periodically, indicating a bug
-	    # in the config parsing.
-	    $notify_list = $SECURITY_ADMIN;
-	}
-	else {
-	    $notify_list = $master_notify;
+    foreach my $pattern_entry (@TIMESTAMP_PATTERNS) {
+	my $pattern = $pattern_entry->[0];
+	if ($line =~ s/$pattern//) {
+	    return $line;
 	}
     }
 
-    # Defensive checks against undef parameters
-    $hostname = $SHORT_HOSTNAME if (!defined ($hostname));
-    $logfile = '(unknown)' if (!defined ($logfile));
-    $email_sender = $EMAIL_SENDER if (!defined ($email_sender));
-
-    if ($debug_mode) {
-	print "$hostname: $logfile ($notify_list)\n";
-	foreach $line (@lines) {
-	    print "$line\n";
-	}
-    }
-
-    else {
-	if (open (MAIL, '|-', $SENDMAIL, '-t')) {
-	    print MAIL "From: Reporter <$email_sender>\n";
-	    print MAIL "To: $notify_list\n";
-	    print MAIL "Subject: $hostname $logfile\n\n";
-	    s/\r//g for @lines; # remove carriage returns
-	    foreach $line (@lines) {
-		if (length($line) > 990) {
-		    print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
-		}
-		else {
-		    print MAIL "$line\n";
-		}
-	    }
-	    close (MAIL);
-	}
-	else {
-	    die "Unable to open $SENDMAIL. $!\n";
-	}
-    }
+    return $line;
 }
 
-# Send a text message. This code could easily be merged with
-# send_notify, it is identical except for the mail format.
-sub send_text {
-    my ($hostname, $logfile, $notify_list, @lines) = @_;
+# Subroutine to extract the leading timestamp string from a log line.
+# Returns the matched timestamp string, or undef if none recognized.
+# Used for building time ranges for text notifications.
+sub extract_leading_timestamp {
+    my ($line) = @_;
+
+    foreach my $pattern_entry (@TIMESTAMP_PATTERNS) {
+	my $pattern = $pattern_entry->[0];
+	if ($line =~ /$pattern/) {
+	    return $1;
+	}
+    }
+
+    return undef;
+}
+
+# Subroutine to extract HH:MM from a timestamp string. Handles all the
+# formats recognized by @TIMESTAMP_PATTERNS. The regex requires HH:MM:SS
+# with a valid hour range (00-23) so it won't mistakenly grab a
+# "year:hour" pair from formats like Apache/nginx common log.
+sub extract_hhmm {
+    my ($timestamp) = @_;
+    return undef unless (defined ($timestamp));
+    if ($timestamp =~ /(?:^|[^\d])([01]\d|2[0-3]):([0-5]\d):[0-5]\d/) {
+        return "$1:$2";
+    }
+    return undef;
+}
+
+# Subroutine to strip a hostname (short or fully-qualified) from the
+# start of a line when it matches the passed-in hostname. This is used
+# to reduce noise in text notifications since the hostname is already
+# in the subject line. The hostname is only stripped when it appears
+# at the very start of the line (after timestamp removal) so we don't
+# accidentally strip references to this host that appear later in the
+# line as legitimate log content.
+sub strip_leading_hostname {
+    my ($line, $short_hostname, $long_hostname) = @_;
+
+    # Try long (fully-qualified) hostname first, then short. Requires
+    # trailing whitespace so we don't consume part of another word.
+    if (defined ($long_hostname) && $long_hostname ne '' &&
+	$long_hostname ne $short_hostname) {
+	my $quoted = quotemeta ($long_hostname);
+	if ($line =~ s/^$quoted\s+//) {
+	    return $line;
+	}
+    }
+    if (defined ($short_hostname) && $short_hostname ne '') {
+	my $quoted = quotemeta ($short_hostname);
+	if ($line =~ s/^$quoted\s+//) {
+	    return $line;
+	}
+    }
+
+    return $line;
+}
+
+# Send a mail notification. $format selects standard email
+# ($NOTIFY_STD) or a compact text-message format ($NOTIFY_TEXT).
+# Text messages get a summary subject line with hostname, log basename,
+# match count, and time range; the body has timestamps and the local
+# hostname stripped, duplicates removed, and both line count and line
+# length capped for SMS-friendliness.
+sub send_notify {
+    my ($hostname, $logfile, $notify_list, $format, @lines) = @_;
     my ($line);
 
     if (!defined ($notify_list)) {
@@ -4252,26 +4329,82 @@ sub send_text {
 	foreach $line (@lines) {
 	    print "$line\n";
 	}
+	return;
     }
 
-    else {
-	if (open (MAIL, '|-', $SENDMAIL, '-t')) {
-	    print MAIL "From: Reporter <$email_sender>\n";	    
-	    print MAIL "To: $notify_list\n\n";
-	    s/\r//g for @lines; # remove carriage returns
-	    foreach $line (@lines) {
-		if (length($line) > 990) {
-		    print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
-		}
-		else {
-		    print MAIL "$line\n";
-		}
+    s/\r//g for @lines; # remove carriage returns
+
+    my $subject;
+    my @out_lines;
+
+    if ($format == $NOTIFY_TEXT) {
+	# Build subject: hostname, log basename, match count, time range.
+	my $short_logname = basename ($logfile);
+	my $line_count = scalar (@lines);
+	my ($first_time, $last_time);
+	foreach my $l (@lines) {
+	    my $ts = extract_leading_timestamp ($l);
+	    next unless (defined ($ts));
+	    my $hhmm = extract_hhmm ($ts);
+	    next unless (defined ($hhmm));
+	    $first_time = $hhmm if (!defined ($first_time));
+	    $last_time = $hhmm;
+	}
+	my $time_range = '';
+	if (defined ($first_time)) {
+	    if (defined ($last_time) && $last_time ne $first_time) {
+		$time_range = " $first_time-$last_time";
 	    }
-	    close (MAIL);
+	    else {
+		$time_range = " $first_time";
+	    }
 	}
-	else {
-	    die "Unable to open $SENDMAIL. $!\n";
+	$subject = "Subject: $hostname $short_logname ($line_count)$time_range\n\n";
+
+	# Strip timestamps and matching hostnames, then deduplicate exact matches.
+	# Deduplication happens AFTER stripping so that lines that differ only
+	# in their timestamp collapse to one.
+	my %seen;
+	foreach my $l (@lines) {
+	    my $stripped = strip_leading_timestamp ($l);
+	    $stripped = strip_leading_hostname ($stripped, $hostname, $HOSTNAME);
+	    next if ($seen{$stripped}++);
+	    push (@out_lines, $stripped);
 	}
+
+	# Cap number of lines and truncate each line.
+	if (@out_lines > $TEXT_MAX_LINES) {
+	    @out_lines = @out_lines[0 .. ($TEXT_MAX_LINES - 1)];
+	}
+	foreach my $l (@out_lines) {
+	    if (length ($l) > $TEXT_MAX_LINE_LENGTH) {
+		$l = substr ($l, 0, $TEXT_MAX_LINE_LENGTH);
+	    }
+	}
+    }
+    else {
+	$subject = "Subject: $hostname $logfile\n\n";
+	@out_lines = @lines;
+    }
+
+    if (open (MAIL, '|-', $SENDMAIL, '-t')) {
+	print MAIL "From: Reporter <$email_sender>\n";
+	print MAIL "To: $notify_list\n";
+	print MAIL $subject;
+	foreach $line (@out_lines) {
+	    if ($format != $NOTIFY_TEXT && length ($line) > 990) {
+		# Long-line splitting only for standard email; text lines
+		# were already truncated to $TEXT_MAX_LINE_LENGTH.
+		print MAIL "$_\n" for ($line =~ m/.{1,990}/gs);
+	    }
+	    else {
+		print MAIL "$line\n";
+	    }
+	}
+	close (MAIL);
+    }
+    else {
+	die "Unable to open $SENDMAIL. $!\n";
     }
 }
 
@@ -4280,10 +4413,10 @@ sub send_error {
     my ($filename, $error) = @_;
 
     if (defined ($master_notify)) {
-	send_notify ($SHORT_HOSTNAME, $filename, $master_notify, $error);
+	send_notify ($SHORT_HOSTNAME, $filename, $master_notify, $NOTIFY_STD, $error);
     }
     else {
-	send_notify ($SHORT_HOSTNAME, $filename, $SECURITY_ADMIN, $error);
+	send_notify ($SHORT_HOSTNAME, $filename, $SECURITY_ADMIN, $NOTIFY_STD, $error);
     }
 }
 
@@ -4307,20 +4440,20 @@ sub write_size_file {
     # do that.
     if (defined ($current_logfile) && $start_or_end == $LOG_APPEND) {
 	if (!open (SIZEFILE, '>>', $size_file)) {
-	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for appending. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot open size file for appending. $!");
 	    exit;
 	}
 	$lock_timeout_limit = time() + $SIZE_FILE_LOCK_TIMEOUT_LIMIT;
 	until (flock (SIZEFILE, LOCK_EX | LOCK_NB)) {
 	    if (time() > $lock_timeout_limit) {
-		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for writing. $!");
+		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot lock size file for writing. $!");
 		exit;
 	    }
 	    sleep 1;
 	}
 	print SIZEFILE "$current_logfile,$log_size{$current_logfile},$log_mtime{$current_logfile},$log_checktime{$current_logfile},null,0\n";
 	if (!flock (SIZEFILE, LOCK_UN)) {
-	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after appending. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot unlock size file after appending. $!");
 	    exit;
 	}
 	close (SIZEFILE);
@@ -4336,16 +4469,16 @@ sub write_size_file {
 		@size_file_lines = <SIZEFILE>;
 	    }
 	    else {
-		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for reading. $!");
+		send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot lock size file for reading. $!");
 		exit;
 	    }
 	}
 	else {
-	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for reading. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot open size file for reading. $!");
 	    exit;
 	}
 	if (!flock (SIZEFILE, LOCK_UN)) {
-	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after reading. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot unlock size file after reading. $!");
 	    exit;
 	}
 	close (SIZEFILE);
@@ -4358,14 +4491,14 @@ sub write_size_file {
     # was just read from the size file except for our current logfile.
     # Modified to remove race condition (was truncating before lock).
     if (!sysopen (SIZEFILE, $size_file, O_RDWR | O_CREAT, 0600)) {
-	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot open size file for writing. $!");
+	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot open size file for writing. $!");
 	exit;
     }
 
     $lock_timeout_limit = time() + $SIZE_FILE_LOCK_TIMEOUT_LIMIT;
     until (flock (SIZEFILE, LOCK_EX | LOCK_NB)) {
 	if (time() > $lock_timeout_limit) {
-	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot lock size file for writing. $!");
+	    send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot lock size file for writing. $!");
 	    exit;
 	}
 	sleep 1;
@@ -4373,7 +4506,7 @@ sub write_size_file {
 
     # Now have lock, truncate.
     truncate (SIZEFILE, 0) || do {
-	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot truncate size file. $!");
+	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot truncate size file. $!");
 	exit;
     };
 
@@ -4430,7 +4563,7 @@ sub write_size_file {
 
     # Unlock and close size file.
     if (!flock (SIZEFILE, LOCK_UN)) {
-	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, "Cannot unlock size file after writing. $!");
+	send_notify ($SHORT_HOSTNAME, $size_file, $master_notify, $NOTIFY_STD, "Cannot unlock size file after writing. $!");
 	exit;
     }
     close (SIZEFILE);

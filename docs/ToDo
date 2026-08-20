@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.36a) Fixed $delta calc in Linux process accounting (reportnew and lastcomm.pl).
+Minor enhancements to mailcert.pl and wifi.pl.
+
 (Fixed 1.36) Fixed Claude Opus 4.8 identified bugs:
    1) fix typo in priv call ("get-mclogfiles" instead of "get-mclog-files").
    2) fix linux_device major range test (bug not present in equivalent
@@ -129,6 +132,9 @@ for them, anchor each end against likely separators (beginning of line,
 the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
+
+* (Done 1.37) Make text action distinct from notify, allow it as
+a second action.
 
 * (Done 1.35a) Rename processes when privilege separation is used.
 
