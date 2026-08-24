@@ -39,9 +39,9 @@ Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 - **Time constraints**: rules can be restricted to specific time windows
   using `define_time:` and `times:` directives, with negation support
 - **Actions**: notify (email), text (minimal email for SMS, removing
-  time stamps and redundant host names, and capping number of matching
-  lines and line length), alert (stdout), or execute (pass matching
-  lines to a signed script)
+  time stamps and redundant host names, shorterning same-domain hostnames by
+  removing domain, and capping number of matching lines and line length),
+  alert (stdout), or execute (pass matching lines to a signed script)
 - **Combined actions**: any action can be followed by an execute action
   for simultaneous alerting and data collection, or a text action
 - **Session correlation**: `session-with`/`session-without` matching

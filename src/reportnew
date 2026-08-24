@@ -296,6 +296,14 @@
 #    time range, timestamp and local hostname stripping, deduplication,
 #    per-message line/length caps.
 #    Also allow "notify + text" as a valid two-action combination.
+# Modified 21 August 2026 by Jim Lippard to extend text default line length
+#    to 200 chars.
+# Modified 23 August 2026 by Jim Lippard to report number of deduplicated
+#    lines at the point of removal and shorten other host names for text
+#    action. (Improved both with Claude Opus 4.7 on 24 August 2026, to
+#    reduce code duplication for former using anonymous subroutine, and
+#    to shorten code and cover more occurrences of host names, not just
+#    at the beginning of a log line, for the latter.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -362,6 +370,15 @@ use constant {
     RESP_FD_FOLLOWS => 'fd_follows' # file descriptor will be sent next
 };
 
+# Split hostname into short name and domain. Everything after the first
+# dot is treated as the domain. For hosts like "foo.int.example.com" this
+# gives $DOMAINNAME = "int.example.com", which means only hosts on
+# int.example.com will be shortened in log-body hostname stripping for text
+# actions and emails will originate from nobody@int.example.com by default
+# if no sender is configured (but you should anyway!). This works fine when
+# a log collector receives logs only from hosts on the same subdomain;
+# for the general multi-domain case, a config directive would be needed to
+# support multi-domain host shortening for text actions.
 my $HOSTNAME = hostname();
 my ($SHORT_HOSTNAME, $DOMAINNAME) = split (/\./, $HOSTNAME, 2);
 
@@ -380,7 +397,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.37 of 20 August 2026';
+my $VERSION = 'reportnew 1.38 of 24 August 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -457,7 +474,7 @@ my @TIMESTAMP_PATTERNS = (
 # Text notification limits. These are constants for now but could be
 # made configurable in the future.
 my $TEXT_MAX_LINES = 5;
-my $TEXT_MAX_LINE_LENGTH = 180;
+my $TEXT_MAX_LINE_LENGTH = 200;
 
 ### Variables.
 
@@ -4298,6 +4315,22 @@ sub strip_leading_hostname {
     return $line;
 }
 
+# Subroutine to shorten the name of a host at the beginning of a log line
+# if it is a fully qualified domain name on the same domain as the current
+# host.
+sub shorten_other_local_hostname {
+    my ($line, $domain) = @_;
+
+    return $line unless (defined ($domain) && $domain ne '');
+    
+    my $quoted = quotemeta ($domain);
+
+    # Match hostname followed by whitespace, colon, or end of line.
+    # Require a preceding whitespace/start-of-line to avoid modifying URLs and emails.
+    $line =~ s/(?:^|(?<=\s))([\w-]+)\.$quoted(?=\s|:|$)/$1/g;
+    return $line;
+}
+
 # Send a mail notification. $format selects standard email
 # ($NOTIFY_STD) or a compact text-message format ($NOTIFY_TEXT).
 # Text messages get a summary subject line with hostname, log basename,
@@ -4365,13 +4398,30 @@ sub send_notify {
 	# Deduplication happens AFTER stripping so that lines that differ only
 	# in their timestamp collapse to one.
 	my %seen;
+	my $lines_deduped = 0;
+
+	my $flush_dedup_marker = sub {
+	    return unless ($lines_deduped);
+	    my $line_plural = ($lines_deduped > 1) ? 's' : '';
+	    push (@out_lines, "[$lines_deduped line$line_plural repeated]");
+	    $lines_deduped = 0;
+	};
+	
 	foreach my $l (@lines) {
 	    my $stripped = strip_leading_timestamp ($l);
 	    $stripped = strip_leading_hostname ($stripped, $hostname, $HOSTNAME);
-	    next if ($seen{$stripped}++);
+	    $stripped = shorten_other_local_hostname ($stripped, $DOMAINNAME);
+	    
+	    if ($seen{$stripped}++) {
+		$lines_deduped++;
+		next;
+	    }
+	    $flush_dedup_marker->();
 	    push (@out_lines, $stripped);
 	}
 
+	$flush_dedup_marker->();
+	
 	# Cap number of lines and truncate each line.
 	if (@out_lines > $TEXT_MAX_LINES) {
 	    @out_lines = @out_lines[0 .. ($TEXT_MAX_LINES - 1)];

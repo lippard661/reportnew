@@ -133,6 +133,9 @@ the right hand side). (DONE, also uses right bracket for right hand side)
 
 FEATURES:
 
+* (Done 1.38) Make text action report deduplication efforts and shorten
+hostnames on the current domain.
+
 * (Done 1.37) Make text action distinct from notify, allow it as
 a second action.
 
