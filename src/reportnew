@@ -334,6 +334,22 @@
 #       rotated log or cyclog/multilog file changed since the last check;
 #       an integer mtime made a file changed in the same second as the
 #       check look unchanged.
+# Modified 15 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard (1.40) to call Signify::verify with the named-argument form
+#    of Signify.pm 1.3, and to treat an older Signify.pm as unavailable
+#    (with a message saying so) rather than passing it a hash where it
+#    expects a key path. execute_script now ignores SIGPIPE while writing
+#    to the script (a script that exits without reading its input killed
+#    reportnew silently) and reports a failed write; its child leaves with
+#    POSIX::_exit (127) and a message instead of die if it cannot drop
+#    privileges or exec the script. The scripts directory is unveiled rx
+#    instead of rwx, and two comments that said execute scripts inherit
+#    reportnew's pledge and unveil are corrected: an exec without
+#    execpromises clears both (kern_exec.c), so each script must pledge
+#    and unveil itself. -c now checks execute-script and signed-macro
+#    signatures in single-host configs (my_host returned false when no
+#    host block was in effect, so -c skipped them). The usage message
+#    lists -p.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -427,7 +443,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.39 of 14 October 2026';
+my $VERSION = 'reportnew 1.40 of 15 October 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -580,7 +596,7 @@ my ($user, $reporter_uid, $reporter_gid, $use_privsep,
 
 ### Main program.
 
-getopts ('cdpV', \%opts) || die "Usage: reportnew [-c (check)|-d (debug)|-V (version)] [config-file]\n";
+getopts ('cdpV', \%opts) || die "Usage: reportnew [-c (check)|-d (debug)|-p (privsep)|-V (version)] [config-file]\n";
 
 $config_check = $opts{'c'};
 $debug_mode = $opts{'d'} || $config_check; # config_check implies debug_mode;
@@ -598,7 +614,7 @@ elsif ($#ARGV < 0) {
     $config_file = "$DEFAULT_CONFIG_DIR/$DEFAULT_CONFIG_NAME";
 }
 else {
-    die "Usage: reportnew [-c (check)|-d (debug)|-V (version)] [config-file]\n";
+    die "Usage: reportnew [-c (check)|-d (debug)|-p (privsep)|-V (version)] [config-file]\n";
 }
 
 $MACRO_DIR = dirname ($config_file);
@@ -614,9 +630,21 @@ BEGIN {
     delete @ENV{qw(IFS CDPATH ENV BASH_ENV PERL5LIB LD_PRELOAD LD_LIBRARY_PATH)};
 }
 
-# See if Signify is available.
+# See if Signify is available. 1.3 or later is needed for the
+# named-argument form of Signify::verify; an older module would take the
+# hash reference as the public key path and fail every verification with
+# a misleading message, so it counts as unavailable.
 my $have_signify = 0;
-$have_signify = 1 if (require_module ('Signify'));
+my $signify_problem = 'Signify.pm not found on system';
+if (require_module ('Signify')) {
+    if (eval { Signify->VERSION ('1.3'); 1 }) {
+	$have_signify = 1;
+    }
+    else {
+	$signify_problem = 'Signify.pm ' . ($Signify::VERSION // '(unknown version)') .
+	    ' is too old, 1.3 or later is required';
+    }
+}
 
 # If on OpenBSD, use pledge and unveil. Do as much as possible before
 # parsing the config, then finish unveiling after the config is parsed.
@@ -739,12 +767,14 @@ if ($^O eq 'openbsd') {
 	}
     }
 
-    # Unveil execute scripts directory if any execute actions are defined.
-    # Use "rwx" to allow scripts to read, write and execute within the
-    # directory, no "c" (create) - admin must create any necessary data
-    # subdirectories.
+    # Unveil execute scripts directory if any execute actions are defined:
+    # r to check and verify the scripts and their signatures, x to exec
+    # them. This restricts reportnew only. An exec without execpromises
+    # clears pledge and unveil (kern_exec.c), so the scripts get none of
+    # this; each script must pledge and unveil itself (as wifi.pl,
+    # mailcert.pl and distinctping.pl do).
     if (keys %execute_scripts) {
-	unveil ($SCRIPT_DIR, "rwx");
+	unveil ($SCRIPT_DIR, "rx");
     }
 
     # Need to unveil containing dir of size file, which can but
@@ -1272,7 +1302,7 @@ sub parse_config {
 			    exit;	
 			}
 			if (!$have_signify) {
-			    send_error ($config_file, "Signify.pm not found on system, but signify  public key is defined, \"$signify_pubkey\" on line $line_num. $_\n");
+			    send_error ($config_file, "$signify_problem, but signify  public key is defined, \"$signify_pubkey\" on line $line_num. $_\n");
 			    exit;	
 			}
 			$signify_pubkey = $SIGNIFY_DIR . '/' . $signify_pubkey;
@@ -1622,7 +1652,7 @@ sub parse_config {
 					    exit;
 					}
 					if (!$have_signify) {
-					    send_error ($config_file, "Signify.pm not found on system, cannot verify signature on execute script \"$script_path\" on line $line_num. $_");
+					    send_error ($config_file, "$signify_problem, cannot verify signature on execute script \"$script_path\" on line $line_num. $_");
 					    exit;	
 					}
 					if (!verify_signify_sig ($script_path)) {
@@ -1695,7 +1725,7 @@ sub parse_config {
 			    # Don't verify presence of Signify.pm or signature during config check if not current host.
 			    if (!$config_check || my_host ($line_num, $current_host)) {
 				if (!$have_signify) {
-				    send_error ($config_file, "Signify.pm not found on system, cannot verify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
+				    send_error ($config_file, "$signify_problem, cannot verify signature on signed macro include file \"$macro_file\" on line $line_num. $_\n");
 				    exit;	
 				}
 				if (!verify_signify_sig ($macro_file)) {
@@ -1954,7 +1984,7 @@ sub parse_macro {
 		exit;			
 	    }
 	    if (!$have_signify) {
-		send_error ($config_file, "Signify.pm not found on system, can't verify signature on signed macro value file \"$macro_file\" on line $line_num. $_\n");
+		send_error ($config_file, "$signify_problem, can't verify signature on signed macro value file \"$macro_file\" on line $line_num. $_\n");
 		exit;	
 	    }
 	    if (!verify_signify_sig ($macro_file)) {
@@ -2044,7 +2074,7 @@ sub verify_signify_sig {
 
     # Already checked readability of file itself but Signify.pm will
     # check it again.
-    if (Signify::verify ($file, $signify_pubkey)) {
+    if (Signify::verify ($file, { public_key_path => $signify_pubkey })) {
 	return 1;
     }
 
@@ -2056,7 +2086,7 @@ sub verify_signify_sig {
 	return 0;
     }
     elsif ($errors[0] =~ /^no readable signature file/) {
-	send_error ($config_file, "Cannot open signed macro file \"$file\".\n");
+	send_error ($config_file, "No readable signature file \"$file.sig\" for \"$file\".\n");
 	return 0;
     }
     elsif ($errors[0] =~ /^no readable public key/) {
@@ -2079,6 +2109,13 @@ sub verify_signify_sig {
 sub my_host {
     my ($line_num, $host_list) = @_;
     my (@hosts, $host);
+
+    # No host block in effect (a single-host config, or outside
+    # begin-host/end-host): the line applies to every host, this one
+    # included. Until 1.40 this returned 0, so -c skipped the signature
+    # checks on execute scripts and signed macro files in single-host
+    # configs that the real run then enforced.
+    return 1 if (!defined ($host_list) || $host_list eq '');
 
     # 'all'
     return 1 if ($host_list eq 'all');
@@ -4325,27 +4362,49 @@ sub execute_script {
     # Parent process
     if ($pid) {
 	close ($read_fh);
-	
-	# Write matching lines to the pipe
+
+	# Write matching lines to the pipe. A script that exits without
+	# reading all of its input (it failed at startup, or stops early)
+	# would otherwise raise SIGPIPE here once the pipe buffer is full,
+	# killing reportnew with no message. Ignored in the parent only,
+	# after the fork, so the script keeps the default disposition.
+	local $SIG{PIPE} = 'IGNORE';
+	my $write_error;
 	foreach my $line (@lines) {
-	    print $write_fh "$line\n";
+	    if (!print $write_fh "$line\n") {
+		$write_error = "$!";
+		last;
+	    }
 	}
-	close ($write_fh);
-	
-	# Wait for child to complete
+	if (!close ($write_fh) && !defined ($write_error)) {
+	    $write_error = "$!";
+	}
+
+	# Wait for child to complete. Save the status at once: send_error
+	# runs sendmail, whose close resets $?.
 	waitpid ($pid, 0);
-	if ($? & 127) {
-	    send_error ($script_path, "Execute script $script_path killed by signal " . ($? & 127));
-	    return 128 + ($? & 127);
+	my $status = $?;
+	if (defined ($write_error)) {
+	    send_error ($script_path, "Execute script $script_path did not read all of its input ($write_error)");
 	}
-	my $exit_status = $? >> 8;
-	if ($exit_status != 0) {
+	if ($status & 127) {
+	    send_error ($script_path, "Execute script $script_path killed by signal " . ($status & 127));
+	    return 128 + ($status & 127);
+	}
+	my $exit_status = $status >> 8;
+	if ($exit_status == 127) {
+	    send_error ($script_path, "Execute script $script_path exited with status 127 (also used by reportnew when it cannot drop privileges for or exec the script; see stderr)");
+	}
+	elsif ($exit_status != 0) {
 	    send_error ($script_path, "Execute script $script_path exited with status $exit_status");
 	}
 	return $exit_status;
     }
 
-    # Child process - will exec the script
+    # Child process - will exec the script. It is a copy of reportnew, so
+    # it never dies or returns: a failure writes its reason with syswrite
+    # and leaves with POSIX::_exit (127), which runs no END blocks or
+    # destructors and cannot unwind into a caller's eval.
     close ($write_fh);
 
     # Rename process.
@@ -4378,17 +4437,22 @@ sub execute_script {
 		# Verify privilege drop worked
 		if ($> != $nobody_uid || $< != $nobody_uid ||
 		    $) != $nobody_gid || $( != $nobody_gid) {
-		    die "Failed to drop privileges for execute script\n";
+		    syswrite (STDERR, "Failed to drop privileges for execute script $script_path\n");
+		    POSIX::_exit (127);
 		}
 	    }
 	}
 	else {
-	    die "Cannot find nobody:nogroup (or nobody:nobody) for privilege drop for script execution.\n";
+	    syswrite (STDERR, "Cannot find nobody:nogroup (or nobody:nobody) for privilege drop for script execution.\n");
+	    POSIX::_exit (127);
 	}
     }
 
     # Redirect stdin from the pipe
-    open (STDIN, '<&', $read_fh) || die "Cannot redirect stdin. $!\n";
+    if (!open (STDIN, '<&', $read_fh)) {
+	syswrite (STDERR, "Cannot redirect stdin for execute script $script_path. $!\n");
+	POSIX::_exit (127);
+    }
     close ($read_fh);
     
     # Set up environment variables
@@ -4398,15 +4462,18 @@ sub execute_script {
     # Clean environment for security
     delete @ENV{qw(IFS CDPATH BASH_ENV PERL5LIB LD_PRELOAD LD_LIBRARY_PATH)};
 
-    # Exec the script
-    # The child inherits the unveil restrictions from the parent process.
-    # On OpenBSD, the script won't be able to access files outside the
-    # unveiled paths (scripts directory and /tmp).
-    # The child also inherits pledges - it can exec this one script, but
-    # the script itself won't be able to exec other programs or fork because
-    # shell scripts executed via exec don't inherit pledges, they run under
-    # the kernel's default restrictions for the executable format.
-    exec ($script_path) || die "Cannot exec $script_path. $!\n";
+    # Exec the script. On OpenBSD the exec clears this process's pledge
+    # and unveil, because none of reportnew's pledges set execpromises
+    # (kern_exec.c: unveil_destroy() on exec without PS_EXECPLEDGE). The
+    # script therefore runs with no restrictions from reportnew, only the
+    # uid it runs as (_reportnew under privsep, nobody otherwise) and
+    # whatever pledge and unveil it calls itself.
+    {
+	no warnings 'exec';
+	exec ($script_path);
+    }
+    syswrite (STDERR, "Cannot exec $script_path. $!\n");
+    POSIX::_exit (127);
 }
 
 # Subroutine to strip a recognized leading timestamp from a log line.

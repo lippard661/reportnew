@@ -17,10 +17,14 @@ platforms using a `_reportnew` user and group.
 Available at https://www.discord.org/lippard/software/ and
 https://github.com/lippard661/reportnew
 
-The OpenBSD package is signed with signify. To verify:
+The OpenBSD package is signed with signify (the signature is embedded in
+the gzip header). To verify:
 ```
-signify -C -p discord.org-2026-pkg.pub -x reportnew-<version>.tgz
+signify -Vz -p discord.org-2026-pkg.pub -x reportnew-<version>.tgz -m /dev/null
 ```
+(`signify-openbsd` on Linux.) It prints nothing and exits 0 if the
+signature is good. With the public key installed in `/etc/signify`,
+`pkg_add` on OpenBSD verifies the package itself.
 Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 
 ## Features
@@ -39,19 +43,22 @@ Public key: https://www.discord.org/lippard/software/discord.org-2026-pkg.pub
 - **Time constraints**: rules can be restricted to specific time windows
   using `define_time:` and `times:` directives, with negation support
 - **Actions**: notify (email), text (minimal email for SMS, removing
-  time stamps and redundant host names, shorterning same-domain hostnames by
+  time stamps and redundant host names, shortening same-domain hostnames by
   removing domain, and capping number of matching lines and line length),
   alert (stdout), or execute (pass matching lines to a signed script)
-- **Combined actions**: any action can be followed by an execute action
-  for simultaneous alerting and data collection, or a text action
+- **Combined actions**: notify, text or alert can be followed by an
+  execute action for simultaneous alerting and data collection, or
+  notify or alert by a text action (at most two actions per rule)
 - **Session correlation**: `session-with`/`session-without` matching
   groups log lines by session ID and reports entire sessions only when
   a specified error pattern appears anywhere in the session
 - **Multi-host configs**: a single config file can cover multiple hosts
   using `hosts:` directives to scope sections to specific hosts
 - **Multiple configs**: multiple reportnew configs can run independently
-  on the same host, each with its own state file; useful for different
-  monitoring frequencies (e.g., 30-minute and daily configs)
+  on the same host, each with its own state file (give each config its
+  own `size_file:`; without one, every config uses
+  `/etc/reportnew/reportnew.size`); useful for different monitoring
+  frequencies (e.g., 30-minute and daily configs)
 - **Privilege separation**: privileged process handles file access;
   unprivileged `_reportnew` process does pattern matching and alerting
 - **Signed execute scripts**: scripts invoked by execute actions must be
@@ -180,8 +187,8 @@ known_fingerprints = "<signedfile:fingerprints.txt>"
 
 Macro include files:
 ```
-macro-include-file: shared-macros.conf
-macro-include-signedfile: signed-macros.conf
+include-macro-file: shared-macros.conf
+include-macro-signedfile: signed-macros.conf
 ```
 
 **Log and rule definitions**:
@@ -239,14 +246,37 @@ action: notify admin@example.com; execute script.pl  # both
 particularly useful for automated data collection from alerts.
 `alert` outputs to stdout and is mainly useful for manual testing;
 -d (debug mode) is more practical for troubleshooting without config
-changs. `text` sends a minimal email suitable for SMS gateways and may
+changes. `text` sends a minimal email suitable for SMS gateways and may
 be enhanced in a future version.
 
 Execute scripts must be in a `scripts/` subdirectory under the config
 file directory and must be signed with the key specified in `signify_pubkey`.
+The signature is checked when the config is read (including by `-c`) and
+again just before each run of the script.
 Scripts are executed as `_reportnew:_reportnew` (with privsep) or
-`nobody:nogroup` (without). Scripts are not bound by pledge/unveil unless
-they apply it themselves.
+`nobody:nogroup` (without), with the matching log lines on standard input.
+
+Scripts are not bound by reportnew's pledge/unveil: on OpenBSD an exec
+clears both, so a script is restricted only by the user it runs as and
+by any pledge/unveil it applies itself. The sample scripts pledge and
+unveil themselves so that their only file access is to their `logs/`
+subdirectory (and, for `mailcert.pl`, read access to time zone files).
+
+Suggested ownership and modes, with privsep:
+```sh
+chown root:_reportnew /etc/reportnew/scripts
+chmod 750 /etc/reportnew/scripts          # _reportnew can read and run, not change
+mkdir /etc/reportnew/scripts/logs
+chown root:_reportnew /etc/reportnew/scripts/logs
+chmod 770 /etc/reportnew/scripts/logs     # where scripts keep their output
+```
+Without privsep, scripts run as `nobody`, which then needs read and
+execute access to the scripts and write access to `logs/`.
+
+If a script exits with a non-zero status, is killed by a signal, or
+exits without reading all of its input, reportnew reports it by email.
+Exit status 127 is also what reportnew uses when it cannot start the
+script (the reason goes to stderr).
 
 Two sample execute scripts are included:
 - `mailcert.pl` — collects TLS certificate fingerprints from mail logs
@@ -290,8 +320,9 @@ chmod 600 /etc/reportnew/reportnew.conf
 **Required**:
 - Perl 5
 - Standard modules: strict, warnings, Getopt::Std, Sys::Hostname,
-  File::Basename, POSIX, Digest::SHA, Storable, File::Temp,
-  IO::Uncompress::Gunzip
+  File::Basename, File::Copy, File::Find, POSIX, Digest::SHA, File::Temp,
+  IO::Uncompress::Gunzip, IO::Socket::UNIX, Time::HiRes
+- Time::ParseDate (CPAN)
 
 **For privilege separation** (recommended):
 - IO::FDPass
@@ -299,8 +330,8 @@ chmod 600 /etc/reportnew/reportnew.conf
 - JSON::MaybeXS (preferred) or JSON::PP (standard, slower)
 
 Install on OpenBSD: `pkg_add p5-IO-FDPass p5-Privileges-Drop p5-JSON-MaybeXS`
-Install on Debian/Linux: `apt install libio-fdpass-perl libprivileges-drop-perl libjson-maybexs-perl`
-Install via CPAN: `cpanm IO::FDPass Privileges::Drop JSON::MaybeXS`
+Install on Debian/Linux: `apt install libio-fdpass-perl libprivileges-drop-perl libjson-maybexs-perl libtime-parsedate-perl`
+Install via CPAN: `cpanm IO::FDPass Privileges::Drop JSON::MaybeXS Time::ParseDate`
 
 Note: Privileges::Drop fails with the system Perl (5.34.1) on macOS Tahoe
 26.1. Use Homebrew Perl (5.40.2+) or patch Privileges::Drop: on the lines
@@ -310,28 +341,38 @@ This works around a bug where setgid in Perl 5.34.1 puts -1 (0xFFFFFFFF
 unsigned) into $GID and $EGID.
 
 **For cyclog/multilog support**:
-- Time::TAI64 (CPAN)
+- Time::TAI64 (CPAN), for multilog timestamps only
+
+cyclog timestamps are converted without it. multilog TAI64N timestamps
+are left as they are unless you install Time::TAI64 and uncomment its
+`use` line and the `tai64nlocal` call in the script.
 
 (Note: tai64nlocal from djb's daemontools was previously used but was
 removed from OpenBSD ports due to licensing; Time::TAI64 provides the
 same functionality.)
 
 **For signed includes and execute scripts**:
-- [Signify.pm](https://github.com/lippard661/Signify)
+- [Signify.pm](https://github.com/lippard661/Signify) 1.3 or later
+  (reportnew 1.40 uses its named-argument form and reports an older
+  version as too old)
 - signify (OpenBSD standard), signify-openbsd (Linux apt), or
   signify via Homebrew (macOS)
 
 ### Setting up privilege separation
 
 ```sh
-# OpenBSD
-useradd -r -d /var/empty -s /sbin/nologin _reportnew
+# OpenBSD (-g =uid also creates the _reportnew group; -r on OpenBSD
+# sets a UID range, not "system user")
+useradd -d /var/empty -s /sbin/nologin -g =uid _reportnew
 
-# Linux
+# Linux (-r creates a system user, and the matching group on
+# distributions that create user groups by default)
 useradd -r -d /var/empty -s /usr/sbin/nologin _reportnew
 ```
 
-Set `privsep: yes` in reportnew.conf.
+reportnew uses privilege separation only when run as root and both a
+`_reportnew` user and a `_reportnew` group exist. Set `privsep: yes` in
+reportnew.conf (or pass `-p`).
 
 ### Setting up process accounting
 
@@ -408,8 +449,8 @@ Or with a randomized start within a window to reduce timing predictability:
 reportnew [options] configfile
 
 -p          Use privilege separation
--c          Check config file for syntax errors and exit
--v          Verbose output
+-c          Check config file and exit (syntax, and the signatures of
+            execute scripts and signed macro files for this host)
 -d          Debug output
 -V          Display version
 ```
@@ -417,13 +458,13 @@ reportnew [options] configfile
 ## Security Notes
 
 - `reportnew.conf` should be mode 0600 (root only); it reveals your
-  monitoring rules and alert addresses. reportnew will warn if it finds
-  the config world-readable.
+  monitoring rules and alert addresses. reportnew does not check its mode.
 - Macro include files that are not signed should also be protected;
   signed include files can be uchg-protected while the main config
   is schg-protected (see [syslock](https://github.com/lippard661/syslock))
 - Execute scripts must be signify-signed; privileges are dropped before
-  execution
+  execution. Scripts do not inherit reportnew's pledge/unveil, so each
+  script should apply its own (see Actions)
 - The state file (size_file) does not need to be tightly protected but
   should be root-owned; an attacker who can modify it could cause entries
   to be missed or re-reported, but cannot inject false alerts

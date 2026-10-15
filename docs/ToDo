@@ -1,5 +1,8 @@
 BUGS
 
+(Fixed 1.40) Use new Signify.pm 1.3 calling method and require that version
+due to security issues in prior versions.
+
 (Fixed 1.39) Several bugs, using a defect taxonomy, bug fixing guidance,
 and assessment guidance docs being used across all agents in a project:
 
