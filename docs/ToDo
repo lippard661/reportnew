@@ -1,5 +1,50 @@
 BUGS
 
+(Fixed 1.39) Several bugs, using a defect taxonomy, bug fixing guidance,
+and assessment guidance docs being used across all agents in a project:
+
+    1) The privileged process no longer writes into the child-owned
+       temp dir. Gunzips, journal reads and lastcomm output are
+       written to a root-only temp dir of its own, opened, unlinked
+       and passed to the child as a file descriptor; the child copies
+       the data into its own temp file. Previously root wrote and
+       chowned predictable paths in a dir the child owns, so a
+       compromised child could plant a symlink and have root overwrite
+       and chown any file.
+    2) All IPC socket I/O uses sysread/syswrite. The buffered read in
+       the child could consume the byte carrying the passed file
+       descriptor on Linux, which drops the descriptor and hangs the
+       child; the Linux-only ACK added to work around that is
+       removed. The child now times out waiting for a descriptor
+       instead of hanging forever.
+    3) Report (rather than silently skip) a log still claimed in the
+       size file by a live process more than an hour after its last
+       check.
+    4) The default action (no action: directive) now notifies
+       master_notify; it was stored without "notify," and did nothing.
+    5) Process accounting: track file position with sysseek (tell did
+       not see sysread), restart at the start of a file whose first
+       record does not match, remove gunzipped temp copies after
+       reading them, store mtime rather than atime, read two-digit
+       rotations (pacct.10.gz on Linux).
+    6) Check the sendmail close and ignore SIGPIPE while writing to
+       it, report a signal-killed execute script, check temp dir
+       removal.
+    7) Compare sub-second mtimes with checktime when deciding whether
+       a rotated log or cyclog/multilog file changed since the last
+       check; an integer mtime made a file changed in the same second
+       as the check look unchanged.
+
+Updated lastcomm.pl comments.
+
+Updated mailcert.pl execute script: accept IPv6 and any scheme and port
+in the mta connecting line and any syslog hostname. If Domain::PublicSuffix
+is used, create its object once, before pledge and unveil.
+
+Updated wifi.pl execute script: Fix SSID change test, accept uppercase MAC
+addresses and negative RSSI values, keep cached band current, prune cache
+entries left without an epoch by older versions.
+
 (Fixed 1.36a) Fixed $delta calc in Linux process accounting (reportnew and lastcomm.pl).
 Minor enhancements to mailcert.pl and wifi.pl.
 

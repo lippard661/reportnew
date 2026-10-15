@@ -304,6 +304,36 @@
 #    reduce code duplication for former using anonymous subroutine, and
 #    to shorten code and cover more occurrences of host names, not just
 #    at the beginning of a log line, for the latter.
+# Modified 14 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard to fix issues found in a review of 1.38 against the audit
+#    checklists:
+#    1) The privileged process no longer writes into the child-owned temp
+#       dir. Gunzips, journal reads and lastcomm output are written to a
+#       root-only temp dir of its own, opened, unlinked and passed to the
+#       child as a file descriptor; the child copies the data into its own
+#       temp file. Previously root wrote and chowned predictable paths in a
+#       dir the child owns, so a compromised child could plant a symlink and
+#       have root overwrite and chown any file.
+#    2) All IPC socket I/O uses sysread/syswrite. The buffered read in the
+#       child could consume the byte carrying the passed file descriptor on
+#       Linux, which drops the descriptor and hangs the child; the Linux-only
+#       ACK added to work around that is removed. The child now times out
+#       waiting for a descriptor instead of hanging forever.
+#    3) Report (rather than silently skip) a log still claimed in the size
+#       file by a live process more than an hour after its last check.
+#    4) The default action (no action: directive) now notifies master_notify;
+#       it was stored without "notify," and did nothing.
+#    5) Process accounting: track file position with sysseek (tell did not
+#       see sysread), restart at the start of a file whose first record does
+#       not match, remove gunzipped temp copies after reading them, store
+#       mtime rather than atime, read two-digit rotations (pacct.10.gz on
+#       Linux).
+#    6) Check the sendmail close and ignore SIGPIPE while writing to it,
+#       report a signal-killed execute script, check temp dir removal.
+#    7) Compare sub-second mtimes with checktime when deciding whether a
+#       rotated log or cyclog/multilog file changed since the last check;
+#       an integer mtime made a file changed in the same second as the
+#       check look unchanged.
 
 # Suggested enhancements:
 # * Process all rotated logs and original log, as well as all components
@@ -328,7 +358,7 @@ use strict;
 use warnings;
 use feature 'state';
 use Digest::SHA qw( hmac_sha256_hex sha256_hex );
-use Errno qw( EPERM );
+use Errno qw( EPERM EINTR );
 use Fcntl qw(:DEFAULT :flock);
 use File::Basename;
 use File::Copy;
@@ -397,7 +427,7 @@ my $SIGNIFY = '/usr/bin/signify';
 my $ETC_DIR = '/etc';
 my $ZONEINFO_DIR = '/usr/share/zoneinfo';
 
-my $VERSION = 'reportnew 1.38 of 24 August 2026';
+my $VERSION = 'reportnew 1.39 of 14 October 2026';
 
 my $DEFAULT_CONFIG_DIR = '/etc/reportnew';
 my $DEFAULT_CONFIG_NAME = 'reportnew.conf';
@@ -409,6 +439,13 @@ my $SIZE_SUFFIX = ".size";
 my ($MACRO_DIR, $SCRIPT_DIR); # config_dir and config_dir/scripts
 
 my $SIZE_FILE_LOCK_TIMEOUT_LIMIT = 10;
+
+# Report a log still claimed by a live process this long after its last
+# completed check (a hung run otherwise makes every later run skip it).
+my $STALE_PROCESSING_SECS = 60 * 60;
+
+# Seconds the unprivileged child waits for a file descriptor.
+my $FD_RECV_TIMEOUT = 30;
 
 my $SIGNIFY_DIR = '/etc/signify';
 
@@ -539,7 +576,7 @@ my ($rotated_logs_flag, $processed_rotated_log_flag, @rotated_logs, $rotated_log
 # For privilege separation.
 my ($user, $reporter_uid, $reporter_gid, $use_privsep,
     $privsep_flag, $priv_flag, $nonpriv_flag,
-    $parent_sock, $child_sock, $HMAC_SECRET);
+    $parent_sock, $child_sock, $HMAC_SECRET, $priv_temp_dir);
 
 ### Main program.
 
@@ -761,10 +798,6 @@ if ($privsep_flag) {
     ($parent_sock, $child_sock) = IO::Socket::UNIX->socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC)
 	or die "socketpair: $!";
 
-    # Enable autoflush on both sockets to prevent buffering issues.
-    my $old_fh = select ($parent_sock); $| = 1; select ($old_fh);
-    $old_fh = select ($child_sock); $| = 1; select ($old_fh);
-
     # Create shared secret.
     $HMAC_SECRET = generate_random_secret();
 
@@ -791,10 +824,17 @@ if ($privsep_flag) {
 	# chown temp_dir to _reportnew so child has access.
 	chown ($reporter_uid, $reporter_gid, $temp_dir);
 
+	# The privileged side's own temp dir (root only, 0700). Everything
+	# root writes goes here, never into the child-owned $temp_dir, and
+	# results go to the child as file descriptors.
+	$priv_temp_dir = mkdtemp ('/tmp/reportnew-priv.XXXXXXX') || die "Cannot create privileged temp dir. $!\n";
+	chomp ($priv_temp_dir);
+
 	# Listen for requests that require privileges.
 	priv_listener();
 
 	# Shutdown after EOF.
+	rmdir ($priv_temp_dir) or warn "Could not remove privileged temp dir $priv_temp_dir: $!\n";
 	exit;
     }
 
@@ -825,7 +865,19 @@ foreach $logfile (@logfiles) {
     # Read all logs from size file, skip this one if it's already
     # being processed, otherwise mark this one as being processed.
     read_size_file ($size_file);
-    next if ($log_processing_pid{$logfile} != 0 && pid_exists ($log_processing_pid{$logfile}));
+    if ($log_processing_pid{$logfile} != 0 && pid_exists ($log_processing_pid{$logfile})) {
+	my $holder = $log_processing_pid{$logfile};
+	print "DEBUG: skipping $logfile, size file says pid $holder is processing it\n" if ($debug_mode);
+	# A hung run keeps the log claimed for as long as it lives, and every
+	# later run skips it. Report it once the last completed check is old
+	# enough that this is not just an overlapping run.
+	if ($log_checktime{$logfile} > 0 &&
+	    time() - $log_checktime{$logfile} > $STALE_PROCESSING_SECS) {
+	    my $minutes = int ((time() - $log_checktime{$logfile}) / 60);
+	    send_error ($logfile, "Skipping $logfile: size file says pid $holder is still processing it, and its last completed check was $minutes minutes ago. If pid $holder is a hung reportnew, kill it.");
+	}
+	next;
+    }
     write_size_file ($size_file, $logfile, $LOG_PROCESSING_START); # save PID
 
     if ($logfile eq $PROCESS_ACCOUNTING_LOG) {
@@ -978,7 +1030,7 @@ foreach $logfile (@logfiles) {
 	    next if ($cyclog_file eq 'lock'); # multilog format
 	    next if ($cyclog_file eq 'state'); # multilog format
 	    $cyclog_file = $logfile . '/' . $cyclog_file;
-	    ($size, $mtime) = get_size ($cyclog_file);
+	    $mtime = get_mtime_hires ($cyclog_file);
 	    next if ($mtime < $old_log_checktime);
 	    # If we get here, then we've found the oldest changed file
 	    # (since we last checked).
@@ -1022,7 +1074,7 @@ foreach $logfile (@logfiles) {
 }
 
 # Remove temp dir.
-rmdir ($temp_dir);
+rmdir ($temp_dir) or warn "Could not remove temp dir $temp_dir: $!\n";
 
 ### Subroutines.
 
@@ -1735,7 +1787,7 @@ sub parse_config {
 	}
 	if (!defined ($action_hash{$current_logfile})) {
 	    # Default action is notify to master_notify (stored as array ref)
-	    push (@{$action_hash{$current_logfile}}, [$master_notify]);
+	    push (@{$action_hash{$current_logfile}}, ["notify,$master_notify"]);
 	    # need indicator for action=notify.
 	}
 
@@ -2309,37 +2361,40 @@ sub evaluate_time_constraint {
 # for the specific file in the multilog/cyclog directory to be opened. These return a file
 # descriptor immediately after a non-failure (sending back fd_follows status).
 # get-hash: logname. Returns hash of first line of logfile (uncompressed if it's a gzip).
-# get-journal: logname, checktime. Returns hash of temp_logfile and new checktime.
-# get-linux-pacct (deprecated): logname, checktime. Returns hash of temp_logfile and new checktime.
+# get-journal: logname, checktime. Returns the journal output as a file descriptor
+# (fd_follows), with the new checktime in the response metadata.
+# get-linux-pacct (deprecated): logname, checktime. Returns the lastcomm output as a
+# file descriptor (fd_follows), with the new checktime in the response metadata.
 # get-mclog-files: logname. Returns array reference of multilog/cyclog file list.
-# gunzip: lofname. Gunzips the file and returns temp_logfile name.
+# gunzip: logname. Gunzips the file and returns the result as a file descriptor
+# (fd_follows).
+# Results the privileged side creates are written in $priv_temp_dir (root only),
+# opened, unlinked and passed as descriptors, so root never writes or chowns a
+# path in the child-owned $temp_dir.
+# All socket I/O is sysread/syswrite: a buffered read can consume the byte that
+# carries a passed descriptor, which on Linux discards the descriptor.
 sub priv_listener {
     my ($req, $req_type);
     my $MAX_REQUEST_LENGTH = 1024 * 1024;
 
     print "DEBUG: starting priv_listener\n" if ($debug_mode);
     while (1) {
-	read ($parent_sock, my $len_bytes, 4) or last;
+	my $len_bytes = sock_read_exact ($parent_sock, 4);
+	last if (!defined ($len_bytes));
 	my $msg_len = unpack ('N', $len_bytes);
 	if ($msg_len > $MAX_REQUEST_LENGTH || $msg_len < 1) {
+	    # Can't find the next message boundary, so stop: the child
+	    # gets EOF rather than a desynchronized stream.
 	    warn "Invalid message length: $msg_len\n";
 	    send_error_response_nohmac ("Invalid message length.");
-	    next;
+	    last;
 	}
 
 	# Read full message.
-	my $buffer = '';
-	my $remaining = $msg_len;
-	while ($remaining > 0) {
-	    my $n = read($parent_sock, my $chunk, $remaining);
-	    last unless defined($n) && $n > 0;
-	    $buffer .= $chunk;
-	    $remaining -= $n;
-	}
-	if ($remaining > 0) {
+	my $buffer = sock_read_exact ($parent_sock, $msg_len);
+	if (!defined ($buffer)) {
 	    warn "Short read on message body\n";
-	    send_error_response_nohmac("Short read");
-	    next;
+	    last;
 	}
 
 	my $envelope = eval {decode_json ($buffer) };
@@ -2452,56 +2507,55 @@ sub handle_fd_request {
 
     # Try to open the file.
     if (open (my $log_fh, $open_mode, $logfile)) {
-	# Send response indicating that file descriptor will follow.
-	my $response = {
-	    status => RESP_FD_FOLLOWS,
-	    request_id => $request->{request_id},
-	    metadata => {
-		logfile => $logfile,
-		mode => $open_mode,
-	    }
-	};
-
-	send_response ($response);
-
-	# ACK protocol only on Linux to avoid FD passing race conditions.
-	if ($^O eq 'linux') {
-	    print "DEBUG: parent waiting for ACK before sending FD\n" if ($debug_mode);
-
-	    my $ack_buf;
-	    # Timeout to avoid hanging forever
-	    eval {
-		local $SIG{ALRM} = sub { die "ACK timeout\n"; };
-		alarm (5); # 5 second timeout
-		my $n = sysread ($parent_sock, $ack_buf, 3);
-		alarm (0);
-
-		unless (defined ($n) && $n == 3 && $ack_buf eq 'ACK') {
-		    warn "Failed to receive ACK for FD transfer for $logfile (got \"$ack_buf\", " .
-			(defined ($n) ? "$n bytes" : "undef") . ")\n";
-		    close $log_fh;
-		    send_error_response ("Failed to receive ACK for FD transfer", $request->{request_id});
-		    return;
-		}
-	    };
-	    if ($@) {
-		warn "ACK timeout or error for $logfile: $@\n";
-		close $log_fh;
-		send_error_response ("ACK timeout: $@", $request->{request_id});
-		return;
-	    }
-	    print "DEBUG: parent received ACK, sending FD\n" if ($debug_mode);
-	}
-
-	# Now send the file descriptor.
-	IO::FDPass::send (fileno ($parent_sock), fileno ($log_fh))
-	    or warn "Failed to send file descriptor for $logfile: $!\n";
-
-	close ($log_fh); # safe to close after send
+	send_fh_to_child ($request, $log_fh, { logfile => $logfile, mode => $open_mode });
     }
     else {
 	send_error_response ("Cannot open $logfile: $!", $request->{request_id}, int ($!));
     }
+}
+
+# Subroutine to send an open filehandle to the child as a file descriptor
+# (privileged side). The fd_follows response is written with syswrite, and
+# the child reads exactly that response with sysread before receiving the
+# descriptor, so no read can consume the byte that carries it.
+sub send_fh_to_child {
+    my ($request, $fh, $metadata) = @_;
+
+    my $response = {
+	status => RESP_FD_FOLLOWS,
+	request_id => $request->{request_id},
+	metadata => $metadata,
+    };
+
+    send_response ($response);
+
+    IO::FDPass::send (fileno ($parent_sock), fileno ($fh))
+	or warn "Failed to send file descriptor for $metadata->{logfile}: $!\n";
+
+    close ($fh); # safe to close after send
+}
+
+# Subroutine to send a result file the privileged side created in
+# $priv_temp_dir to the child as an open file descriptor (privileged side).
+# The file is unlinked once open, so the descriptor is its only reference
+# and nothing is left behind for either side to clean up.
+sub send_priv_temp_file {
+    my ($request, $path, $metadata) = @_;
+    my $fh;
+
+    if (index ($path, "$priv_temp_dir/") != 0) {
+	send_error_response ("Internal error: result $path is not in the privileged temp dir.", $request->{request_id});
+	return;
+    }
+    if (!open ($fh, '<:raw', $path)) {
+	my $err = "$!";
+	unlink ($path);
+	send_error_response ("Cannot open result $path: $err", $request->{request_id});
+	return;
+    }
+    unlink ($path) or warn "Cannot remove $path: $!\n";
+
+    send_fh_to_child ($request, $fh, $metadata);
 }
 
 # Subroutine to handle hash requests (privileged side).
@@ -2550,25 +2604,15 @@ sub handle_journal_request {
 	return;
     }
 
-    my ($temp_logfile, $new_checktime) = read_linux_journal ($logfile, $checktime, $temp_dir);
+    my ($temp_logfile, $new_checktime) = read_linux_journal ($logfile, $checktime, $priv_temp_dir);
 
     if (!defined ($temp_logfile)) {
         send_error_response ("Could not read journal for $logfile.", $request->{request_id});
         return;
     }
-    
-    chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
-    my $response = {
-	status => RESP_SUCCESS,
-	request_id => $request->{request_id},
-	data => {
-	    temp_logfile => $temp_logfile,
-	    checktime => $new_checktime,
-	}
-    };
-
-    send_response ($response);
+    send_priv_temp_file ($request, $temp_logfile,
+			 { logfile => $logfile, checktime => $new_checktime });
 }
 
 # Get Linux process accounting logs (using lastcomm, deprecated; privileged side).
@@ -2583,25 +2627,15 @@ sub handle_linux_pacct_request {
 	return;
     }
 
-    my ($temp_logfile, $new_checktime) = read_process_acct_log ($logfile, $checktime, $temp_dir);
+    my ($temp_logfile, $new_checktime) = read_process_acct_log ($logfile, $checktime, $priv_temp_dir);
     
     if (!defined ($temp_logfile)) {
 	send_error_response ("Could not read process accounting log for $logfile.", $request->{request_id});
 	return;
     }
-    
-    chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
-    my $response = {
-	status => RESP_SUCCESS,
-	request_id => $request->{request_id},
-	data => {
-	    temp_logfile => $temp_logfile,
-	    checktime => $new_checktime,
-	}
-    };
-
-    send_response ($response);
+    send_priv_temp_file ($request, $temp_logfile,
+			 { logfile => $logfile, checktime => $new_checktime });
 }
 
 # Get files in a multilog/cyclog directory (privileged side).
@@ -2647,7 +2681,7 @@ sub handle_gunzip_request {
 	return;
     }
 
-    my $temp_logfile = eval { gunzip_logfile ($logfile, $temp_dir) };
+    my $temp_logfile = eval { gunzip_logfile ($logfile, $priv_temp_dir) };
 
     if ($@) {
 	send_error_response ("Error gunzipping $logfile: $@", $request->{request_id});
@@ -2657,16 +2691,8 @@ sub handle_gunzip_request {
 	send_error_response ("Could not gunzip $logfile.", $request->{request_id});
 	return;
     }
-    
-    chown ($reporter_uid, $reporter_gid, $temp_logfile);
 
-    my $response = {
-	status => RESP_SUCCESS,
-	request_id => $request->{request_id},
-	data => $temp_logfile,
-    };
-
-    send_response ($response);
+    send_priv_temp_file ($request, $temp_logfile, { logfile => $logfile });
 }
 
 # Subroutine to send response from priv to nonpriv.
@@ -2683,7 +2709,46 @@ sub send_response {
 
     my $envelope_json = encode_json ($envelope);
     my $len = pack ('N', length ($envelope_json));
-    print $parent_sock $len . $envelope_json;
+    sock_write_all ($parent_sock, $len . $envelope_json)
+	or warn "Failed to send response to unprivileged process: $!\n";
+}
+
+# Subroutine to write all of $data to a socket, unbuffered. Returns 1 on
+# success, 0 on failure (with $! set). SIGPIPE is ignored so a closed peer
+# is a reportable write error rather than a silent death.
+sub sock_write_all {
+    my ($sock, $data) = @_;
+    local $SIG{PIPE} = 'IGNORE';
+    my $offset = 0;
+    my $len = length ($data);
+
+    while ($offset < $len) {
+	my $n = syswrite ($sock, $data, $len - $offset, $offset);
+	if (!defined ($n)) {
+	    next if ($! == EINTR);
+	    return 0;
+	}
+	$offset += $n;
+    }
+    return 1;
+}
+
+# Subroutine to read exactly $len bytes from a socket, unbuffered. Returns
+# the bytes, or undef on EOF or error. Never reads past $len, so a byte that
+# carries a passed file descriptor stays in the socket for IO::FDPass::recv.
+sub sock_read_exact {
+    my ($sock, $len) = @_;
+    my $buf = '';
+
+    while (length ($buf) < $len) {
+	my $n = sysread ($sock, $buf, $len - length ($buf), length ($buf));
+	if (!defined ($n)) {
+	    next if ($! == EINTR);
+	    return undef;
+	}
+	return undef if ($n == 0); # EOF
+    }
+    return $buf;
 }
 
 # Subroutine to send an error response from priv to nonpriv.
@@ -2749,7 +2814,7 @@ sub is_allowed_logfile {
     my ($logfile, $cyclog_file_flag) = @_;
 
     #   For rotated and gzipped logs, strip off those suffixes.
-    if ($logfile =~ /^(.*)(\.\d(\.gz){0,1})$/) {
+    if ($logfile =~ /^(.*)(\.\d{1,2}(\.gz)?)\z/) {
 	$logfile = $1;
     }
 
@@ -2823,17 +2888,21 @@ sub send_priv_req {
     my $len = pack ('N', length ($envelope_json));
 
     print "DEBUG: child sending $req_type\n" if ($debug_mode);
-    print $child_sock $len . $envelope_json;
+    sock_write_all ($child_sock, $len . $envelope_json)
+	or die "Failed to send $req_type request to privileged process: $!\n";
 
-    # Read response.
-    read ($child_sock, my $resp_len_bytes, 4)
-	or die "Failed to read response length after sending priv request.\n";
+    # Read response, exactly (see sock_read_exact).
+    my $resp_len_bytes = sock_read_exact ($child_sock, 4);
+    die "Failed to read response length after sending priv request.\n"
+	if (!defined ($resp_len_bytes));
     my $resp_len = unpack ('N', $resp_len_bytes);
 
-    die "Response to priv request too large.\n" if $resp_len > $MAX_RESPONSE_LENGTH;
+    die "Invalid response length to priv request: $resp_len\n"
+	if ($resp_len > $MAX_RESPONSE_LENGTH || $resp_len < 1);
 
-    read ($child_sock, my $resp_json, $resp_len)
-	or die "Failed to read response after sending priv request.\n";
+    my $resp_json = sock_read_exact ($child_sock, $resp_len);
+    die "Failed to read response after sending priv request.\n"
+	if (!defined ($resp_json));
 
     # Verify response HMAC.
     my $resp_envelope = decode_json ($resp_json);
@@ -2859,8 +2928,17 @@ sub send_priv_req {
     return $response;
 }
 
-# Wrapper for file descriptor requests (nonprivileged side).
+# Wrapper for file descriptor requests (nonprivileged side). Returns the
+# filehandle, or nothing on an error response (with $! set from its errno).
 sub send_priv_req_for_fd {
+    my ($req_type, $req_params) = @_;
+    my ($fh) = priv_req_fd ($req_type, $req_params);
+    return $fh;
+}
+
+# Send a request whose success response is a file descriptor (nonprivileged
+# side). Returns ($fh, $response); $fh is undef on an error response.
+sub priv_req_fd {
     my ($req_type, $req_params) = @_;
 
     my $logfile = $req_params->{logfile};
@@ -2870,31 +2948,81 @@ sub send_priv_req_for_fd {
     if ($response->{status} eq RESP_FD_FOLLOWS) {
 	print "DEBUG: receiving file descriptor\n" if ($debug_mode);
 
-	# On Linux, send ACK before calling recv to avoid race condition
-	if ($^O eq 'linux') {
-	    print "DEBUG: child sending ACK before recv\n" if ($debug_mode);
-	    syswrite ($child_sock, 'ACK', 3);
+	# Bounded wait: if the privileged side fails to send the descriptor,
+	# die rather than hang (a hung run keeps the log claimed in the size
+	# file and later runs skip it).
+	my $fd = eval {
+	    local $SIG{ALRM} = sub { die "timeout\n"; };
+	    alarm ($FD_RECV_TIMEOUT);
+	    my $received = IO::FDPass::recv (fileno ($child_sock));
+	    alarm (0);
+	    $received;
+	};
+	alarm (0);
+	if ($@ eq "timeout\n") {
+	    die "Timed out after $FD_RECV_TIMEOUT seconds waiting for file descriptor for $logfile from privileged process.\n";
 	}
-	
-	my $fd = IO::FDPass::recv (fileno ($child_sock));
+	elsif ($@) {
+	    die "Error receiving file descriptor for $logfile: $@";
+	}
 	print "DEBUG: child received fd for $logfile\n" if ($debug_mode);
 
-	if ($fd < 0) {
-	    die "Failed to receive file descriptor.\n";
+	if (!defined ($fd) || $fd < 0) {
+	    die "Failed to receive file descriptor for $logfile.\n";
 	}
 
 	print "DEBUG: child opening fh for $logfile\n" if ($debug_mode);
 	open (my $fh, "+<&=$fd")
 	    or die "Cannot fdopen received file descriptor for $logfile: $!\n";
-	return $fh;
+	return ($fh, $response);
     }
     elsif ($response->{status} eq RESP_ERROR) {
 	$! = $response->{errno} if (defined ($response->{errno}));
-	return;
+	return (undef, $response);
     }
     else {
 	die "Unexpected response: $response->{status}\n";
     }
+}
+
+# Send a request whose result comes back as a file descriptor, and copy the
+# data into a new temp file in the child's own $temp_dir (nonprivileged
+# side). Returns (path, response metadata). The child owns the copy and
+# removes it as it would any other temp file. Dies on an error response,
+# as get_priv_data does.
+sub priv_fd_to_temp_file {
+    my ($req_type, $req_params) = @_;
+
+    my ($in_fh, $response) = priv_req_fd ($req_type, $req_params);
+    if (!$in_fh) {
+	my $error = (defined ($response) && defined ($response->{error})) ? $response->{error} : "$!";
+	die "Privileged request $req_type failed for $req_params->{logfile}: $error\n";
+    }
+    binmode ($in_fh);
+
+    my ($out_fh, $out_path);
+    if ($^O eq 'openbsd') {
+	($out_fh, $out_path) = mkstemp ("$temp_dir/reportnew.XXXXXXX");
+    }
+    else {
+	($out_fh, $out_path) = tempfile ("$temp_dir/reportnew.XXXXXXX");
+    }
+    die "Could not create temp file in $temp_dir. $!\n" if (!defined ($out_path));
+    binmode ($out_fh);
+
+    while (1) {
+	my $n = sysread ($in_fh, my $buf, 65536);
+	if (!defined ($n)) {
+	    next if ($! == EINTR);
+	    die "Read failed on $req_type result for $req_params->{logfile}: $!\n";
+	}
+	last if ($n == 0);
+	print $out_fh $buf or die "Write to $out_path failed: $!\n";
+    }
+    close ($in_fh);
+    close ($out_fh) or die "Could not write $out_path: $!\n";
+
+    return ($out_path, $response->{metadata});
 }
 
 # Wrapper for data requests (non-file descriptors; nonprivileged side).
@@ -3256,7 +3384,7 @@ sub gunzip_logfile {
 
     if (!-r $logfile &&
 	$privsep_flag && $nonpriv_flag) {
-	$temp_logfile = get_priv_data ('gunzip', { logfile => $logfile });
+	($temp_logfile) = priv_fd_to_temp_file ('gunzip', { logfile => $logfile });
 	return ($temp_logfile);
     }
 
@@ -3370,14 +3498,18 @@ sub identify_rotated_logs {
     $logbase = basename ($logfile);
 
     # Read directory, searching for matching files.
-    # Assumes a single-digit number of rotated logs.
+    # Accepts one- or two-digit rotation numbers (Linux keeps pacct.1.gz
+    # through pacct.29.gz).
     # Added match for gzips; sizes may be less meaningful.
     if (opendir (DIR, $logdir)) {
-	@files = grep (/^$logbase\.\d(\.gz){0,1}$/, readdir (DIR));
+	my $logbase_re = quotemeta ($logbase);
+	@files = grep (/^$logbase_re\.\d{1,2}(\.gz)?\z/, readdir (DIR));
 
-	# Find files that have been modified since our last check.
-	foreach $file (reverse (sort (@files))) {
-	    ($size, $mtime) = get_size ("$logdir/$file");
+	# Find files that have been modified since our last check, oldest
+	# (highest rotation number) first, compared numerically so that
+	# pacct.10.gz comes before pacct.9.gz.
+	foreach $file (sort { rotation_number ($b) <=> rotation_number ($a) } @files) {
+	    $mtime = get_mtime_hires ("$logdir/$file");
 	    if ($mtime > $old_checktime) { # a rotated log that needs checking
 		if (!$rotated_logs_flag) { # first one we find
 		    $rotated_logs_flag = 1;
@@ -3390,6 +3522,13 @@ sub identify_rotated_logs {
     }
 
     return ($rotated_logs_flag, @rotated_logs);
+}
+
+# Subroutine to return the rotation number of a rotated log name
+# (name.N or name.N.gz), or -1.
+sub rotation_number {
+    my ($file) = @_;
+    return ($file =~ /\.(\d+)(?:\.gz)?\z/) ? $1 : -1;
 }
 
 # Subroutine to read process accounting log files directly.
@@ -3463,7 +3602,7 @@ sub direct_read_process_acct_log {
 		my @stat = stat ($acct_fh);
 		if (@stat) {
 		    $new_size = $stat[7]; # size
-		    $new_mtime = $stat[8]; # mtime;
+		    $new_mtime = $stat[9]; # mtime
 		}
 		else {
 		    die "fstat failed on live file $acct_file: $!\n";
@@ -3485,7 +3624,16 @@ sub direct_read_process_acct_log {
 			    $new_first_line_hash =
 				first_log_line_sha256_digest ($acct_log,
 							       $record);
-			    seek ($acct_fh, $old_size, 0) if ($old_first_line_hash eq $new_first_line_hash);
+			    # Same file as last time: resume where we left off.
+			    # Otherwise start at the beginning (records are
+			    # still filtered by checktime below). sysseek, not
+			    # seek/tell: this handle is only read with sysread.
+			    if ($old_first_line_hash eq $new_first_line_hash) {
+				sysseek ($acct_fh, $old_size, 0);
+			    }
+			    else {
+				sysseek ($acct_fh, 0, 0);
+			    }
 			    # if not the live file we'll need to get a new one
 			    $new_first_line_hash = undef if (!$is_live_file);
 			}
@@ -3494,16 +3642,20 @@ sub direct_read_process_acct_log {
 			# when switching from reportnew-1.27b or earlier.
 			# Later can delete the 'null' references.
 			elsif ($n_bytes == $RECORD_SIZE) {
-			    seek ($acct_fh, $old_size - $RECORD_SIZE, 0);
+			    sysseek ($acct_fh, $old_size - $RECORD_SIZE, 0);
 			}
 			else { # didn't get full record
-			    seek ($acct_fh, 0, 0); # go back to beginning
+			    sysseek ($acct_fh, 0, 0); # go back to beginning
 			} # didn't get full record
 		    } # have an old first-line hash
 		} # $old_size > 0
 	    }
 
-	    my $position = tell ($acct_fh);
+	    # Offset of the descriptor (sysseek returns "0 but true" for 0).
+	    # tell would still say 0 after a sysread.
+	    my $position = sysseek ($acct_fh, 0, 1);
+	    die "Cannot get position in acct file $acct_file: $!\n" if (!defined ($position));
+	    $position += 0;
 
 	    while (1) {
 		last if ($is_live_file && $position >= $new_size); # end if we've processed everything we had at start
@@ -3617,6 +3769,12 @@ sub direct_read_process_acct_log {
 	}
 	close ($acct_fh);
 	$/ = $NL;
+
+	# Remove the gunzipped temp copy now that it has been read.
+	if (defined ($acct_temp_logfile) && $acct_file eq $acct_temp_logfile) {
+	    unlink ($acct_temp_logfile) or warn "Could not remove temp file $acct_temp_logfile: $!\n";
+	    undef $acct_temp_logfile;
+	}
     }
 
     if (!$found_first_record || !$processing_records) {
@@ -3741,9 +3899,8 @@ sub read_process_acct_log {
     my ($req_response); # for privsep
 
     if ($^O eq 'linux' && $privsep_flag && $nonpriv_flag) {
-	$req_response = get_priv_data ('get-linux-pacct', { logfile => $acct_log, checktime => $checktime });
+	($temp_logfile, $req_response) = priv_fd_to_temp_file ('get-linux-pacct', { logfile => $acct_log, checktime => $checktime });
 	if (defined ($req_response)) {
-	    $temp_logfile = $req_response->{temp_logfile};
 	    $new_checktime = $req_response->{checktime};
 	    return ($temp_logfile, $new_checktime);
 	}
@@ -3766,26 +3923,22 @@ sub read_process_acct_log {
     # is earlier, even if the duration is added to it (or if the
     # time is earlier by more than the duration).
 
-    # Only looks at acct.N[.gz] where N is a single digit, Linux will go to
-    # double digits. Also returns oldest first.
+    # Looks at acct.N[.gz] where N has one or two digits. Returns oldest
+    # first.
     # $rotated_logs_flag ignored, we're always going to do something
     # unless there's no log at all, which should already have been
     # determined (unless it just got deleted).
     ($rotated_logs_flag, @rotated_acct_logs) = identify_rotated_logs ($acct_log, $checktime);
-    # Insert current log at the front. It will be sorted anyway, but
-    # this puts it where it belongs.
-    unshift (@rotated_acct_logs, $acct_log);
+    # identify_rotated_logs returns oldest first; we want newest first,
+    # with the current log at the front.
+    @rotated_acct_logs = ($acct_log, reverse (@rotated_acct_logs));
 
     # Set new checktime to roughly correspond with the last log entry
     # (first one in the newest file, which we process first).
     $new_checktime = gettimeofday();
-    # Sorting from oldest first to newest first. Maybe make an option
-    # to identify_rotated_logs to avoid unnecessary sort.
-    # Note that sort here and in identify_rotated_logs won't work
-    # right if support is added for more than one digit in the filename,
-    # unless we sort numerically on the number and keep the one without
-    # a number at the front.
-    foreach $acct_file (sort @rotated_acct_logs) {
+    # @rotated_acct_logs is already newest first (see above), so no sort
+    # here; a lexical sort would misorder two-digit rotation numbers.
+    foreach $acct_file (@rotated_acct_logs) {
 	if (is_gzip ($acct_file)) {
 	    # gunzip into a temp file and run lastcomm on that.
 	    $acct_temp_logfile = gunzip_logfile ($acct_file, $temp_dir);
@@ -3892,8 +4045,8 @@ sub read_linux_journal {
     my $result; # for privilege separation
 
     if ($privsep_flag && $nonpriv_flag) {
-	$result = get_priv_data ('get-journal', { logfile => $logfile, checktime => $checktime });
-	return ($result->{temp_logfile}, $result->{checktime});
+	($temp_logfile, $result) = priv_fd_to_temp_file ('get-journal', { logfile => $logfile, checktime => $checktime });
+	return ($temp_logfile, $result->{checktime});
     }
 
     # Create temp file.
@@ -4071,6 +4224,17 @@ sub get_size {
     return ($size, $mtime);
 }
 
+# Subroutine to get a file's modification time with sub-second precision
+# (Time::HiRes::stat; integer where the platform has no sub-second times),
+# for comparison with a checktime from gettimeofday. An integer mtime is
+# never later than a checktime taken in the same second, so a file changed
+# in the second after a check would otherwise look unchanged since it.
+sub get_mtime_hires {
+    my ($file) = @_;
+    my @st = Time::HiRes::stat ($file);
+    return (@st ? $st[9] : 0);
+}
+
 # Subroutine to precompile regexps for matching.
 sub compile_re {
     my ($pattern, $context) = @_;
@@ -4170,6 +4334,10 @@ sub execute_script {
 	
 	# Wait for child to complete
 	waitpid ($pid, 0);
+	if ($? & 127) {
+	    send_error ($script_path, "Execute script $script_path killed by signal " . ($? & 127));
+	    return 128 + ($? & 127);
+	}
 	my $exit_status = $? >> 8;
 	if ($exit_status != 0) {
 	    send_error ($script_path, "Execute script $script_path exited with status $exit_status");
@@ -4437,6 +4605,10 @@ sub send_notify {
 	@out_lines = @lines;
     }
 
+    # A sendmail that exits early must be a reportable error, not a
+    # SIGPIPE that kills us.
+    local $SIG{PIPE} = 'IGNORE';
+
     if (open (MAIL, '|-', $SENDMAIL, '-t')) {
 	print MAIL "From: Reporter <$email_sender>\n";
 	print MAIL "To: $notify_list\n";
@@ -4451,7 +4623,12 @@ sub send_notify {
 		print MAIL "$line\n";
 	    }
 	}
-	close (MAIL);
+	# Can't send_error from here (it calls us), so warn: from cron,
+	# stderr is mailed separately.
+	if (!close (MAIL)) {
+	    warn "$SENDMAIL failed sending notification for $logfile: " .
+		($! ? "$!" : "exit status " . ($? >> 8)) . "\n";
+	}
     }
     else {
 	die "Unable to open $SENDMAIL. $!\n";

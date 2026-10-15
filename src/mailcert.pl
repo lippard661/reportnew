@@ -12,6 +12,12 @@
 #    extraction, better collision handling, stricter validation.
 # Modified 30 June 2026 by Jim Lippard after Claude Opus 4.8 review for some
 #    minor improvements.
+# Modified 14 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard to stop silently dropping sessions: accept IPv6 addresses and
+#    any scheme and port in the mta connecting line (only
+#    smtp://a.b.c.d:25 matched), and any syslog hostname (a hyphen in the
+#    local hostname dropped every line). If Domain::PublicSuffix is
+#    installed, create its object once, before pledge and unveil.
 
 use strict;
 use warnings;
@@ -23,10 +29,14 @@ use Time::ParseDate;
 # Optional: Use Domain::PublicSuffix for proper international domain handling
 # https://metacpan.org/pod/Domain::PublicSuffix
 # If not available, falls back to heuristic method below
+# Created here, before pledge and unveil, in case it reads its suffix list
+# when constructed.
 my $HAVE_DOMAIN_PUBLICSUFFIX = 0;
+my $PUBLIC_SUFFIX;
 eval {
     require Domain::PublicSuffix;
-    $HAVE_DOMAIN_PUBLICSUFFIX = 1;
+    $PUBLIC_SUFFIX = Domain::PublicSuffix->new();
+    $HAVE_DOMAIN_PUBLICSUFFIX = 1 if (defined ($PUBLIC_SUFFIX));
 };
 
 use if $^O eq 'openbsd', 'OpenBSD::Pledge';
@@ -66,8 +76,7 @@ sub extract_domain_name {
     
     # If we have Domain::PublicSuffix, use it
     if ($HAVE_DOMAIN_PUBLICSUFFIX) {
-        my $suffix = Domain::PublicSuffix->new();
-        my $root = $suffix->get_root_domain($hostname);
+        my $root = $PUBLIC_SUFFIX->get_root_domain($hostname);
         if (defined $root && $root =~ /^([^.]+)\./) {
             return $1;  # Return leftmost part of root domain
         }
@@ -140,16 +149,20 @@ if (-e $CACHEFILE && !-z $CACHEFILE) {
 }
 
 while (<STDIN>) {
-    if (/(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}) (\w+) smtpd\[\d+\]: ([0-9a-f]{16}) mta (.*$)/) {
+    if (/(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}) (\S+) smtpd\[\d+\]: ([0-9a-f]{16}) mta (.*$)/) {
 	my $date_str = $1;
 	my $host = $2;
 	$uid = $3;
 	my $rest = $4;
-	if ($rest =~ /connecting address=smtp:\/\/(\d+\.\d+\.\d+\.\d+):25 host=(.*$)/) {
+	# IPv4 (smtp://192.0.2.1:25) or bracketed IPv6
+	# (smtp://[2001:db8::1]:25), any scheme (smtp, smtps, smtp+tls) and
+	# port.
+	if ($rest =~ /connecting address=[a-z+]+:\/\/(?:\[([0-9A-Fa-f:.]+)\]|(\d+\.\d+\.\d+\.\d+)):\d+ host=(.*$)/) {
+	    my ($ip6, $ip4, $peer) = ($1, $2, $3);
 	    $date{$uid} = $date_str;
 	    $recipient_host{$uid} = $host;
-	    $sender_ip{$uid} = $1;
-	    $sender_host{$uid} = $2;
+	    $sender_ip{$uid} = defined ($ip6) ? $ip6 : $ip4;
+	    $sender_host{$uid} = $peer;
 	}
 	elsif ($rest =~ /cert-check result.* fingerprint=\"(.*)\"/) {
 	    $cert{$uid} = $1;

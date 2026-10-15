@@ -24,6 +24,9 @@
 #   use cache for getpwuid calls, remove dead code, minor enhancements.
 # Modified 30 June 2026 by Jim Lippard to modify Linux $delta calculation
 #    and use expand on paging values.
+# Modified 14 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard to correct the OpenBSD record-format comment (Z24 and q<) and
+#    note why getpwuid and ctime work after unveil.
 
 # Optional arguments to match user, device/tty, or command, multiple
 # args treated as OR, not AND.
@@ -128,6 +131,10 @@ if ($^O eq 'darwin') {
 
 if ($^O eq 'openbsd') {
     build_devname_cache();
+    # Only the log file is unveiled. getpwuid still works because, with
+    # the getpw promise, a read-only open of /etc/pwd.db bypasses unveil,
+    # and ctime's /etc/localtime and /usr/share/zoneinfo reads bypass it
+    # too (pledge_namei() in kern_pledge.c sets BYPASSUNVEIL for them).
     pledge (@PROMISES) || die "Could not pledge promises. $!\n";
     unveil ($logfile, 'r');
     unveil ();
@@ -375,9 +382,9 @@ sub requested {
 
 # OpenBSD process accounting log format in acct.h
 # unpack template used above is:
-# "A24 S< S< S< S< Q< L< L< L< l< L< b32"
+# "Z24 S< S< S< S< q< L< L< L< l< L< b32"
 # 64-byte records:
-# A24: 24 characters, command
+# Z24: 24 characters, command (null-terminated)
 # S<: int16 user time
 # S<: int16 system time
 # S<: int16 elapsed time (cpu)

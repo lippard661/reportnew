@@ -13,6 +13,13 @@
 #    only doing it for new MACs, not cached).
 # Modified 30 June 2026 by Jim Lippard for minor enhancement after Claude
 #    Opus 4.8 review.
+# Modified 14 October 2026 by Claude Opus 5.5 at the direction of Jim
+#    Lippard to fix the SSID-change test (`//` binds looser than `ne`, so
+#    an unchanged SSID was reported as changed and a change from a hidden
+#    SSID was missed), accept upper-case MACs and negative RSSI values
+#    rather than silently dropping those lines, keep the cached band
+#    current, and prune cache entries left without an epoch by older
+#    versions.
 
 use strict;
 use warnings;
@@ -139,7 +146,7 @@ while (<STDIN>) {
     # Parse WiFi scan log entry
     # Note: SSID capture is non-greedy (.*?) to stop at first comma
     # MAC may have reportnew macro appended like: 22:ad:56:35:42:fa[MAC_randomized]
-    if (/MAC: ([0-9a-f:]{17})(?:\[.*?\])?, SSID: (.*?), Channel: (\d+), Mode: (\d+), RSSI: (\d+), AP Type: (\d+), Timestamp: (.*?) , Epoch Timestamp: (\d+)/) {
+    if (/MAC: ([0-9A-Fa-f:]{17})(?:\[.*?\])?, SSID: (.*?), Channel: (\d+), Mode: (\d+), RSSI: (-?\d+), AP Type: (\d+), Timestamp: (.*?) , Epoch Timestamp: (\d+)/) {
 	my $candidate_mac = lc($1);  # Normalize to lowercase
 	my $raw_ssid = $2;
 	my $channel = $3;
@@ -170,8 +177,11 @@ open (LOG, '>>', $LOGFILE) || die "Cannot open log file $LOGFILE. $!\n";
 
 # Prune old entries from cache (older than CACHE_MAX_AGE)
 my $now = time();
-foreach my $old_mac (keys %cache_epoch) {
-    if ($now - $cache_epoch{$old_mac} > $CACHE_MAX_AGE) {
+# An entry with no epoch was written by an older version and has not been
+# seen since, so it goes too.
+foreach my $old_mac (keys %cache_mac) {
+    if (!defined ($cache_epoch{$old_mac}) ||
+	$now - $cache_epoch{$old_mac} > $CACHE_MAX_AGE) {
 	delete $cache_epoch{$old_mac};
 	delete $cache_ssid{$old_mac};
 	delete $cache_mac{$old_mac};
@@ -201,7 +211,7 @@ foreach $mac (keys (%epoch)) {
 	    $cache_epoch{$mac} = $epoch{$mac};
 	    print LOG " (new)";
 	}
-	elsif ($cache_ssid{$mac} // '' ne $ssid{$mac}) {
+	elsif (($cache_ssid{$mac} // '') ne $ssid{$mac}) {
 	    # SSID changed for known MAC
 	    my $safe_old_ssid = sanitize_log_data($cache_ssid{$mac});
 	    print LOG " (former SSID: $safe_old_ssid)";
@@ -209,6 +219,9 @@ foreach $mac (keys (%epoch)) {
 	    # Update cached SSID
 	    $cache_ssid{$mac} = $ssid{$mac};
 	}
+
+	# Keep the cached band current (the channel can change).
+	$cache_band{$mac} = $band{$mac};
 	
 	# Note if randomized MAC (check for all entries, not just new)
 	if ($REPORT_RANDOMIZED_MACS && is_randomized_mac($mac)) {
